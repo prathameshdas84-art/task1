@@ -105,6 +105,11 @@ class FullMetadata(BaseModel):
     # Raw XMP fields
     xmp_fields: dict = {}
 
+    # ICC color profiles + page rotation consistency
+    icc_profiles: list[str] = []
+    has_icc_profiles: bool = False
+    page_rotation: dict = {}
+
     # Comprehensive forensic-report sections (commercial-tool parity)
     raw: dict = {}                  # all original /Info + XMP fields
     structure: dict = {}            # page-by-page content structure
@@ -150,6 +155,16 @@ class ForensicResponse(BaseModel):
     signals: list[str]
     suspicious_lines: list[SuspiciousLine]
     numeric_anomalies: list[NumericAnomaly]
+
+    # OCR word-level anomalies (font size / color / position vs document
+    # baseline) and the document-wide stats they were compared against.
+    ocr_word_anomalies: list = []
+    ocr_stats: dict = {}
+
+    # Incremental-update / old-object-recovery findings (Layer 5 / ELA) —
+    # %%EOF/xref counts, /Prev trailer pointer, and any shadowed earlier
+    # object versions recovered from the raw file bytes.
+    incremental_updates: dict = {}
 
     # Cross-layer signal fusion — high-confidence findings confirmed by 2+
     # independent layers, plus suppression statistics
