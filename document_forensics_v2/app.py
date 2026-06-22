@@ -388,7 +388,7 @@ if uploaded:
 
     # ── Location Detection (Phase 2) ─────────────────────────────────────────
     if verdict.verdict == "MODIFIED" and (
-        content_report.suspicious_lines or ocr_report.suspicious_regions or
+        content_report.suspicious_lines or ocr_report.word_anomalies or
         (numeric_report and numeric_report.anomalies) or
         (ela_report and ela_report.regions) or
         (pymupdf_report and pymupdf_report.overlay_regions)
@@ -398,7 +398,8 @@ if uploaded:
             '<div style="background:#111; padding:10px 16px; border-radius:6px; '
             'margin-bottom:1rem; font-size:0.85rem; color:#888;">'
             '🔴 Red = font/spacing &nbsp;|&nbsp; '
-            '🟠 Orange = OCR &nbsp;|&nbsp; '
+            '🟠 Orange = OCR size anomaly &nbsp;|&nbsp; '
+            '🟪 Magenta = OCR color anomaly &nbsp;|&nbsp; '
             '🟡 Yellow = numeric &nbsp;|&nbsp; '
             '🟣 Purple = ELA (z≥4.0 only) &nbsp;|&nbsp; '
             '🩵 Cyan = white-rect overlay &nbsp;|&nbsp; '
@@ -410,7 +411,7 @@ if uploaded:
             highlighter = LocationHighlighter(pdf_path)
             highlighted_pages = highlighter.highlight_pages(
                 suspicious_lines=content_report.suspicious_lines,
-                ocr_regions=ocr_report.suspicious_regions,
+                ocr_word_anomalies=ocr_report.word_anomalies,
                 numeric_anomalies=numeric_report.anomalies if numeric_report else [],
                 ela_regions=ela_report.regions if ela_report else [],
                 overlay_regions=pymupdf_report.overlay_regions if pymupdf_report else [],
@@ -492,20 +493,18 @@ if uploaded:
                 unsafe_allow_html=True
             )
 
-    # ── OCR suspicious regions ────────────────────────────────────────────────
-    if ocr_report.suspicious_regions:
+    # ── OCR word anomalies ────────────────────────────────────────────────────
+    if ocr_report.word_anomalies:
         st.markdown(
-            f"#### Suspicious Regions — OCR "
-            f"({len(ocr_report.suspicious_regions)} flagged)"
+            f"#### Word Anomalies — OCR "
+            f"({len(ocr_report.word_anomalies)} flagged)"
         )
-        for r in ocr_report.suspicious_regions:
+        for r in ocr_report.word_anomalies:
             st.markdown(
                 f'<div class="ocr-item">'
                 f'<strong>Page {r.page+1}</strong> '
-                f'<span style="color:#8888FF">'
-                f'(confidence {r.confidence:.0f}% vs page avg {r.page_avg_confidence:.0f}%)'
-                f'</span><br>'
-                f'<span style="color:#ccc">"{r.text}"</span><br>'
+                f'<span style="color:#8888FF">({", ".join(r.anomaly_types)})</span><br>'
+                f'<span style="color:#ccc">"{r.word}"</span><br>'
                 f'<span style="color:#666">{r.reason}</span>'
                 f'</div>',
                 unsafe_allow_html=True
@@ -527,8 +526,8 @@ if uploaded:
             "Source Risk":         meta_report.source.suspicion_level,
             "OCR Pages Analyzed":  ocr_report.pages_analyzed,
             "OCR Avg Confidence":  f"{ocr_report.avg_confidence:.1f}%",
-            "OCR/Embedded Mismatch": ocr_report.ocr_vs_embedded_mismatch,
-            "Mismatch Ratio":      f"{ocr_report.mismatch_ratio:.0%}",
+            "OCR Avg Font Size":   f"{ocr_report.avg_font_size:.1f}pt",
+            "OCR Word Anomalies":  len(ocr_report.word_anomalies),
         })
 
     try:

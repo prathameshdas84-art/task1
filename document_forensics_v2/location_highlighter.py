@@ -34,11 +34,13 @@ RENDER_DPI = 150  # page render resolution, matches the DPI used for box-coordin
 # Box colors per signal source, RGB. Each layer gets a distinct color so a
 # page with multiple anomaly types is still visually distinguishable.
 COLOR_CONTENT = (255, 50, 50)    # red    — font/spacing anomaly (content_analyzer)
-COLOR_OCR     = (255, 140, 0)    # orange — OCR confidence drop
 COLOR_NUMERIC = (255, 220, 0)    # yellow — numeric outlier
 COLOR_ELA     = (180, 0, 255)    # purple — ELA outlier (image edit)
 COLOR_WHITE_RECT    = (0, 200, 255)   # cyan    — white rect overlay (pymupdf_analyzer)
 COLOR_IMAGE_OVERLAY = (255, 0, 200)   # magenta — image overlay (pymupdf_analyzer)
+COLOR_OCR_SIZE  = (255, 100, 0)   # orange-red — OCR word font-size anomaly
+COLOR_OCR_COLOR = (255, 0, 200)   # magenta    — OCR word color anomaly
+COLOR_OCR_CONF  = (255, 140, 0)   # orange     — OCR word low-confidence anomaly
 
 # ELA blocks are noisy on logos/dense text even in clean documents, so this
 # draw filter exists to avoid flooding the page with low-confidence boxes.
@@ -69,7 +71,7 @@ class LocationHighlighter:
     def highlight_pages(
         self,
         suspicious_lines: list = None,
-        ocr_regions: list = None,
+        ocr_word_anomalies: list = None,
         numeric_anomalies: list = None,
         ela_regions: list = None,
         overlay_regions: list = None,
@@ -79,11 +81,11 @@ class LocationHighlighter:
         Returns dict of {page_num: PIL.Image} with red boxes drawn.
         Only returns pages that have at least one suspicious region.
 
-        suspicious_lines:  list of SuspiciousLine from content_analyzer
-        ocr_regions:       list of SuspiciousRegion from ocr_analyzer
-        numeric_anomalies: list of NumericAnomaly from numeric_analyzer
-        ela_regions:       list of ELARegion from ela_analyzer
-        overlay_regions:   list of OverlayRegion from pymupdf_analyzer
+        suspicious_lines:    list of SuspiciousLine from content_analyzer
+        ocr_word_anomalies:  list of OCRWordAnomaly from ocr_analyzer
+        numeric_anomalies:   list of NumericAnomaly from numeric_analyzer
+        ela_regions:         list of ELARegion from ela_analyzer
+        overlay_regions:     list of OverlayRegion from pymupdf_analyzer
         age_days:          document's last-modification age in days. Box colors
                            are blended toward red for recent edits and faded
                            for old ones, and a "Modified: …" badge is drawn in
@@ -105,8 +107,8 @@ class LocationHighlighter:
             lines_by_page.setdefault(sl.page, []).append(sl)
 
         ocr_by_page = {}
-        if ocr_regions:
-            for r in ocr_regions:
+        if ocr_word_anomalies:
+            for r in ocr_word_anomalies:
                 ocr_by_page.setdefault(r.page, []).append(r)
 
         numeric_by_page = {}
@@ -154,16 +156,24 @@ class LocationHighlighter:
                     thickness=2,
                 )
 
-            # Draw OCR suspicious regions (ORANGE boxes)
+            # Draw OCR word anomalies — orange-red for size, magenta for
+            # color, orange for low confidence (size/color take priority
+            # in the box color when a word has more than one anomaly type).
             for r in ocr_by_page.get(page_num, []):
+                if "size" in r.anomaly_types:
+                    color = COLOR_OCR_SIZE
+                elif "color" in r.anomaly_types:
+                    color = COLOR_OCR_COLOR
+                else:
+                    color = COLOR_OCR_CONF
                 self._draw_box(
                     draw=draw,
                     img_size=img.size,
                     bbox=r.bbox,
                     page_h_pts=page_h,
-                    color=COLOR_OCR,
-                    label=f"OCR: {r.confidence:.0f}% confidence",
-                    label_color=COLOR_OCR,
+                    color=color,
+                    label=f"OCR:{','.join(r.anomaly_types)}",
+                    label_color=color,
                     thickness=2,
                 )
 

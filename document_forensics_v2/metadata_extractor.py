@@ -60,6 +60,8 @@ SCORE_MODIFIED_LATER        = 5
 SCORE_MULTIPLE_PRODUCERS    = 20
 SCORE_XMP_PRODUCER_MISMATCH = 15
 SCORE_POSSIBLE_IMG_CONVERT  = 15
+SCORE_XMP_METADATA_DATE_MISMATCH = 20
+SCORE_ROTATION_INCONSISTENCY     = 15
 
 # suspicion -> anomaly score. The producer database now carries an explicit
 # suspicion per entry (e.g. PDF24 is MEDIUM, not the same HIGH bucket as
@@ -130,6 +132,9 @@ class MetadataReport:
     has_open_action: bool = False
     document_id: Optional[str] = None
     xmp_fields: dict = field(default_factory=dict)
+    icc_profiles: list = field(default_factory=list)
+    has_icc_profiles: bool = False
+    page_rotation: dict = field(default_factory=dict)
 
     # Overall modification age (PDFs store only the LAST mod date, not a
     # per-edit history). Populated by _compute_edit_age() — see that method.
@@ -304,6 +309,8 @@ class MetadataExtractor:
             has_open_action=pikepdf_extras["has_open_action"],
             document_id=pikepdf_extras["document_id"],
             xmp_fields=xmp_fields_full,
+            icc_profiles=pikepdf_extras["icc_profiles"],
+            has_icc_profiles=pikepdf_extras["has_icc_profiles"],
         )
 
         # Overall modification age (used for display + risk weighting)
@@ -315,6 +322,7 @@ class MetadataExtractor:
         report.suspicious_content = self._extract_suspicious_content(pdf_path)
         report.dimensions_full    = self._extract_dimensions(pdf_path)
         report.dates_full         = self._enhance_dates(creation_date, modification_date)
+        report.page_rotation      = self._check_page_rotation_consistency(pdf_path)
 
         # Run anomaly detection
         self._detect_anomalies(report)
@@ -745,6 +753,8 @@ class MetadataExtractor:
             "has_javascript": False,
             "has_open_action": False,
             "document_id": None,
+            "icc_profiles": [],
+            "has_icc_profiles": False,
         }
         try:
             with pikepdf.open(pdf_path) as pdf:
@@ -802,21 +812,113 @@ class MetadataExtractor:
                     except Exception:
                         continue
                 result["page_details"] = page_details
+
+                # ICC color profiles — a document edited/re-exported with
+                # different software typically embeds a different ICC
+                # profile than the page(s) it was originally produced with,
+                # so a mix of profiles across pages is a tamper signal.
+                try:
+                    icc_profiles = []
+                    for page in pdf.pages:
+                        resources = page.get("/Resources", {})
+                        color_spaces = resources.get("/ColorSpace", {}) if resources else {}
+                        for name, cs in color_spaces.items():
+                            try:
+                                if (isinstance(cs, list) and len(cs) > 1 and
+                                        str(cs[0]) == "/ICCBased"):
+                                    icc_profiles.append(str(name))
+                            except Exception:
+                                continue
+                    result["icc_profiles"] = icc_profiles
+                    result["has_icc_profiles"] = bool(icc_profiles)
+                except Exception:
+                    pass
         except Exception:
             pass
         return result
 
     def _extract_xmp_fields_full(self, pdf_path: str) -> dict:
+        """
+        Full XMP extraction via pikepdf's open_metadata() — every namespaced
+        XMP key, plus Dublin Core fields and XMP timestamps pulled out
+        explicitly so callers don't have to know the namespace syntax.
+
+        Also flags xmp:MetadataDate != xmp:ModifyDate: MetadataDate tracks
+        when the metadata packet itself was last touched, ModifyDate tracks
+        when the document content was last touched. They diverge when
+        something rewrote the metadata (e.g. stripped/re-injected by a
+        tool) without going through the normal content-save path that
+        would have updated both together — a sign of post-creation
+        tampering with the metadata layer specifically.
+        """
+        result = {}
         try:
-            import pdfplumber
-            with pdfplumber.open(pdf_path) as pdf_plumb:
-                if pdf_plumb.metadata:
-                    # Cast to str — pdfplumber metadata values aren't
-                    # guaranteed JSON-serializable as-is.
-                    return {str(k): str(v) for k, v in pdf_plumb.metadata.items()}
+            with pikepdf.open(pdf_path) as pdf:
+                with pdf.open_metadata() as xmp:
+                    for key in xmp:
+                        try:
+                            result[str(key)] = str(xmp.get(key, ""))
+                        except Exception:
+                            pass
+
+                    dc_fields = [
+                        "dc:title", "dc:creator", "dc:description",
+                        "dc:publisher", "dc:date", "dc:format",
+                        "dc:identifier", "dc:source", "dc:language",
+                    ]
+                    for f in dc_fields:
+                        try:
+                            val = xmp.get(f)
+                            if val:
+                                result[f] = str(val)
+                        except Exception:
+                            pass
+
+                    xmp_timestamps = [
+                        "xmp:CreateDate", "xmp:ModifyDate",
+                        "xmp:MetadataDate", "xmp:CreatorTool",
+                    ]
+                    for f in xmp_timestamps:
+                        try:
+                            val = xmp.get(f)
+                            if val:
+                                result[f] = str(val)
+                        except Exception:
+                            pass
+
+                    xmp_meta_date = result.get("xmp:MetadataDate")
+                    xmp_mod_date  = result.get("xmp:ModifyDate")
+                    if xmp_meta_date and xmp_mod_date and xmp_meta_date != xmp_mod_date:
+                        result["_metadata_date_mismatch"] = True
         except Exception:
             pass
-        return {}
+        return result
+
+    def _check_page_rotation_consistency(self, pdf_path: str) -> dict:
+        """
+        Pages from different source documents merged into one PDF often
+        carry different /Rotate values (each source page kept its own
+        viewer rotation) — a mix of rotations across pages is a sign of
+        document recombination, not a single coherent scan/export.
+        """
+        result = {"consistent": True, "rotations": [], "anomaly": False}
+        try:
+            doc = fitz.open(pdf_path)
+            rotations = [page.rotation for page in doc]
+            doc.close()
+            result["rotations"] = rotations
+            unique_rotations = set(rotations)
+
+            if len(unique_rotations) > 1:
+                result["consistent"] = False
+                result["anomaly"] = True
+                result["anomaly_reason"] = (
+                    f"Pages have inconsistent rotation: {sorted(unique_rotations)} "
+                    f"— may indicate pages from different documents were merged"
+                )
+        except Exception:
+            pass
+        return result
 
     # ── Anomaly detection ──────────────────────────────────────────────────────
 
@@ -875,6 +977,20 @@ class MetadataExtractor:
                 "re-processed after creation"
             )
             score += SCORE_XMP_MISMATCH
+
+        # XMP MetadataDate vs ModifyDate mismatch (full XMP extraction)
+        if report.xmp_fields.get("_metadata_date_mismatch"):
+            anomalies.append(
+                "XMP MetadataDate differs from XMP ModifyDate — "
+                "document metadata was updated separately from content, "
+                "suggesting post-creation modification"
+            )
+            score += SCORE_XMP_METADATA_DATE_MISMATCH
+
+        # Page rotation inconsistency — signs of document recombination
+        if report.page_rotation.get("anomaly"):
+            anomalies.append(report.page_rotation["anomaly_reason"])
+            score += SCORE_ROTATION_INCONSISTENCY
 
         # 6. Time delta anomaly
         if report.time_delta_seconds is not None:

@@ -426,6 +426,9 @@ def build_full_metadata(meta_report, total_pages: int, has_images: bool) -> Full
         fonts=[FontDetail(**f) for f in meta_report.fonts],
         page_details=[PageDetail(**p) for p in meta_report.page_details],
         xmp_fields=meta_report.xmp_fields,
+        icc_profiles=meta_report.icc_profiles,
+        has_icc_profiles=meta_report.has_icc_profiles,
+        page_rotation=meta_report.page_rotation,
         raw=meta_report.raw_metadata,
         structure=meta_report.structure,
         suspicious_content=meta_report.suspicious_content,
@@ -491,6 +494,18 @@ async def analyze_document(file: UploadFile = File(...)):
         with open(tmp_path, "wb") as f:
             f.write(content)
 
+        # For a directly-uploaded image, OCR the ORIGINAL pixels before
+        # convert_to_pdf() stretches the image into a fixed-size PDF page
+        # and re-rasterizes it at a different DPI (and deletes the
+        # original file) — that round-trip loses fine detail this layer
+        # can otherwise use directly.
+        direct_image_ocr = None
+        if ext in (".jpg", ".jpeg", ".png"):
+            try:
+                direct_image_ocr = OCRAnalyzer().analyze_image(tmp_path)
+            except Exception:
+                direct_image_ocr = None
+
         # Convert to PDF if needed
         pdf_path = convert_to_pdf(tmp_path, file.filename)
 
@@ -515,7 +530,7 @@ async def analyze_document(file: UploadFile = File(...)):
         doc_tmp.close()
 
         try:
-            ocr_report     = OCRAnalyzer().analyze(pdf_path)
+            ocr_report     = direct_image_ocr if direct_image_ocr is not None else OCRAnalyzer().analyze(pdf_path)
         except Exception as e:
             ocr_report     = None
 
@@ -595,7 +610,7 @@ async def analyze_document(file: UploadFile = File(...)):
             suspicious_lines=suspicious_lines,
             numeric_anomalies=numeric_anomalies,
             ela_regions=ela_report.regions if ela_report else [],
-            ocr_regions=ocr_report.suspicious_regions if ocr_report else [],
+            ocr_regions=ocr_report.word_anomalies if ocr_report else [],
             overlay_regions=pymupdf_report.overlay_regions if pymupdf_report else [],
             metadata_findings=metadata_findings,
         )
@@ -675,7 +690,7 @@ async def analyze_document(file: UploadFile = File(...)):
             "suspicious_lines": suspicious_lines,
             "numeric_anomalies": numeric_anomalies,
             "ela_regions": ela_report.regions if ela_report else [],
-            "ocr_regions": ocr_report.suspicious_regions if ocr_report else [],
+            "ocr_word_anomalies": ocr_report.word_anomalies if ocr_report else [],
             "overlay_regions": pymupdf_report.overlay_regions if pymupdf_report else [],
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
         }
@@ -696,6 +711,25 @@ async def analyze_document(file: UploadFile = File(...)):
         result_dict = result.dict()
         result_dict["analysis_id"] = analysis_id
         result_dict["total_pages"] = total_pages
+        result_dict["ocr_word_anomalies"] = [
+            {
+                "page": a.page + 1,
+                "word": a.word,
+                "bbox": list(a.bbox),
+                "anomaly_types": a.anomaly_types,
+                "size_z": round(a.size_z, 2),
+                "color_z": round(a.color_z, 2),
+                "reason": a.reason,
+            }
+            for a in (ocr_report.word_anomalies if ocr_report else [])
+        ]
+        result_dict["ocr_stats"] = {
+            "word_count": ocr_report.word_count if ocr_report else 0,
+            "avg_font_size": ocr_report.avg_font_size if ocr_report else 0,
+            "avg_color_brightness": ocr_report.avg_color_brightness if ocr_report else 0,
+            "avg_confidence": ocr_report.avg_confidence if ocr_report else 0,
+        }
+        result_dict["incremental_updates"] = ela_report.incremental_updates if ela_report else {}
         return result_dict
 
     finally:
@@ -757,7 +791,7 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
         highlighter = LocationHighlighter(pdf_path)
         highlighted = highlighter.highlight_pages(
             suspicious_lines=cached["suspicious_lines"],
-            ocr_regions=cached["ocr_regions"],
+            ocr_word_anomalies=cached["ocr_word_anomalies"],
             numeric_anomalies=cached["numeric_anomalies"],
             ela_regions=cached["ela_regions"],
             overlay_regions=cached.get("overlay_regions", []),

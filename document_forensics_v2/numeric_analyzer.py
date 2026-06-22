@@ -92,6 +92,26 @@ class NumericAnalyzer:
     # only to weight the signal text/score, not to decide whether to flag.
     EXTREME_Z_SCORE_THRESHOLD = 5.0
 
+    # Cross-field arithmetic validation (salary/financial documents): labels
+    # we recognize when scanning a line for a labeled financial field, and
+    # the key each maps to in the `labeled` dict built by _validate_arithmetic.
+    ARITHMETIC_LABEL_KEYWORDS = [
+        ("basic", "basic"), ("hra", "hra"),
+        ("gross", "gross"), ("total earnings", "total_earnings"),
+        ("total deduction", "total_deductions"),
+        ("net pay", "net_pay"), ("net salary", "net_pay"),
+        ("professional tax", "prof_tax"),
+        ("provident fund", "pf"), ("pf", "pf"),
+    ]
+
+    # Net Pay = Total Earnings - Total Deductions is expected to hold
+    # exactly; a real document can have <=0.5% rounding noise, anything
+    # beyond that is a tampered figure where the components weren't
+    # recalculated to match (e.g. the total was edited by -300).
+    ARITHMETIC_MISMATCH_PCT_THRESHOLD = 0.5
+    ARITHMETIC_SCORE_PER_MISMATCH     = 35
+    ARITHMETIC_SCORE_CAP              = 70
+
     def analyze(self, pdf_path: str) -> NumericReport:
         lines = self._extract_lines_with_numbers(pdf_path)
 
@@ -114,6 +134,14 @@ class NumericAnalyzer:
                 continue
             anomalies = self._find_outliers(items, context)
             all_anomalies.extend(anomalies)
+
+        # Cross-field arithmetic check (salary/financial documents):
+        # Net Pay should equal Total Earnings - Total Deductions. This
+        # catches a tampered total that wasn't recalculated to match its
+        # components — a pattern the column/label statistical grouping
+        # above can't see, since each field individually still looks like
+        # a plausible number.
+        all_anomalies.extend(self._validate_arithmetic(lines))
 
         # Sort by z-score descending
         all_anomalies.sort(key=lambda x: x.z_score, reverse=True)
@@ -489,6 +517,71 @@ class NumericAnalyzer:
 
         return anomalies
 
+    # ── Arithmetic validation ──────────────────────────────────────────────────
+
+    def _label_matches(self, text_lower: str, keyword: str) -> bool:
+        """
+        Plain substring match for longer labels ("total earnings", "gross"),
+        but word-boundary match for short abbreviations ("pf", "hra") —
+        a bare substring check on "pf" would also match inside ordinary
+        words like "helpful", silently mislabeling unrelated lines.
+        """
+        if len(keyword) <= 3:
+            return re.search(rf"\b{re.escape(keyword)}\b", text_lower) is not None
+        return keyword in text_lower
+
+    def _validate_arithmetic(self, lines: list[dict]) -> list[NumericAnomaly]:
+        """
+        Cross-field arithmetic check for salary/financial documents:
+        Net Pay is expected to equal Total Earnings - Total Deductions.
+
+        Each labeled field is looked up independently across the document
+        by keyword, so this only fires when all three fields are actually
+        present and labeled — documents without a recognizable
+        earnings/deductions/net-pay structure are left alone.
+        """
+        labeled = {}  # key -> {"value": float, "line": line dict}
+        for line in lines:
+            text_lower = line["text"].lower()
+            if not line["numbers"]:
+                continue
+            for keyword, key in self.ARITHMETIC_LABEL_KEYWORDS:
+                if self._label_matches(text_lower, keyword):
+                    labeled[key] = {"value": line["numbers"][-1], "line": line}
+
+        anomalies = []
+        required = ("net_pay", "total_earnings", "total_deductions")
+        if all(k in labeled for k in required):
+            total_earnings   = labeled["total_earnings"]["value"]
+            total_deductions = labeled["total_deductions"]["value"]
+            actual_net        = labeled["net_pay"]["value"]
+            expected_net      = total_earnings - total_deductions
+
+            diff     = abs(expected_net - actual_net)
+            pct_diff = diff / max(abs(expected_net), 1) * 100
+
+            if pct_diff > self.ARITHMETIC_MISMATCH_PCT_THRESHOLD:
+                net_line = labeled["net_pay"]["line"]
+                anomalies.append(NumericAnomaly(
+                    page=net_line["page"],
+                    line_num=net_line["line_num"],
+                    text=net_line["text"][:80],
+                    bbox=net_line["bbox"],
+                    value=actual_net,
+                    group_mean=round(expected_net, 2),
+                    group_std=0.0,
+                    z_score=round(pct_diff, 2),
+                    context="arithmetic_validation",
+                    reason=(
+                        f"Net Pay {actual_net:,.2f} ≠ Total Earnings "
+                        f"{total_earnings:,.2f} - Total Deductions "
+                        f"{total_deductions:,.2f} = {expected_net:,.2f} "
+                        f"(difference: {diff:,.2f})"
+                    ),
+                ))
+
+        return anomalies
+
     # ── Signals ────────────────────────────────────────────────────────────────
 
     def _build_signals(
@@ -507,9 +600,22 @@ class NumericAnalyzer:
             )
             return signals, 0
 
+        # Arithmetic mismatches carry a pct-difference in their z_score
+        # field, not a real z-score — score and report them separately
+        # from the statistical tiers below rather than bucketing a small
+        # percentage (e.g. 0.6) into "below threshold" and losing the signal.
+        arithmetic = [a for a in anomalies if a.context == "arithmetic_validation"]
+        statistical = [a for a in anomalies if a.context != "arithmetic_validation"]
+
+        if arithmetic:
+            for a in arithmetic:
+                signals.append(f"Arithmetic mismatch: {a.reason}")
+            score += min(self.ARITHMETIC_SCORE_CAP,
+                         len(arithmetic) * self.ARITHMETIC_SCORE_PER_MISMATCH)
+
         # High z-score anomalies
-        extreme = [a for a in anomalies if a.z_score >= self.EXTREME_Z_SCORE_THRESHOLD]
-        high    = [a for a in anomalies if self.Z_SCORE_THRESHOLD <= a.z_score < self.EXTREME_Z_SCORE_THRESHOLD]
+        extreme = [a for a in statistical if a.z_score >= self.EXTREME_Z_SCORE_THRESHOLD]
+        high    = [a for a in statistical if self.Z_SCORE_THRESHOLD <= a.z_score < self.EXTREME_Z_SCORE_THRESHOLD]
 
         if extreme:
             signals.append(

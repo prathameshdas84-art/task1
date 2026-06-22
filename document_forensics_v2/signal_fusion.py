@@ -146,7 +146,7 @@ class SignalFusion:
                 "page": _field(ocr, "page", 0),
                 "bbox": tuple(bbox),
                 "line_num": None,
-                "text": _field(ocr, "text"),
+                "text": _field(ocr, "word") or _field(ocr, "text"),
                 "score": 1.0 - (_field(ocr, "confidence", 100) or 100) / 100,
                 "raw": ocr,
             })
