@@ -54,12 +54,17 @@ DESIGN_FONT_RATIO_THRESHOLD = 0.15
 # equivalents before using this analyzer on non-Indian or non-English
 # documents.
 ALWAYS_CHECK_KEYWORDS = [
-    "salary", "ctc", "amount", "balance", "total",
+    "salary", "amount", "balance", "total",
     "net pay", "gross", "income", "compensation",
-    "remuneration", "stipend", "wage", "payment",
-    "account number", "pan", "aadhaar", "dob",
+    "remuneration", "stipend", "payment",
+    "account number", "aadhaar",
     "date of birth",
 ]
+# Short keywords collide with ordinary words when matched as bare
+# substrings — "pan" matches "company"/"Japan"/"expand", "dob" matches
+# "Adobe", "wage" matches "sewage", "ctc" is short enough to risk the
+# same. Require word boundaries so they only match the actual abbreviation.
+ALWAYS_CHECK_KEYWORDS_WORD_BOUNDARY = [r"\bctc\b", r"\bpan\b", r"\bdob\b", r"\bwage\b"]
 CRITICAL_VALUE_KEYWORDS = [
     "salary", "ctc", "amount", "balance", "total",
     "net pay", "gross", "income", "compensation",
@@ -156,6 +161,37 @@ FONT_MISMATCH_DEFAULT_SCORE   = 0.40
 # document's 0-100 anomaly_score scale, not the 0.0-1.0 per-line scale.
 MIXED_FONT_EMBEDDING_SCORE = 25
 
+# Per-line font-color consistency: spans within one PyMuPDF text LINE were
+# drawn by the same renderer in the same pass, so they should share the
+# exact RGB. Raising COLOR_DIFF_MIN alone can't separate a sloppy edit
+# (ink color that's close-but-not-quite a match) from deliberate "Label:
+# Value" styling (gray label + black filled-in value on one visual row —
+# extremely common on payslips, bank statements, certificates), because
+# the latter often has an even BIGGER RGB distance than a careless forgery.
+# The actual distinguishing fact is repetition: a label/value color pair
+# recurs on many lines throughout the document (it's the template's
+# style), while an edited span's slightly-off color appears once. So a
+# color is only a candidate anomaly if it's RARE document-wide — same
+# frequency-clustering principle ocr_analyzer.py already uses for OCR
+# word size/color outliers (_common_value_clusters/SIZE_CLUSTER_MIN_SHARE).
+COLOR_DIFF_MIN                    = 15   # filters anti-aliasing/rounding noise, not real styling
+COLOR_CLUSTER_MIN_SHARE           = 0.03  # a color on >=3% of spans is a deliberate document style
+COLOR_CONSISTENCY_SCORE_PER_SPAN  = 10
+COLOR_CONSISTENCY_SCORE_CAP       = 40
+
+# Government ID cards (Aadhaar, PAN, driving licence, passport, voter ID)
+# intentionally mix multiple ink colors on the same visual line by template
+# design (e.g. Aadhaar's blue/black/orange) — the per-line color-consistency
+# check below would otherwise flag that as tampering on every single one.
+ID_CARD_KEYWORDS = [
+    "aadhaar", "aadhar", "uid", "uidai", "unique identification",
+    "permanent account number", "pan card",
+    "driving licence", "driving license",
+    "passport", "voter id", "epic no",
+    "date of birth", "dob", "s/o", "d/o",
+    "government of india",
+]
+
 
 # ── Data structures ────────────────────────────────────────────────────────────
 
@@ -227,7 +263,16 @@ class ContentAnalyzer:
 
         profile          = self._build_profile(lines)
         suspicious_lines = self._score_lines(lines, profile)
-        signals, score   = self._build_signals(lines, suspicious_lines, profile, fonts or [])
+
+        # ID cards (Aadhaar/PAN/driving licence/passport/voter ID)
+        # legitimately mix ink colors on one line by template design — the
+        # per-line color-consistency check is suppressed for them entirely
+        # rather than threshold-tuned, since there's no single tolerance
+        # that fits both "blue/black/orange on one Aadhaar line" and "one
+        # tampered span" at the same time.
+        is_id_card = self._is_id_card_document(lines)
+        color_issues = [] if is_id_card else self._check_color_consistency_per_line(pdf_path)
+        signals, score   = self._build_signals(lines, suspicious_lines, profile, fonts or [], color_issues)
 
         return ContentReport(
             total_lines=len(lines),
@@ -583,6 +628,30 @@ class ContentAnalyzer:
                 "median": statistics.median(vals),
             }
 
+        def trimmed_stats(values, trim_pct=0.10):
+            """
+            Same shape as safe_stats, but excludes the top/bottom trim_pct
+            of values before computing mean/std — threshold saturation:
+            one injected 36pt line among fifty 11pt lines otherwise
+            inflates `std` enough that a separate, smaller font-size/
+            spacing edit elsewhere in the document no longer clears
+            Z_OUTLIER_THRESHOLD. Falls back to safe_stats when there
+            aren't enough values left to trim meaningfully.
+            """
+            vals = [v for v in values if v and v > 0]
+            if len(vals) < 4:
+                return safe_stats(vals)
+            sorted_vals = sorted(vals)
+            trim = max(1, int(len(sorted_vals) * trim_pct))
+            trimmed = sorted_vals[trim:-trim]
+            if len(trimmed) < 2:
+                return safe_stats(vals)
+            return {
+                "mean":   statistics.mean(trimmed),
+                "std":    max(statistics.stdev(trimmed), 1e-9),
+                "median": statistics.median(trimmed),
+            }
+
         font_counts = Counter(l.font_name for l in lines)
         dominant    = font_counts.most_common(1)[0][0]
 
@@ -599,9 +668,9 @@ class ContentAnalyzer:
             "dominant_font_ratio": font_counts[dominant] / len(lines),
             "font_count":          len(font_counts),
             "design_fonts":        design_fonts,
-            "font_size":           safe_stats([l.font_size     for l in lines]),
-            "char_spacing":        safe_stats([l.char_spacing   for l in lines]),
-            "word_spacing":        safe_stats([l.word_spacing   for l in lines]),
+            "font_size":           trimmed_stats([l.font_size     for l in lines]),
+            "char_spacing":        trimmed_stats([l.char_spacing   for l in lines]),
+            "word_spacing":        trimmed_stats([l.word_spacing   for l in lines]),
             "line_height":         safe_stats([l.line_height    for l in lines]),
             "noise":               safe_stats([l.noise          for l in lines]),
             "sharpness":           safe_stats([l.sharpness      for l in lines]),
@@ -627,6 +696,8 @@ class ContentAnalyzer:
         # These are the most common tamper targets
         text_lower = text.lower()
         if any(kw in text_lower for kw in ALWAYS_CHECK_KEYWORDS):
+            return False  # never structural — always check
+        if any(re.search(kw, text_lower) for kw in ALWAYS_CHECK_KEYWORDS_WORD_BOUNDARY):
             return False  # never structural — always check
 
         # Rule 1: ALL CAPS line = header
@@ -849,6 +920,109 @@ class ContentAnalyzer:
     def _z(self, value: float, stats: dict) -> float:
         return abs(value - stats["mean"]) / stats["std"]
 
+    def _is_id_card_document(self, lines: list) -> bool:
+        text_lower = " ".join(line.text.lower() for line in lines)
+        return any(kw in text_lower for kw in ID_CARD_KEYWORDS)
+
+    def _check_color_consistency_per_line(self, pdf_path: str) -> list[dict]:
+        """
+        Within each text line, flag a span whose RGB color both (a)
+        differs meaningfully from the line's dominant color and (b) is
+        RARE across the whole document — see COLOR_CLUSTER_MIN_SHARE above
+        for why frequency, not raw color distance, is what separates a
+        real edit from deliberate label/value styling.
+        """
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:
+            return []
+
+        line_spans = []  # list of list[span_color_dict], one per line
+        all_colors = []
+
+        try:
+            for page_num in range(len(doc)):
+                rawdict = doc[page_num].get_text("rawdict")
+                for block in rawdict.get("blocks", []):
+                    for line in block.get("lines", []):
+                        spans = []
+                        for span in line.get("spans", []):
+                            # rawdict spans have no "text" field, only a
+                            # per-character "chars" list (see
+                            # ocr_analyzer._split_span_into_words) — same
+                            # reconstruction needed here.
+                            text = "".join(ch.get("c", "") for ch in span.get("chars", [])).strip()
+                            if not text:
+                                continue
+                            color_int = span.get("color", 0)
+                            rgb = (
+                                (color_int >> 16) & 0xFF,
+                                (color_int >> 8) & 0xFF,
+                                color_int & 0xFF,
+                            )
+                            spans.append({
+                                "text": text, "rgb": rgb,
+                                "bbox": span.get("bbox", (0, 0, 0, 0)),
+                                "page": page_num,
+                            })
+                            all_colors.append(rgb)
+                        if len(spans) >= 2:
+                            line_spans.append(spans)
+        finally:
+            doc.close()
+
+        if not all_colors:
+            return []
+
+        color_counts = Counter(all_colors)
+        threshold = max(2, round(len(all_colors) * COLOR_CLUSTER_MIN_SHARE))
+        common_colors = {c for c, n in color_counts.items() if n >= threshold}
+
+        candidates = []
+        for spans in line_spans:
+            counts = Counter(s["rgb"] for s in spans)
+            dominant_color = counts.most_common(1)[0][0]
+            if len(counts) <= 1:
+                continue
+            for s in spans:
+                if s["rgb"] == dominant_color or s["rgb"] in common_colors:
+                    continue
+                diff = sum(abs(a - b) for a, b in zip(s["rgb"], dominant_color))
+                if diff < COLOR_DIFF_MIN:
+                    continue
+                candidates.append((s, dominant_color, diff))
+
+        # A real edit happens once, in one place. The exact same (text,
+        # color, dominant_color) combination recurring on 2+ DIFFERENT
+        # pages is a repeated letterhead/header/footer element rendered
+        # with a slightly different anti-aliased near-black than the body
+        # text -- not an edit replicated identically across pages.
+        pages_per_combo = {}
+        for s, dominant_color, _ in candidates:
+            key = (s["text"], s["rgb"], dominant_color)
+            pages_per_combo.setdefault(key, set()).add(s["page"])
+
+        anomalies = []
+        for s, dominant_color, diff in candidates:
+            key = (s["text"], s["rgb"], dominant_color)
+            if len(pages_per_combo[key]) >= 2:
+                continue
+            anomalies.append({
+                    "page": s["page"],
+                    "text": s["text"],
+                    "bbox": s["bbox"],
+                    "color": s["rgb"],
+                    "dominant_color": dominant_color,
+                    "color_diff": diff,
+                    "reason": (
+                        f"Color mismatch within same line: span '{s['text'][:20]}' "
+                        f"uses RGB{s['rgb']} while the rest of the line uses "
+                        f"RGB{dominant_color} (diff={diff}) — possible text "
+                        f"edited with a different tool"
+                    ),
+                })
+        return anomalies
+
     # ── Signals + score ────────────────────────────────────────────────────────
 
     def _mixed_font_embedding_families(self, fonts: list) -> set:
@@ -876,7 +1050,7 @@ class ContentAnalyzer:
         return embedded_families & unembedded_families
 
     def _build_signals(
-        self, lines, suspicious_lines, profile, fonts: list = None
+        self, lines, suspicious_lines, profile, fonts: list = None, color_issues: list = None
     ) -> tuple[list[str], int]:
         signals = []
         score   = 0
@@ -918,6 +1092,15 @@ class ContentAnalyzer:
                 f"{len(med)} line(s) with moderate anomaly"
             )
             score += min(20, len(med) * 5)
+
+        if color_issues:
+            signals.append(
+                f"{len(color_issues)} span(s) with color inconsistency within "
+                f"the same text line — text color doesn't match the rest of "
+                f"the line, possible edit with a different tool"
+            )
+            score += min(COLOR_CONSISTENCY_SCORE_CAP,
+                         len(color_issues) * COLOR_CONSISTENCY_SCORE_PER_SPAN)
 
         if not signals:
             signals.append(

@@ -23,6 +23,7 @@ from ocr_analyzer import OCRAnalyzer
 from numeric_analyzer import NumericAnalyzer
 from ela_analyzer import ELAAnalyzer
 from pymupdf_analyzer import PyMuPDFAnalyzer
+from xref_analyzer import XrefAnalyzer
 from verdict_engine import combine
 from models import (
     ForensicResponse, HealthResponse,
@@ -131,6 +132,10 @@ def build_confidence_detail(
     if layer_scores.get("pymupdf", 0) >= 20:
         active_layers.append("PyMuPDF")
         key_signals.append(f"PyMuPDF deep analysis score {layer_scores['pymupdf']}/100")
+
+    if layer_scores.get("xref", 0) >= 20:
+        active_layers.append("XREF")
+        key_signals.append(f"XREF sequence anomaly score {layer_scores['xref']}/100")
 
     n_active = len(active_layers)
 
@@ -417,6 +422,7 @@ def build_full_metadata(meta_report, total_pages: int, has_images: bool) -> Full
         total_pages=total_pages,
         document_id=meta_report.document_id,
         has_javascript=meta_report.has_javascript,
+        js_context=meta_report.js_context,
         has_open_action=meta_report.has_open_action,
         has_embedded_files=meta_report.has_embedded_files,
         has_images=has_images,
@@ -552,6 +558,11 @@ async def analyze_document(file: UploadFile = File(...)):
         except Exception as e:
             pymupdf_report = None
 
+        try:
+            xref_report = XrefAnalyzer().analyze(pdf_path)
+        except Exception as e:
+            xref_report = None
+
         if not all([meta_report, content_report, ocr_report]):
             raise HTTPException(
                 status_code=500,
@@ -561,8 +572,18 @@ async def analyze_document(file: UploadFile = File(...)):
         # Combine verdict
         verdict_obj = combine(
             meta_report, content_report, ocr_report,
-            numeric_report, ela_report, pymupdf_report
+            numeric_report, ela_report, pymupdf_report, xref_report
         )
+
+        # Gatekeeper — an ORIGINAL verdict means no layer accumulated enough
+        # evidence to call this document modified. Surfacing per-region
+        # location arrays anyway (a borderline ELA block, a lone OCR word
+        # anomaly that didn't move the score) draws false highlight boxes on
+        # a document the engine itself just called clean. Every coordinate-
+        # bearing list below is zeroed at the source so it can't reach
+        # either the JSON response or the annotation cache that
+        # /annotated-image reads from.
+        is_clean = verdict_obj.verdict == "ORIGINAL"
 
         # Recompute authenticity now that the cross-layer verdict exists — the
         # metadata-only score produced inside extract() can't see content/OCR/
@@ -583,18 +604,24 @@ async def analyze_document(file: UploadFile = File(...)):
             "numeric":  verdict_obj.numeric_score,
             "ela":      verdict_obj.ela_score,
             "pymupdf":  verdict_obj.pymupdf_score,
+            "xref":     verdict_obj.xref_score,
         }
 
-        # Build confidence detail
-        suspicious_lines = content_report.suspicious_lines if content_report else []
-        numeric_anomalies = numeric_report.anomalies if numeric_report else []
+        # Build confidence detail — all gated to [] when is_clean, so every
+        # consumer below (fusion, the response payload, and the annotation
+        # cache) sees the same suppressed state.
+        suspicious_lines = [] if is_clean else (content_report.suspicious_lines if content_report else [])
+        numeric_anomalies = [] if is_clean else (numeric_report.anomalies if numeric_report else [])
+        ela_regions = [] if is_clean else (ela_report.regions if ela_report else [])
+        ocr_word_anomalies = [] if is_clean else (ocr_report.word_anomalies if ocr_report else [])
+        overlay_regions = [] if is_clean else (pymupdf_report.overlay_regions if pymupdf_report else [])
 
         # Metadata is a document-level signal with no bbox, so on its own it can
         # never fuse spatially. Represent a flagged metadata report as a global
         # page-1 pseudo-finding so it can cross-validate any location-based
         # anomaly (a metadata edit trace + a visual/content anomaly is strong).
         metadata_findings = []
-        if meta_report and meta_report.anomaly_score >= 30:
+        if not is_clean and meta_report and meta_report.anomaly_score >= 30:
             metadata_findings.append({
                 "layer": "metadata",
                 "page": 0,  # 0-indexed; surfaces as page 1 in the response
@@ -609,9 +636,9 @@ async def analyze_document(file: UploadFile = File(...)):
         fused_findings, fusion_stats = fusion_engine.fuse(
             suspicious_lines=suspicious_lines,
             numeric_anomalies=numeric_anomalies,
-            ela_regions=ela_report.regions if ela_report else [],
-            ocr_regions=ocr_report.word_anomalies if ocr_report else [],
-            overlay_regions=pymupdf_report.overlay_regions if pymupdf_report else [],
+            ela_regions=ela_regions,
+            ocr_regions=ocr_word_anomalies,
+            overlay_regions=overlay_regions,
             metadata_findings=metadata_findings,
         )
 
@@ -644,6 +671,7 @@ async def analyze_document(file: UploadFile = File(...)):
                     text=sl.text,
                     anomaly_score_pct=int(sl.score * 100),
                     reasons=sl.anomalies[:3],
+                    bbox=list(sl.bbox) if sl.bbox else None,
                 )
                 for sl in suspicious_lines[:15]
             ],
@@ -655,6 +683,7 @@ async def analyze_document(file: UploadFile = File(...)):
                     value=a.value,
                     z_score=a.z_score,
                     reason=a.reason,
+                    bbox=list(a.bbox) if a.bbox else None,
                 )
                 for a in numeric_anomalies[:10]
             ],
@@ -689,9 +718,9 @@ async def analyze_document(file: UploadFile = File(...)):
             "response": result,           # ForensicResponse object
             "suspicious_lines": suspicious_lines,
             "numeric_anomalies": numeric_anomalies,
-            "ela_regions": ela_report.regions if ela_report else [],
-            "ocr_word_anomalies": ocr_report.word_anomalies if ocr_report else [],
-            "overlay_regions": pymupdf_report.overlay_regions if pymupdf_report else [],
+            "ela_regions": ela_regions,
+            "ocr_word_anomalies": ocr_word_anomalies,
+            "overlay_regions": overlay_regions,
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
         }
         # This path is now owned by the cache — the finally block below
@@ -721,7 +750,7 @@ async def analyze_document(file: UploadFile = File(...)):
                 "color_z": round(a.color_z, 2),
                 "reason": a.reason,
             }
-            for a in (ocr_report.word_anomalies if ocr_report else [])
+            for a in ocr_word_anomalies
         ]
         result_dict["ocr_stats"] = {
             "word_count": ocr_report.word_count if ocr_report else 0,
@@ -788,15 +817,24 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
         if cached.get("response") and cached["response"].metadata:
             age_days = cached["response"].metadata.edit_age_days
 
-        highlighter = LocationHighlighter(pdf_path)
-        highlighted = highlighter.highlight_pages(
-            suspicious_lines=cached["suspicious_lines"],
-            ocr_word_anomalies=cached["ocr_word_anomalies"],
-            numeric_anomalies=cached["numeric_anomalies"],
-            ela_regions=cached["ela_regions"],
-            overlay_regions=cached.get("overlay_regions", []),
-            age_days=age_days,
-        )
+        # highlight_pages() renders and annotates EVERY anomalous page in
+        # one call (it has to — boxes are computed from the full set of
+        # findings, not per-page), so calling it again per page request
+        # would redundantly redo that work N times for an N-page document.
+        # Cache the result on the analysis the first time it's needed and
+        # reuse it for every subsequent page of the SAME analysis_id.
+        highlighted = cached.get("highlighted_pages")
+        if highlighted is None:
+            highlighter = LocationHighlighter(pdf_path)
+            highlighted = highlighter.highlight_pages(
+                suspicious_lines=cached["suspicious_lines"],
+                ocr_word_anomalies=cached["ocr_word_anomalies"],
+                numeric_anomalies=cached["numeric_anomalies"],
+                ela_regions=cached["ela_regions"],
+                overlay_regions=cached.get("overlay_regions", []),
+                age_days=age_days,
+            )
+            cached["highlighted_pages"] = highlighted
 
         if page_idx not in highlighted:
             # Return clean page if no anomalies on this page

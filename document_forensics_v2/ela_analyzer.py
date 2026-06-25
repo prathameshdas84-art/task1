@@ -17,6 +17,8 @@ import fitz
 import numpy as np
 from PIL import Image
 
+from pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
+
 
 RENDER_DPI    = 150
 # Vector PDFs (text outlined to paths — Canva/Figma/Illustrator exports)
@@ -94,6 +96,26 @@ SCALE_MATCH_PADDING_PT = 3.0
 CONFIRMED_BLOCK_SCORE_PER_BLOCK = 15
 CONFIRMED_BLOCK_SCORE_CAP       = 70
 
+# Scanned-document calibration: scanner compression artifacts and paper
+# texture create a baseline ELA noise floor scattered across the WHOLE
+# page as many small, spatially-isolated 1-2-block hits (confirmed by
+# testing: 25 such hits spread across all 3 pages of a real scanned
+# payslip, no two near each other). A genuine edit covers a whole word or
+# line of replaced text, so it shows up as ONE contiguous cluster of
+# several touching blocks. Requiring the high-DPI 3rd scale to also agree
+# was tried first and rejected — testing showed it almost never confirms
+# ANYTHING, even on a document with a known real edit, making it too blunt
+# a gate (would suppress real positives as readily as noise). Cluster size
+# is the discriminator that actually separates the two cases.
+SCANNED_MIN_CLUSTER_SIZE          = 3     # blocks; smaller clusters = scattered noise, not an edit
+SCANNED_CLUSTER_GAP_TOLERANCE_PT  = 4.0   # how close two blocks must be to count as "touching"
+SCANNED_SCORE_MULTIPLIER          = 0.6
+SCANNED_LOW_HIT_COUNT             = 5     # fewer confirmed blocks than this = likely noise, not edit
+SCANNED_LOW_HIT_MULTIPLIER        = 0.5
+SCANNED_SIGNATURE_ZONE_FRACTION   = 0.15  # bottom of page — signatures always cause ELA noise
+SCANNED_HEADER_ZONE_FRACTION      = 0.12  # top of page — printed logos/letterhead on a scan
+SCANNED_HEADER_WEIGHT_MULTIPLIER  = 0.6   # reduce (not drop) header-zone hits by 40%
+
 # High-DPI region refinement: how much padding (in low-DPI block-equivalents)
 # to render around a confirmed block when cropping for exact-location
 # refinement, so the crop has enough surrounding context to compute a
@@ -109,9 +131,37 @@ SHARPNESS_RENDER_DPI  = 600
 # Image-document noise-consistency check (scanned/photographed pages) —
 # z-score cutoff for a 32x32 noise-variance block to count as anomalous,
 # plus the score weights for however many such blocks get found.
-NOISE_Z_THRESHOLD       = 4.0
+#
+# Empirically validated against a real photographed government-ID page
+# (dense security micro-print/hologram texture) plus a synthetic
+# cover-and-retype tamper built from the same page: natural ID-card
+# texture alone produces block z-scores up to 9.2 with zero tampering,
+# while the tamper's blocks peaked at 13.0 (several blocks landing
+# 9.9-13.0) — a threshold of 4.0 flagged 384 untampered blocks across a
+# 12-page real scan, all false positives. 9.5 sits just above the
+# observed natural ceiling and below the tamper's confirmed hits.
+NOISE_Z_THRESHOLD       = 9.5
 NOISE_SCORE_PER_REGION  = 8
 NOISE_SCORE_CAP         = 40
+
+# "Too clean" / digital-erasure detection. A digital eraser or clone stamp
+# leaves a region with near-zero pixel variance — real paper/background,
+# even on a clean scan, has microscopic sensor noise. This is restricted to
+# LIGHT pixels only (background, not text strokes or dense image content),
+# unlike _analyze_noise_consistency (which scans the whole page and flags
+# BOTH directions — too noisy or too clean). Treat this as a complementary,
+# narrower signal, not a replacement: it only fires deep inside a flat
+# background region, where _analyze_noise_consistency's blocks would mostly
+# sit near its own mean and not cross NOISE_Z_THRESHOLD.
+ERASURE_BLOCK_SIZE       = 15
+ERASURE_STRIDE           = 8
+ERASURE_BG_MIN_BRIGHTNESS = 180   # only check background-colored pixels, not text/photos
+ERASURE_RATIO_THRESHOLD  = 0.2    # block std below this fraction of the page's median std = "too clean"
+ERASURE_MIN_MEDIAN_STD   = 3.0    # a page already this flat overall isn't a real scan — skip it
+ERASURE_CLUSTER_DIST_PT  = 30
+ERASURE_SCORE_PER_REGION = 15
+ERASURE_SCORE_CAP        = 45
+ERASURE_MAX_REGIONS      = 10
 
 # Cross-page noise-consistency check (possible whole-page substitution).
 CROSS_PAGE_MIN_PAGES     = 3     # need at least this many pages to compare
@@ -128,6 +178,18 @@ HIGH_GEN_SCORE_PER_OBJECT    = 10
 HIGH_GEN_SCORE_CAP           = 35
 FREETEXT_SCORE_PER_ANNOT     = 15
 FREETEXT_SCORE_CAP           = 40
+
+# Form XObjects are a standard PDF mechanism for reusable content (logos,
+# letterhead headers/footers, repeated stamps) — not inherently a sign of
+# paste-over editing. A template component shows up on most pages, sits in
+# the header/footer band, is small relative to the page, or is image-only
+# (no text inside it to "paste over" anything with). Only an XObject that
+# is rare, body-positioned, and contains its own text content resembles an
+# injected paste-over rather than a reused template element.
+FORM_XOBJECT_MAX_TEMPLATE_FREQUENCY = 0.5   # appears on >=50% of pages = template, not injected
+FORM_XOBJECT_HEADER_ZONE_FRACTION   = 0.15  # top 15% of page = header/branding
+FORM_XOBJECT_FOOTER_ZONE_FRACTION   = 0.10  # bottom 10% of page = footer/branding
+FORM_XOBJECT_MIN_AREA_FRACTION      = 0.05  # below this = small logo/stamp
 FORM_XOBJECT_SCORE_PER_ITEM  = 10
 FORM_XOBJECT_SCORE_CAP       = 30
 OBJECT_MERGE_DIVISOR         = 3   # how much the object-fingerprint sub-score contributes to the final score
@@ -183,6 +245,8 @@ class ELARegion:
     confirmed_scales: list = field(default_factory=list)  # e.g. ["low","medium","high"]
     sharpness_anomaly: bool = False
     noise_anomaly: bool = False
+    erasure_anomaly: bool = False
+    score_weight: float = 1.0  # scanned-doc header/footer zones count for less (see SCANNED_* constants)
 
 
 @dataclass
@@ -210,6 +274,8 @@ class ELAAnalyzer:
         (low_name, low_dpi), (med_name, med_dpi), (high_name, high_dpi) = render_scales
 
         is_image_doc = self._is_image_based_document(doc, pdf_type)
+        is_scanned_type = pdf_type in ("scanned", "scanned_native")
+        page_heights = {p: doc[p].rect.height for p in range(len(doc))}
 
         signals = []
         total_blocks       = 0   # phase-1 blocks scanned, for diagnostics only
@@ -231,6 +297,10 @@ class ELAAnalyzer:
             total_blocks      += n_blocks
             total_phase1_hits += n_flagged
             regions = self._restrict_to_raster_content(page, regions)
+            if is_scanned_type:
+                page_h = page_heights[page_num]
+                signature_y0 = page_h * (1 - SCANNED_SIGNATURE_ZONE_FRACTION)
+                regions = [r for r in regions if r.bbox[1] < signature_y0]
             if regions:
                 for r in regions:
                     r.confirmed_scales = [low_name]
@@ -254,12 +324,16 @@ class ELAAnalyzer:
             img = Image.frombytes("RGB", [pix.w, pix.h], pix.samples)
 
             med_regions, _, _ = self._analyze_page(img, page_num, med_dpi)
+            qr_zones = get_qr_zones(page, doc)
 
             confirmed = []
             for cand in candidates:
-                if self._region_confirmed_by(cand.bbox, med_regions):
-                    cand.confirmed_scales.append(med_name)
-                    confirmed.append(cand)
+                if not self._region_confirmed_by(cand.bbox, med_regions):
+                    continue
+                if bbox_overlaps_qr_zone(cand.bbox, qr_zones):
+                    continue  # QR code's high-frequency pixels, not an edit
+                cand.confirmed_scales.append(med_name)
+                confirmed.append(cand)
             if confirmed:
                 confirmed_after_medium[page_num] = confirmed
 
@@ -269,6 +343,18 @@ class ELAAnalyzer:
             f"at {SCALE_CONFIRM_MIN_AGREEMENT}+ scales across "
             f"{len(confirmed_after_medium)} page(s)"
         )
+
+        # Scanned docs: drop scattered isolated/paired hits (paper-texture
+        # noise), keep only blocks that are part of a contiguous cluster
+        # large enough to plausibly be one edited word/line. See
+        # SCANNED_MIN_CLUSTER_SIZE above for why.
+        if is_scanned_type:
+            for page_num in list(confirmed_after_medium.keys()):
+                clustered = self._filter_to_significant_clusters(confirmed_after_medium[page_num])
+                if clustered:
+                    confirmed_after_medium[page_num] = clustered
+                else:
+                    del confirmed_after_medium[page_num]
 
         # ── PHASE 3: high-DPI exact-location refinement + text sharpness ──
         # ONLY for pages that survived phase 2 — confirmed-block bboxes are
@@ -301,6 +387,14 @@ class ELAAnalyzer:
 
                 if any(self._bbox_overlaps(region.bbox, b) for b in sharp_anomaly_bboxes):
                     region.sharpness_anomaly = True
+
+                if is_scanned_type:
+                    page_h = page_heights[page_num]
+                    region.score_weight = (
+                        SCANNED_HEADER_WEIGHT_MULTIPLIER
+                        if region.bbox[1] < page_h * SCANNED_HEADER_ZONE_FRACTION
+                        else 1.0
+                    )
 
                 all_regions.append(region)
 
@@ -336,6 +430,30 @@ class ELAAnalyzer:
                 )
             all_regions.extend(noise_regions)
 
+        # ── Image-based document: digital-erasure / "too clean" check ──
+        # Narrower and complementary to the noise-consistency check above —
+        # see ERASURE_* constants for why this targets a separate case.
+        erasure_regions = []
+        if is_image_doc:
+            for page_num, img in page_low_imgs.items():
+                arr = np.asarray(img)
+                hits = self._detect_erased_regions(arr, page_num, low_dpi)
+                for hit in hits:
+                    erasure_regions.append(ELARegion(
+                        page=page_num,
+                        bbox=hit["bbox"],
+                        mean_error=hit["std_val"],
+                        z_score=hit["median_std"] / max(hit["std_val"], 0.01),
+                        render_dpi=low_dpi,
+                        erasure_anomaly=True,
+                    ))
+            if erasure_regions:
+                signals.append(
+                    f"{len(erasure_regions)} suspiciously uniform background "
+                    f"region(s) found — possible digital erasure or clone stamp"
+                )
+            all_regions.extend(erasure_regions)
+
         # Cap how many boxes get drawn per page — keep only the strongest
         # outliers so the UI doesn't flood with low-confidence boxes.
         regions_by_page = {}
@@ -349,7 +467,13 @@ class ELAAnalyzer:
         doc.close()
 
         for r in all_regions:
-            if r.noise_anomaly:
+            if r.erasure_anomaly:
+                signals.append(
+                    f"Page {r.page + 1}: erased region detected at "
+                    f"({r.bbox[0]:.0f},{r.bbox[1]:.0f})-({r.bbox[2]:.0f},{r.bbox[3]:.0f}) "
+                    f"std={r.mean_error:.2f} — possible digital erasure"
+                )
+            elif r.noise_anomaly:
                 signals.append(
                     f"Page {r.page + 1}: noise-consistency anomaly at "
                     f"({r.bbox[0]:.0f},{r.bbox[1]:.0f})-({r.bbox[2]:.0f},{r.bbox[3]:.0f}) "
@@ -373,11 +497,19 @@ class ELAAnalyzer:
         # than the raw phase-1 fraction — a block surviving 2+ independent
         # DPI scales is a much stronger signal than "this fraction of blocks
         # looked busy at one resolution."
-        n_ela_confirmed = sum(1 for r in all_regions if not r.noise_anomaly)
+        ela_confirmed_regions = [r for r in all_regions if not r.noise_anomaly and not r.erasure_anomaly]
+        n_ela_confirmed = sum(r.score_weight for r in ela_confirmed_regions)
+        ela_confirmed_score = min(CONFIRMED_BLOCK_SCORE_CAP, n_ela_confirmed * CONFIRMED_BLOCK_SCORE_PER_BLOCK)
+        if is_scanned_type:
+            ela_confirmed_score *= SCANNED_SCORE_MULTIPLIER
+            if len(ela_confirmed_regions) < SCANNED_LOW_HIT_COUNT:
+                ela_confirmed_score *= SCANNED_LOW_HIT_MULTIPLIER
+
         anomaly_score = min(
             100,
-            min(CONFIRMED_BLOCK_SCORE_CAP, n_ela_confirmed * CONFIRMED_BLOCK_SCORE_PER_BLOCK)
+            ela_confirmed_score
             + min(NOISE_SCORE_CAP, len(noise_regions) * NOISE_SCORE_PER_REGION)
+            + min(ERASURE_SCORE_CAP, len(erasure_regions) * ERASURE_SCORE_PER_REGION)
         )
 
         # Cross-page consistency check (for multi-page documents)
@@ -416,7 +548,7 @@ class ELAAnalyzer:
 
         return ELAReport(
             pdf_type=pdf_type,
-            anomaly_score=anomaly_score,
+            anomaly_score=int(round(anomaly_score)),
             regions=all_regions,
             signals=signals,
             incremental_updates=incremental,
@@ -490,6 +622,78 @@ class ELAAnalyzer:
         except Exception:
             return []
 
+    def _collect_xobject_placements(self, pdf_path: str) -> dict:
+        """
+        Map each Form XObject xref to where/how it's actually used across
+        the document: how many pages invoke it, its bbox + page geometry
+        (from the first invocation), and whether it carries its own text
+        content (fonts / text-showing operators). Used to tell a reused
+        template element (logo/letterhead) apart from an injected paste-over.
+        """
+        placements = {}
+        try:
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            for page_num in range(total_pages):
+                page = doc[page_num]
+                page_rect = page.rect
+                page_area = page_rect.width * page_rect.height
+                for xref, name, invoker, bbox in page.get_xobjects():
+                    entry = placements.setdefault(xref, {
+                        "pages": set(),
+                        "bbox": bbox,
+                        "page_height": page_rect.height,
+                        "page_area": page_area,
+                    })
+                    entry["pages"].add(page_num)
+
+            for xref, entry in placements.items():
+                try:
+                    xobj_dict = doc.xref_object(xref)
+                    has_font = "/Font" in xobj_dict
+                    stream = doc.xref_stream(xref) or b""
+                    has_text_ops = b"Tj" in stream or b"TJ" in stream
+                except Exception:
+                    has_font, has_text_ops = False, False
+                entry["has_text_content"] = bool(has_font or has_text_ops)
+                entry["page_frequency"] = len(entry["pages"]) / total_pages if total_pages else 0
+
+            doc.close()
+        except Exception:
+            return {}
+        return placements
+
+    def _is_injected_xobject(self, xref: int, placements: dict) -> bool:
+        """
+        True only for Form XObjects that look like an injected paste-over
+        rather than a reused template component. See FORM_XOBJECT_* constants.
+        """
+        entry = placements.get(xref)
+        if entry is None:
+            return True  # no placement info — fall back to flagging (old behavior)
+
+        if entry["page_frequency"] >= FORM_XOBJECT_MAX_TEMPLATE_FREQUENCY:
+            return False  # appears on most pages = template, not injected
+
+        bbox = fitz.Rect(entry["bbox"])
+        page_height = entry["page_height"]
+        page_area = entry["page_area"]
+
+        if page_height > 0:
+            top_frac = bbox.y0 / page_height
+            bottom_frac = (page_height - bbox.y1) / page_height
+            if top_frac <= FORM_XOBJECT_HEADER_ZONE_FRACTION or bottom_frac <= FORM_XOBJECT_FOOTER_ZONE_FRACTION:
+                return False  # header/footer branding zone
+
+        area_frac = (bbox.width * bbox.height) / page_area if page_area > 0 else 0
+        if area_frac < FORM_XOBJECT_MIN_AREA_FRACTION:
+            return False  # small logo/stamp
+
+        if not entry.get("has_text_content"):
+            return False  # image-only content, nothing to "paste over"
+
+        return True
+
     def _pdf_object_fingerprint(self, pdf_path: str) -> tuple[list[str], int]:
         """
         Analyze PDF object structure for signs of post-creation editing.
@@ -517,6 +721,8 @@ class ELAAnalyzer:
                     f"document was saved multiple times after creation"
                 )
                 score += min(EOF_SCORE_CAP, (eof_count - 1) * EOF_SCORE_PER_REVISION)
+
+            xobject_placements = self._collect_xobject_placements(pdf_path)
 
             with pikepdf.open(pdf_path) as pdf:
 
@@ -550,11 +756,13 @@ class ELAAnalyzer:
                     except Exception:
                         pass
 
-                    # Signal 4: Form XObjects (paste-over content)
+                    # Signal 4: Form XObjects (paste-over content) — only
+                    # ones that look injected, not reused template elements
                     try:
                         if (hasattr(obj, 'get') and
                             obj.get('/Type') == pikepdf.Name('/XObject') and
-                            obj.get('/Subtype') == pikepdf.Name('/Form')):
+                            obj.get('/Subtype') == pikepdf.Name('/Form') and
+                            self._is_injected_xobject(objid, xobject_placements)):
                             form_xobjects.append(objid)
                     except Exception:
                         pass
@@ -1224,6 +1432,48 @@ class ELAAnalyzer:
                 image_pages += 1
         return image_pages >= max(1, len(doc) // 2)
 
+    def _filter_to_significant_clusters(self, regions: list) -> list:
+        """
+        Group regions into connected components by bbox proximity (touching
+        or near-touching), then keep only blocks belonging to a component
+        with >= SCANNED_MIN_CLUSTER_SIZE members. See the SCANNED_* constant
+        comment above for why this separates a real edit from scan noise.
+        """
+        n = len(regions)
+        if n == 0:
+            return []
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        tol = SCANNED_CLUSTER_GAP_TOLERANCE_PT
+        for i in range(n):
+            xi0, yi0, xi1, yi1 = regions[i].bbox
+            for j in range(i + 1, n):
+                xj0, yj0, xj1, yj1 = regions[j].bbox
+                gap_x = max(xi0, xj0) - min(xi1, xj1)
+                gap_y = max(yi0, yj0) - min(yi1, yj1)
+                if gap_x <= tol and gap_y <= tol:
+                    union(i, j)
+
+        component_sizes = {}
+        for i in range(n):
+            root = find(i)
+            component_sizes[root] = component_sizes.get(root, 0) + 1
+
+        return [
+            regions[i] for i in range(n)
+            if component_sizes[find(i)] >= SCANNED_MIN_CLUSTER_SIZE
+        ]
+
     def _refine_region_at_high_dpi(self, page, bbox_pts: tuple, high_dpi: float):
         """
         Render ONLY a padded crop around a phase-2-confirmed block at
@@ -1387,3 +1637,93 @@ class ELAAnalyzer:
                 })
 
         return anomaly_regions
+
+    def _detect_erased_regions(self, img_array: np.ndarray, page_num: int, render_dpi: int) -> list:
+        """
+        Flag background-colored regions with near-zero pixel variance —
+        see ERASURE_* constants above for why this targets a narrower case
+        than _analyze_noise_consistency.
+        """
+        import cv2
+
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape
+
+        variances = {}
+        for y in range(0, h - ERASURE_BLOCK_SIZE, ERASURE_STRIDE):
+            for x in range(0, w - ERASURE_BLOCK_SIZE, ERASURE_STRIDE):
+                block = gray[y:y + ERASURE_BLOCK_SIZE, x:x + ERASURE_BLOCK_SIZE]
+                if float(np.mean(block)) < ERASURE_BG_MIN_BRIGHTNESS:
+                    continue  # text stroke or dense image content, not background
+                variances[(x, y)] = float(np.std(block))
+
+        if len(variances) < 10:
+            return []
+
+        values = list(variances.values())
+        median_std = statistics.median(values)
+        if median_std < ERASURE_MIN_MEDIAN_STD:
+            # Page background itself is already near-flat (digital render,
+            # not a real scan) -- nothing to compare an "erased" block against.
+            return []
+
+        pts_scale = 72 / render_dpi
+        candidates = []
+        for (x, y), std_val in variances.items():
+            if std_val < median_std * ERASURE_RATIO_THRESHOLD:
+                candidates.append({
+                    "page": page_num,
+                    "bbox": (
+                        x * pts_scale, y * pts_scale,
+                        (x + ERASURE_BLOCK_SIZE) * pts_scale,
+                        (y + ERASURE_BLOCK_SIZE) * pts_scale,
+                    ),
+                    "std_val": std_val,
+                    "median_std": median_std,
+                    "reason": (
+                        f"Suspiciously uniform background region "
+                        f"(std={std_val:.2f} vs page median={median_std:.2f}) — "
+                        f"possible digital erasure or clone stamp"
+                    ),
+                })
+
+        return self._cluster_erasure_regions(candidates)[:ERASURE_MAX_REGIONS]
+
+    @staticmethod
+    def _cluster_erasure_regions(regions: list) -> list:
+        """Merge nearby erasure candidates into single larger regions so one
+        flat area doesn't get reported as dozens of overlapping small boxes."""
+        if not regions:
+            return []
+
+        clustered = []
+        used = set()
+        for i, r1 in enumerate(regions):
+            if i in used:
+                continue
+            group = [r1]
+            used.add(i)
+            x0_1, y0_1 = r1["bbox"][0], r1["bbox"][1]
+            for j in range(i + 1, len(regions)):
+                if j in used:
+                    continue
+                r2 = regions[j]
+                dist = ((x0_1 - r2["bbox"][0]) ** 2 + (y0_1 - r2["bbox"][1]) ** 2) ** 0.5
+                if dist < ERASURE_CLUSTER_DIST_PT:
+                    group.append(r2)
+                    used.add(j)
+
+            x0 = min(r["bbox"][0] for r in group)
+            y0 = min(r["bbox"][1] for r in group)
+            x1 = max(r["bbox"][2] for r in group)
+            y1 = max(r["bbox"][3] for r in group)
+            worst = min(group, key=lambda r: r["std_val"])
+            clustered.append({
+                "page": r1["page"],
+                "bbox": (x0, y0, x1, y1),
+                "std_val": worst["std_val"],
+                "median_std": worst["median_std"],
+                "reason": worst["reason"],
+            })
+
+        return clustered

@@ -8,6 +8,8 @@ import fitz
 import statistics
 from dataclasses import dataclass, field
 
+from pdf_utils import get_qr_zones
+
 # Scoring constants
 WHITE_RECT_SCORE_PER_REGION  = 25
 WHITE_RECT_SCORE_CAP         = 70
@@ -37,6 +39,19 @@ MAX_OVERLAY_PAGE_AREA_FRACTION = 0.5
 MAX_OVERLAY_ABS_AREA_PT2  = 6000  # ~a 200x30pt box, generous for one field+value
 MIN_OVERLAY_DIMENSION_PT  = 6     # excludes hairline table border/gutter rects
 
+# Ghost-text detection: two different, non-empty text blocks occupying the
+# same physical space is impossible in a legitimately laid-out document.
+# A low-effort forgery pastes replacement text directly over the original
+# without removing the original run, leaving both in the content stream.
+# GHOST_TEXT_MAX_BLOCK_AREA_FRACTION excludes diagonal "CONFIDENTIAL"/
+# "DRAFT" watermark stamps and background labels, which legitimately span
+# a large fraction of the page and aren't a targeted paste-over.
+GHOST_TEXT_OVERLAP_FRACTION         = 0.3
+GHOST_TEXT_MAX_BLOCK_AREA_FRACTION  = 0.3
+GHOST_TEXT_SCORE_PER_REGION         = 35
+GHOST_TEXT_SCORE_CAP                = 70
+MIN_GHOST_TEXT_LEN                  = 2
+
 # A cover-and-retype edit doesn't have to use a white box — on a colored
 # letterhead/panel background, an editor will fill with whatever color
 # matches the surrounding page so the patch is invisible. We detect that by
@@ -45,12 +60,24 @@ LOCAL_BG_SAMPLE_DPI               = 150
 LOCAL_BG_COLOR_DISTANCE_THRESHOLD = 0.15  # euclidean distance in 0-1 RGB space
 LOCAL_BG_MARGIN_PT                = 10    # how far outside the rect to probe
 
+# Z-order check: a table row background is painted BEFORE the text that
+# sits on it (lower content-stream position = earlier seqno), so the text
+# remains visible. A cover-and-retype edit pastes its box AFTER the text
+# it's hiding (higher seqno), burying it. Geometric overlap alone can't
+# tell these apart — only stream order can.
+ROW_PATTERN_SIZE_TOLERANCE_PT = 2.0   # rects within this size delta count as "same size"
+ROW_PATTERN_MIN_COUNT         = 3     # need this many same-sized rects to call it a pattern
+ROW_PATTERN_INTERVAL_CV_MAX   = 0.3   # coefficient of variation of vertical spacing
+COVERAGE_OVERLAP_FRACTION_MIN = 0.4   # fraction of a text span's own area that must be
+                                       # inside the rect to count as "covered" (excludes
+                                       # adjacent-row font ascender/descender edge-bleed)
+
 
 @dataclass
 class OverlayRegion:
     page: int
     bbox: tuple          # (x0, y0, x1, y1) in PDF points
-    overlay_type: str    # "covering_rect" | "image_overlay" | "char_spacing"
+    overlay_type: str    # "covering_rect" | "image_overlay" | "char_spacing" | "ghost_text"
     reason: str
 
 
@@ -157,6 +184,123 @@ class PyMuPDFAnalyzer:
                 )
         return False, ""
 
+    def _get_text_seqnos(self, page: "fitz.Page") -> list:
+        """List of (bbox: fitz.Rect, seqno: int) for every text span on the page."""
+        spans = []
+        try:
+            for trace in page.get_texttrace():
+                bbox = trace.get("bbox")
+                seqno = trace.get("seqno")
+                if bbox is not None and seqno is not None:
+                    spans.append((fitz.Rect(bbox), seqno))
+        except Exception:
+            pass
+        return spans
+
+    def _was_drawn_over_existing_text(self, rect: "fitz.Rect", drawing_seqno, text_spans: list) -> bool:
+        """
+        True if at least one text span under this rect was already on the
+        page (lower seqno) before the rect was drawn — i.e. the rect was
+        painted on top of existing text (cover-up). False if the rect came
+        first and text was written on top of it afterwards (normal table/
+        panel background rendering), or if seqno info is unavailable.
+        """
+        if drawing_seqno is None:
+            return True  # no stream-order info — fall back to flagging (old behavior)
+        for span_rect, seqno in text_spans:
+            if seqno >= drawing_seqno or not rect.intersects(span_rect):
+                continue
+            span_area = span_rect.width * span_rect.height
+            if span_area <= 0:
+                continue
+            overlap = rect & span_rect
+            overlap_area = overlap.width * overlap.height
+            if overlap_area / span_area >= COVERAGE_OVERLAP_FRACTION_MIN:
+                return True
+        return False
+
+    def _find_row_pattern_rects(self, candidates: list) -> set:
+        """
+        Identify rects that are part of a repeating same-size, regularly-
+        spaced vertical pattern (alternating table row backgrounds) and
+        should be excluded as a group regardless of z-order ambiguity.
+        Returns a set of id(rect) for excluded rects.
+        """
+        groups = {}
+        for rect in candidates:
+            key = (round(rect.width / ROW_PATTERN_SIZE_TOLERANCE_PT),
+                   round(rect.height / ROW_PATTERN_SIZE_TOLERANCE_PT))
+            groups.setdefault(key, []).append(rect)
+
+        excluded = set()
+        for group in groups.values():
+            if len(group) < ROW_PATTERN_MIN_COUNT:
+                continue
+            ys = sorted(r.y0 for r in group)
+            intervals = [b - a for a, b in zip(ys, ys[1:])]
+            if not intervals:
+                continue
+            mean_interval = statistics.mean(intervals)
+            if mean_interval <= 0:
+                continue
+            stdev_interval = statistics.stdev(intervals) if len(intervals) > 1 else 0
+            cv = stdev_interval / mean_interval
+            if cv <= ROW_PATTERN_INTERVAL_CV_MAX:
+                excluded.update(id(r) for r in group)
+        return excluded
+
+    def _detect_overlapping_text(self, page: "fitz.Page", page_num: int, page_area: float) -> list:
+        """
+        Flag pairs of different, non-empty text blocks whose bounding boxes
+        substantially overlap — "ghost text" left behind when a forger
+        pastes replacement text directly over the original instead of
+        removing it first.
+        """
+        blocks = page.get_text("blocks")
+        regions = []
+
+        for i, block_a in enumerate(blocks):
+            text_a = block_a[4].strip() if len(block_a) > 4 else ""
+            if len(text_a) < MIN_GHOST_TEXT_LEN:
+                continue
+            ax0, ay0, ax1, ay1 = block_a[:4]
+            area_a = (ax1 - ax0) * (ay1 - ay0)
+            if page_area > 0 and area_a / page_area > GHOST_TEXT_MAX_BLOCK_AREA_FRACTION:
+                continue  # watermark/background label, not a targeted paste-over
+
+            for block_b in blocks[i + 1:]:
+                text_b = block_b[4].strip() if len(block_b) > 4 else ""
+                if len(text_b) < MIN_GHOST_TEXT_LEN or text_b == text_a:
+                    continue
+                bx0, by0, bx1, by1 = block_b[:4]
+                area_b = (bx1 - bx0) * (by1 - by0)
+                if page_area > 0 and area_b / page_area > GHOST_TEXT_MAX_BLOCK_AREA_FRACTION:
+                    continue
+
+                x_overlap = max(0, min(ax1, bx1) - max(ax0, bx0))
+                y_overlap = max(0, min(ay1, by1) - max(ay0, by0))
+                if x_overlap <= 5 or y_overlap <= 5:
+                    continue
+
+                overlap_area = x_overlap * y_overlap
+                smaller_area = min(area_a, area_b)
+                if smaller_area <= 0:
+                    continue
+                overlap_pct = overlap_area / smaller_area
+                if overlap_pct > GHOST_TEXT_OVERLAP_FRACTION:
+                    regions.append(OverlayRegion(
+                        page=page_num,
+                        bbox=(min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1)),
+                        overlay_type="ghost_text",
+                        reason=(
+                            f"Two different text blocks occupy the same location "
+                            f"({overlap_pct*100:.0f}% overlap): "
+                            f"'{text_a[:30]}' vs '{text_b[:30]}' — "
+                            f"possible text pasted over original (ghost text)"
+                        ),
+                    ))
+        return regions
+
     def analyze(self, pdf_path: str) -> PyMuPDFReport:
         doc = fitz.open(pdf_path)
         all_regions = []
@@ -168,22 +312,43 @@ class PyMuPDFAnalyzer:
             page_area = page.rect.width * page.rect.height
 
             # CHECK 1 — Covering rectangles overlapping text (white, or
-            # filled to match the local page background color)
+            # filled to match the local page background color), filtered by
+            # content-stream z-order so table/panel backgrounds painted
+            # BEFORE their text don't get mistaken for a paste-over box
+            # drawn AFTER the text it's hiding.
+            text_spans = self._get_text_seqnos(page)
+            qr_zones = get_qr_zones(page, doc)
+            geometric_candidates = []  # (drawing, drawing_rect, cover_reason)
             for drawing in page.get_drawings():
                 is_covering, cover_reason = self._is_covering_rectangle(drawing, page, page_area)
                 if not is_covering:
                     continue
                 rect = drawing.get("rect")
                 drawing_rect = fitz.Rect(rect)
+                if any(drawing_rect.intersects(qr) for qr in qr_zones):
+                    continue  # QR code area, not a cover-up
                 for block in text_blocks:
                     if drawing_rect.intersects(fitz.Rect(block[:4])):
-                        all_regions.append(OverlayRegion(
-                            page=page_num,
-                            bbox=tuple(rect),
-                            overlay_type="covering_rect",
-                            reason=cover_reason,
-                        ))
+                        geometric_candidates.append((drawing, drawing_rect, cover_reason))
                         break
+
+            row_pattern_excluded = self._find_row_pattern_rects(
+                [c[1] for c in geometric_candidates]
+            )
+            for drawing, drawing_rect, cover_reason in geometric_candidates:
+                if id(drawing_rect) in row_pattern_excluded:
+                    continue  # repeating alternating-row table background
+                if not self._was_drawn_over_existing_text(drawing_rect, drawing.get("seqno"), text_spans):
+                    continue  # background painted before text = normal table rendering
+                all_regions.append(OverlayRegion(
+                    page=page_num,
+                    bbox=tuple(drawing_rect),
+                    overlay_type="covering_rect",
+                    reason=cover_reason,
+                ))
+
+            # CHECK 1b — Different text blocks overlapping each other (ghost text)
+            all_regions.extend(self._detect_overlapping_text(page, page_num, page_area))
 
             # CHECK 2 — Images overlapping text regions
             for img in page.get_images(full=True):
@@ -245,6 +410,7 @@ class PyMuPDFAnalyzer:
         covering_rects = [r for r in all_regions if r.overlay_type == "covering_rect"]
         img_overlays  = [r for r in all_regions if r.overlay_type == "image_overlay"]
         char_anomalies = [r for r in all_regions if r.overlay_type == "char_spacing"]
+        ghost_text     = [r for r in all_regions if r.overlay_type == "ghost_text"]
 
         signals = []
         score   = 0
@@ -274,7 +440,16 @@ class PyMuPDFAnalyzer:
             score += min(CHAR_ANOMALY_SCORE_CAP,
                          len(char_anomalies) * CHAR_ANOMALY_SCORE_PER_ITEM)
 
-        if not any([covering_rects, img_overlays, char_anomalies]):
+        if ghost_text:
+            signals.append(
+                f"{len(ghost_text)} overlapping text block(s) — "
+                f"different texts at the same coordinates, "
+                f"possible text pasted over original"
+            )
+            score += min(GHOST_TEXT_SCORE_CAP,
+                         len(ghost_text) * GHOST_TEXT_SCORE_PER_REGION)
+
+        if not any([covering_rects, img_overlays, char_anomalies, ghost_text]):
             signals.append(
                 "PyMuPDF deep analysis passed — "
                 "no hidden overlays or character anomalies detected"

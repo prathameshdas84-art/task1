@@ -129,6 +129,7 @@ class MetadataReport:
     page_details: list = field(default_factory=list)
     has_embedded_files: bool = False
     has_javascript: bool = False
+    js_context: str = "none"  # "none" | "names_tree" | "open_action" | "page_level"
     has_open_action: bool = False
     document_id: Optional[str] = None
     xmp_fields: dict = field(default_factory=dict)
@@ -320,6 +321,11 @@ class MetadataExtractor:
         report.raw_metadata       = self._extract_raw_metadata(pdf_path)
         report.structure          = self._extract_structure(pdf_path)
         report.suspicious_content = self._extract_suspicious_content(pdf_path)
+        report.js_context = report.suspicious_content.get("js_context", "none")
+        # suspicious_content's check covers Names tree + OpenAction + page-level
+        # JS actions; pikepdf_extras only checked the Names tree, so this is the
+        # more complete signal — keep has_javascript consistent with js_context.
+        report.has_javascript = report.suspicious_content.get("has_javascript", report.has_javascript)
         report.dimensions_full    = self._extract_dimensions(pdf_path)
         report.dates_full         = self._enhance_dates(creation_date, modification_date)
         report.page_rotation      = self._check_page_rotation_consistency(pdf_path)
@@ -451,8 +457,20 @@ class MetadataExtractor:
         return structure
 
     def _extract_suspicious_content(self, pdf_path: str) -> dict:
-        """Byte-level scan for active/embedded content (JavaScript, OpenAction,
-        Launch actions, embedded files) — the malware-vector surface."""
+        """Structural scan (via the parsed pikepdf object tree) for active/
+        embedded content (JavaScript, OpenAction, Launch actions, embedded
+        files) — the malware-vector surface.
+
+        This walks parsed PDF objects rather than searching raw file bytes.
+        A raw byte search for tokens like b"/JS" matches ANY occurrence of
+        that sequence anywhere in the file, including inside compressed/
+        encoded image streams (scanned pages) — random binary bytes that
+        happen to decode to "/JS" are a real, observed false-positive
+        source (e.g. ASCII85-encoded JPEG data containing that byte
+        sequence by pure coincidence). Resolving through pikepdf's object
+        graph means only an actual /JS or /JavaScript dictionary key can
+        ever match.
+        """
         result = {
             "has_javascript": False,
             "has_open_actions": False,
@@ -460,30 +478,89 @@ class MetadataExtractor:
             "has_embedded_files": False,
             "findings": [],
             "risk_score": 0,
+            "js_context": "none",  # "none" | "names_tree" | "open_action" | "page_level"
         }
         try:
-            with open(pdf_path, "rb") as f:
-                raw_bytes = f.read()
+            with pikepdf.open(pdf_path) as pdf:
+                names = pdf.Root.get("/Names", {})
+                has_names_js = "/JavaScript" in names
 
-            if b"/JS" in raw_bytes or b"/JavaScript" in raw_bytes:
-                result["has_javascript"] = True
-                result["findings"].append("JavaScript detected")
-                result["risk_score"] += 40
+                open_action = pdf.Root.get("/OpenAction", None)
+                open_action_is_js = False
+                if open_action is not None:
+                    try:
+                        open_action_is_js = open_action.get("/S") == pikepdf.Name("/JavaScript")
+                    except Exception:
+                        pass
 
-            if b"/OpenAction" in raw_bytes:
-                result["has_open_actions"] = True
-                result["findings"].append("OpenAction detected — executes code on open")
-                result["risk_score"] += 30
+                has_page_js = False
+                has_launch = False
+                for page in pdf.pages:
+                    for annot in page.get("/Annots", []):
+                        try:
+                            action = annot.get("/A", None)
+                            if action is not None:
+                                action_type = action.get("/S", None)
+                                if action_type == pikepdf.Name("/JavaScript"):
+                                    has_page_js = True
+                                elif action_type == pikepdf.Name("/Launch"):
+                                    has_launch = True
+                            additional = annot.get("/AA", None)
+                            if additional is not None:
+                                for key in additional.keys():
+                                    act = additional.get(key)
+                                    if act is not None and act.get("/S", None) == pikepdf.Name("/JavaScript"):
+                                        has_page_js = True
+                        except Exception:
+                            continue
 
-            if b"/Launch" in raw_bytes:
-                result["has_launch_actions"] = True
-                result["findings"].append("Launch action detected — runs external programs")
-                result["risk_score"] += 50
+                if has_names_js:
+                    result["has_javascript"] = True
+                    result["js_context"] = "names_tree"
+                    result["findings"].append(
+                        "Document-level JavaScript in /Names tree — executes "
+                        "automatically on open, highly suspicious in documents "
+                        "that should not run code"
+                    )
+                    result["risk_score"] += 40
+                elif open_action_is_js:
+                    result["has_javascript"] = True
+                    result["js_context"] = "open_action"
+                    result["findings"].append(
+                        "JavaScript executes on document open — "
+                        "suspicious in static documents"
+                    )
+                    result["risk_score"] += 35
+                elif has_page_js:
+                    result["has_javascript"] = True
+                    result["js_context"] = "page_level"
+                    result["findings"].append(
+                        "Page/form-level JavaScript action found — typically "
+                        "form-field scripting, lower risk than document-level JS"
+                    )
+                    result["risk_score"] += 10
 
-            if b"/EmbeddedFile" in raw_bytes:
-                result["has_embedded_files"] = True
-                result["findings"].append("Embedded files detected")
-                result["risk_score"] += 20
+                if has_launch:
+                    result["has_launch_actions"] = True
+                    result["findings"].append(
+                        "Launch action detected — attempts to run an external "
+                        "program. Very suspicious."
+                    )
+                    result["risk_score"] += 50
+
+                if open_action is not None and not open_action_is_js:
+                    result["has_open_actions"] = True
+                    result["findings"].append(
+                        "OpenAction detected — PDF executes an action on open"
+                    )
+                    result["risk_score"] += 20
+
+                if "/EmbeddedFiles" in names:
+                    result["has_embedded_files"] = True
+                    result["findings"].append(
+                        "Embedded files detected — document contains file attachments"
+                    )
+                    result["risk_score"] += 15
         except Exception:
             pass
         return result

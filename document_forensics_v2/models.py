@@ -13,6 +13,7 @@ class LayerScores(BaseModel):
     numeric: int
     ela: int
     pymupdf: int = 0
+    xref: int = 0
 
 
 class SuspiciousLine(BaseModel):
@@ -21,6 +22,7 @@ class SuspiciousLine(BaseModel):
     text: str
     anomaly_score_pct: int        # 0-100
     reasons: list[str]
+    bbox: Optional[list[float]] = None
 
 
 class NumericAnomaly(BaseModel):
@@ -30,6 +32,7 @@ class NumericAnomaly(BaseModel):
     value: float
     z_score: float
     reason: str
+    bbox: Optional[list[float]] = None
 
 
 class ConfidenceDetail(BaseModel):
@@ -87,6 +90,7 @@ class FullMetadata(BaseModel):
 
     # Content flags
     has_javascript: bool = False
+    js_context: str = "none"  # "none" | "names_tree" | "open_action" | "page_level"
     has_open_action: bool = False
     has_embedded_files: bool = False
     has_images: bool = False
