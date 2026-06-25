@@ -55,6 +55,7 @@ class FinalVerdict:
     numeric_score: int = 0
     ela_score: int = 0
     pymupdf_score: int = 0
+    xref_score: int = 0
     pdf_type: str = ""
     all_signals: list[str] = None
     effective_threshold: float = THRESHOLD  # threshold actually applied (after adjustments)
@@ -67,6 +68,7 @@ def combine(
     numeric: NumericReport = None,
     ela: ELAReport = None,
     pymupdf: PyMuPDFReport = None,
+    xref: "XrefReport" = None,
 ) -> FinalVerdict:
 
     pdf_type = content.pdf_type
@@ -75,13 +77,15 @@ def combine(
     numeric_score = numeric.anomaly_score if numeric else 0
     ela_score     = ela.anomaly_score if ela else 0
     pymupdf_score = pymupdf.anomaly_score if pymupdf else 0
+    xref_score    = xref.xref_score if xref else 0
     combined = (
         meta.anomaly_score    * w["metadata"] +
         content.anomaly_score * w["content"]  +
         ocr.anomaly_score     * w["ocr"]      +
         numeric_score         * w.get("numeric", 0) +
         ela_score              * w.get("ela", 0) +
-        pymupdf_score           * w.get("pymupdf", 0)
+        pymupdf_score           * w.get("pymupdf", 0) +
+        xref_score             * w.get("xref", 0)
     )
 
     effective_threshold = THRESHOLDS.get(pdf_type, THRESHOLD)
@@ -126,6 +130,9 @@ def combine(
     if pymupdf:
         for s in pymupdf.signals:
             all_signals.append(f"[PYMUPDF]  {s}")
+    if xref:
+        for s in xref.signals:
+            all_signals.append(f"[XREF]     {s}")
 
     # Uncertain band: when the combined score sits within UNCERTAIN_BAND of
     # the (possibly adjusted) threshold, the evidence is too close to call
@@ -144,6 +151,7 @@ def combine(
         numeric_score=numeric_score,
         ela_score=ela_score,
         pymupdf_score=pymupdf_score,
+        xref_score=xref_score,
         pdf_type=pdf_type,
         all_signals=all_signals,
         effective_threshold=effective_threshold,

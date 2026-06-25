@@ -38,22 +38,11 @@ COLOR_NUMERIC = (255, 220, 0)    # yellow — numeric outlier
 COLOR_ELA     = (180, 0, 255)    # purple — ELA outlier (image edit)
 COLOR_WHITE_RECT    = (0, 200, 255)   # cyan    — white rect overlay (pymupdf_analyzer)
 COLOR_IMAGE_OVERLAY = (255, 0, 200)   # magenta — image overlay (pymupdf_analyzer)
+COLOR_GHOST         = (255, 200, 0)   # gold    — ghost text / overlapping text layers (pymupdf_analyzer)
 COLOR_OCR_SIZE  = (255, 100, 0)   # orange-red — OCR word font-size anomaly
 COLOR_OCR_COLOR = (255, 0, 200)   # magenta    — OCR word color anomaly
 COLOR_OCR_CONF  = (255, 140, 0)   # orange     — OCR word low-confidence anomaly
-
-# ELA blocks are noisy on logos/dense text even in clean documents, so this
-# draw filter exists to avoid flooding the page with low-confidence boxes.
-# It must match the detection Z_THRESHOLD (3.0) the ELA analyzer flags at:
-# the analyzer already keeps only the MAX_REGIONS_PER_PAGE (10) strongest
-# outliers per page, and per-page-normalized z-scores cluster in the 3.0-3.5
-# band — rarely reaching the old 4.0 cut. At 4.0 this filter silently dropped
-# every ELA box on pages whose edits were real but not extreme (the "no
-# purple boxes on page 2+" bug), since later pages seldom produce a z>=4
-# block. Aligning it with the detection threshold means "what ELA flagged is
-# what gets drawn." The ELA score used in the verdict is unaffected — this is
-# purely a display filter.
-ELA_BOX_MIN_ZSCORE = 3.0
+COLOR_OCR_BASELINE = (0, 255, 120)  # green      — OCR word baseline-misalignment anomaly
 
 BOX_PADDING        = 4   # px padding added around each drawn box
 LABEL_HEIGHT        = 16  # px height of the label background strip
@@ -157,13 +146,16 @@ class LocationHighlighter:
                 )
 
             # Draw OCR word anomalies — orange-red for size, magenta for
-            # color, orange for low confidence (size/color take priority
-            # in the box color when a word has more than one anomaly type).
+            # color, green for baseline misalignment, orange for low
+            # confidence (priority order below when a word has more than
+            # one anomaly type).
             for r in ocr_by_page.get(page_num, []):
                 if "size" in r.anomaly_types:
                     color = COLOR_OCR_SIZE
                 elif "color" in r.anomaly_types:
                     color = COLOR_OCR_COLOR
+                elif "baseline" in r.anomaly_types:
+                    color = COLOR_OCR_BASELINE
                 else:
                     color = COLOR_OCR_CONF
                 self._draw_box(
@@ -190,25 +182,18 @@ class LocationHighlighter:
                     thickness=2,
                 )
 
-            # Draw ELA anomalies (PURPLE) — only high confidence (z >= 5.0)
-            for r in ela_by_page.get(page_num, []):
-                if r.z_score >= ELA_BOX_MIN_ZSCORE:  # only show strong signals
-                    self._draw_box(
-                        draw=draw,
-                        img_size=img.size,
-                        bbox=r.bbox,
-                        page_h_pts=page_h,
-                        color=self._blend_age_color(COLOR_ELA, age_mult),
-                        label=f"ELA z={r.z_score:.1f}",
-                        label_color=COLOR_ELA,
-                        thickness=2,
-                    )
+            # ELA findings still score and still appear in the text report's
+            # signals — they're just not drawn here. ELA's pixel-noise
+            # regions are too imprecise spatially (logos, dense text, scan
+            # artifacts) to annotate reliably, so this loop is intentionally
+            # removed rather than filtered by z-score.
 
             # Draw PyMuPDF overlay regions — CYAN for white-rect cover-ups,
-            # MAGENTA for image overlays. char_spacing regions are too small
-            # (single character bboxes) to usefully draw, so they're skipped.
+            # MAGENTA for image overlays, GOLD for ghost/overlapping text.
+            # char_spacing regions are too small (single character bboxes)
+            # to usefully draw, so they're skipped.
             for r in overlay_by_page.get(page_num, []):
-                if r.overlay_type == "white_rect":
+                if r.overlay_type == "covering_rect":
                     self._draw_box(
                         draw=draw,
                         img_size=img.size,
@@ -228,6 +213,17 @@ class LocationHighlighter:
                         color=COLOR_IMAGE_OVERLAY,
                         label="Image overlay",
                         label_color=COLOR_IMAGE_OVERLAY,
+                        thickness=2,
+                    )
+                elif r.overlay_type == "ghost_text":
+                    self._draw_box(
+                        draw=draw,
+                        img_size=img.size,
+                        bbox=r.bbox,
+                        page_h_pts=page_h,
+                        color=COLOR_GHOST,
+                        label="Ghost text overlap",
+                        label_color=COLOR_GHOST,
                         thickness=2,
                     )
 

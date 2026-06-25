@@ -321,12 +321,21 @@ class SignalFusion:
             f"Cross-validated tamper signal."
         )
 
-        # Pick best bbox from group
-        bbox = anchor.get("bbox")
-        for f in group:
-            if f.get("bbox"):
-                bbox = f["bbox"]
-                break
+        # Union the bboxes of every layer in the group that has one — a
+        # region two layers flagged independently rarely lands on the exact
+        # same pixel rect (e.g. content's line bbox vs ELA's block bbox for
+        # the same edited figure), so picking just one layer's box can crop
+        # the drawn highlight to less than what was actually flagged.
+        group_bboxes = [f["bbox"] for f in group if f.get("bbox")]
+        if group_bboxes:
+            bbox = (
+                min(b[0] for b in group_bboxes),
+                min(b[1] for b in group_bboxes),
+                max(b[2] for b in group_bboxes),
+                max(b[3] for b in group_bboxes),
+            )
+        else:
+            bbox = None
 
         # Map layer findings
         findings_by_layer = {f["layer"]: f["raw"] for f in group}
