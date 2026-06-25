@@ -133,6 +133,35 @@ REPLACEMENT_CHARS = [
 ]
 REPLACEMENT_CHAR_SCORE = 0.60
 
+# ── Upgrade 4: glyph consistency filter ─────────────────────────────────────────
+# Canva/Figma/InDesign/Puppeteer/wkhtmltopdf all subset-embed fonts with
+# custom glyph IDs ("AAAAAA+Helvetica") — when PyMuPDF can't map one of those
+# IDs back to a real character it reads as U+FFFD/"?"/NBSP. That's the
+# EXPORT TOOL's behavior, repeated identically everywhere that glyph is used
+# in that subset (e.g. every Rs./currency symbol on a Canva payslip) — not a
+# one-off edit. GLYPH_WATCH_CHARS is tracked for the registry/ratio
+# computation; only chars also in REPLACEMENT_CHARS above actually get
+# flagged in _score_lines — a bare "?" is far too common in legitimate text
+# (questions, "N/A?", etc.) to safely treat as a tamper signal on its own,
+# so it's tracked for ratio purposes but never itself score-flagged.
+GLYPH_WATCH_CHARS = ('�', '?', ' ')
+
+# -- Upgrade 5: form field suppression -----------------------------------------
+# Form lines (Date:____, Sign:____, table cells separated by tabs) have wide,
+# deliberately irregular spacing by design -- not an edit. Suppresses ONLY the
+# spacing-related checks (char/word spacing, line height) for these lines;
+# font size and color checks still run, since a genuine edit on a form field
+# would still show up there.
+FORM_FIELD_PATTERNS = [
+    r'_{3,}',                  # three or more underscores
+    r'\t{2,}',                 # multiple tabs
+    r':\s{5,}',                # colon followed by 5+ spaces
+    r'^(date|sign|signature|name|place|witness|designation|stamp|seal)\s*:?\s*$',
+]
+FORM_FIELD_SHORT_LINE_MAX_WORDS = 2
+FORM_FIELD_SHORT_LINE_MIN_LEN   = 30  # 1-2 words spanning this much horizontal width = signature block, not a sentence
+GLYPH_CONSISTENCY_RATIO_THRESHOLD = 0.02  # char recurring on >2% of a subset font's chars = platform behavior, not an edit
+
 # _score_lines() per-anomaly score contributions. Each "outlier" check adds
 # min(CAP, z * MULT) so a borderline z-score (just above Z_OUTLIER_THRESHOLD)
 # contributes little while a very extreme one saturates at CAP.
@@ -191,6 +220,39 @@ ID_CARD_KEYWORDS = [
     "date of birth", "dob", "s/o", "d/o",
     "government of india",
 ]
+
+# ── Upgrade 1: vertical line-gap density check ──────────────────────────────────
+# Text injected into empty page space keeps the surrounding font/color, so the
+# font/spacing checks above miss it — but it almost always breaks the page's
+# vertical rhythm (the gap above/below it doesn't match the rest of the page).
+# Computed PER PAGE (not document-wide) since different pages can legitimately
+# have different line spacing.
+LINE_GAP_MIN_LINES_PER_PAGE = 5     # need this many lines on a page for meaningful gap stats
+LINE_GAP_LARGE_MULTIPLIER   = 3.0   # gaps > this many x the median = section/paragraph break, excluded from baseline
+LINE_GAP_Z_THRESHOLD        = 3.5
+LINE_GAP_MIN_WORDS          = 3     # don't flag short lines (labels/headers)
+LINE_GAP_REPEAT_EXCLUDE     = 3     # a gap size recurring this many+ times = deliberate paragraph spacing
+LINE_GAP_SCORE_PER_ANOMALY  = 20
+LINE_GAP_SCORE_CAP          = 60
+LINE_GAP_SCORE_WEIGHT       = 0.5
+
+# Step 5 form-field exclusion for the gap check specifically — a line that's
+# just a form field (date/signature line, underscores) legitimately sits in
+# wide empty space and isn't an injection target.
+LINE_GAP_FORM_FIELD_PATTERNS = [
+    r'_{3,}',                                              # "____"
+    r'^\s*(date|sign|signature)\s*:?\s*$',                 # "Date:", "Sign:", "Signature" alone
+    r'\t{2,}',                                             # tab-separated single words (form fields)
+    r'^\s*for\s+[\w\s.,&]+,\s*$',                          # "For Acme Technologies Pvt Ltd," — letter closing/signature block opener, always preceded by a deliberate gap reserved for the signature
+]
+
+# ── Upgrade 3: page-level baseline isolation ────────────────────────────────────
+# A merged/compiled PDF legitimately has different fonts/sizes/colors per
+# source page — scoring page 2 against page 1's document-wide baseline is
+# what causes false positives on compilations. Below this many lines, a
+# page's own stats are too unstable to score against (falls back to the
+# document-wide profile instead).
+MIN_LINES_FOR_PAGE_PROFILE = 8
 
 
 # ── Data structures ────────────────────────────────────────────────────────────
@@ -262,7 +324,32 @@ class ContentAnalyzer:
             )
 
         profile          = self._build_profile(lines)
-        suspicious_lines = self._score_lines(lines, profile)
+        try:
+            per_page_profiles = self._build_per_page_profiles(lines, profile)
+        except Exception:
+            per_page_profiles = None
+
+        # Upgrade 4 — first pass over subset-embedded fonts before scoring,
+        # so platform-generated missing-glyph placeholders (Canva/Figma/
+        # InDesign/etc.) can be told apart from a one-off injected/edited
+        # occurrence of the same character.
+        try:
+            glyph_registry = self._build_glyph_registry(pdf_path)
+        except Exception:
+            glyph_registry = {}
+
+        suspicious_lines = self._score_lines(lines, profile, per_page_profiles, glyph_registry)
+
+        # Upgrade 1 — vertical line-gap density: catches text injected into
+        # empty page space that font/spacing checks above miss (it inherits
+        # the surrounding font/color, but breaks the page's line rhythm).
+        # Computed from `lines` (not `suspicious_lines`) and scored
+        # separately in _build_signals, so these don't also get double-
+        # counted into the generic high/med anomaly-count buckets there.
+        try:
+            gap_findings = self._check_line_gap_density(lines)
+        except Exception:
+            gap_findings = []
 
         # ID cards (Aadhaar/PAN/driving licence/passport/voter ID)
         # legitimately mix ink colors on one line by template design — the
@@ -272,7 +359,21 @@ class ContentAnalyzer:
         # tampered span" at the same time.
         is_id_card = self._is_id_card_document(lines)
         color_issues = [] if is_id_card else self._check_color_consistency_per_line(pdf_path)
-        signals, score   = self._build_signals(lines, suspicious_lines, profile, fonts or [], color_issues)
+        signals, score   = self._build_signals(lines, suspicious_lines, profile, fonts or [], color_issues, gap_findings)
+
+        # Merged into the report's suspicious_lines AFTER scoring above, so
+        # they're visible/highlightable without affecting the high/med
+        # anomaly-count buckets _build_signals already used to score them.
+        for g in gap_findings:
+            suspicious_lines.append(SuspiciousLine(
+                page=g["page"],
+                line_num=g["line_num"],
+                text=g["text"],
+                bbox=g["bbox"],
+                anomalies=[f"[LINE_GAP] {g['reason']}"],
+                score=0.5,
+            ))
+        suspicious_lines.sort(key=lambda x: x.score, reverse=True)
 
         return ContentReport(
             total_lines=len(lines),
@@ -676,6 +777,25 @@ class ContentAnalyzer:
             "sharpness":           safe_stats([l.sharpness      for l in lines]),
         }
 
+    def _build_per_page_profiles(self, lines: list[LineProfile], global_profile: dict) -> dict:
+        """
+        One profile per page, used instead of the document-wide profile
+        when scoring that page's lines — see Upgrade 3 in _score_lines().
+        A page with too few lines falls back to the global profile since
+        its own mean/std would be too unstable to score against reliably.
+        """
+        by_page: dict = {}
+        for l in lines:
+            by_page.setdefault(l.page, []).append(l)
+
+        per_page = {}
+        for page_num, page_lines in by_page.items():
+            if len(page_lines) >= MIN_LINES_FOR_PAGE_PROFILE:
+                per_page[page_num] = self._build_profile(page_lines)
+            else:
+                per_page[page_num] = global_profile
+        return per_page
+
     # ── Line classification ────────────────────────────────────────────────────
 
     def _is_structural_line(self, line: LineProfile, all_lines: list) -> bool:
@@ -791,13 +911,35 @@ class ContentAnalyzer:
 
     # ── Line scoring ───────────────────────────────────────────────────────────
 
-    def _score_lines(self, lines: list[LineProfile], profile: dict) -> list[SuspiciousLine]:
+    def _score_lines(
+        self, lines: list[LineProfile], profile: dict,
+        per_page_profiles: dict = None, glyph_registry: dict = None,
+    ) -> list[SuspiciousLine]:
         suspicious = []
+        global_profile = profile
+        glyph_registry = glyph_registry or {}
 
         for line in lines:
             text_lower_check = line.text.lower()
             if any(p in text_lower_check for p in NEVER_FLAG_PATTERNS):
                 continue  # skip this line entirely — it's a payslip header row
+
+            # Upgrade 5 — form fields (Date:____, Sign:____, tab-separated
+            # table cells) have wide, deliberately irregular spacing by
+            # design. Suppresses ONLY the spacing-related checks below
+            # (char/word spacing, line height); font size and color checks
+            # still run, since a genuine edit on a form field would still
+            # show up there.
+            is_form_field = self._is_form_field_line(line.text)
+
+            # Upgrade 3 — score this line against its OWN PAGE's profile,
+            # not the document-wide one. A multi-document compilation
+            # legitimately has different fonts/sizes/colors per source
+            # page; comparing page 2 against page 1's baseline is what
+            # produced false positives on merged PDFs. Falls back to the
+            # global profile when the page has too few lines for its own
+            # stats to be reliable (see _build_per_page_profiles).
+            profile = (per_page_profiles or {}).get(line.page, global_profile)
 
             anomalies = []
             score     = 0.0
@@ -807,7 +949,19 @@ class ContentAnalyzer:
             # that glyph after editing. Always checked, never gated by
             # _is_structural_line — an encoding-failure glyph is suspicious
             # on any line, structural or not.
-            if any(ch in line.text for ch in REPLACEMENT_CHARS):
+            #
+            # Upgrade 4 — but only if it's NOT consistent platform-subsetting
+            # behavior: Canva/Figma/InDesign/Puppeteer/wkhtmltopdf all subset
+            # fonts with custom glyph IDs, and a missing-glyph placeholder
+            # that recurs throughout that font's usage (e.g. every Rs. symbol
+            # on a Canva payslip) is the export tool's own behavior, not an
+            # edit — see _is_glyph_consistent.
+            found_chars = [ch for ch in REPLACEMENT_CHARS if ch in line.text]
+            flagged_chars = [
+                ch for ch in found_chars
+                if not self._is_glyph_consistent(line.font_name, ch, glyph_registry)
+            ]
+            if flagged_chars:
                 anomalies.append(
                     "Replacement character found in line — "
                     "possible font encoding mismatch from editing"
@@ -824,10 +978,23 @@ class ContentAnalyzer:
                         # different editing sessions, never intentional design choices
                         is_cidfont = "cidfont" in line.font_name.lower()
                         if is_cidfont or line.font_name not in profile.get("design_fonts", set()):
+                            # Upgrade 4 — a CIDFont "mismatch" whose only
+                            # distinguishing content is a consistently-
+                            # subsetted placeholder glyph (not a real
+                            # second editing session) is downgraded out of
+                            # the highest-severity tier rather than fully
+                            # suppressed, since the font name mismatch
+                            # itself is still mildly informative.
+                            line_replacement_chars = [ch for ch in REPLACEMENT_CHARS if ch in line.text]
+                            is_glyph_subsetting_artifact = bool(line_replacement_chars) and all(
+                                self._is_glyph_consistent(line.font_name, ch, glyph_registry)
+                                for ch in line_replacement_chars
+                            )
                             is_cidfont_mismatch = (
                                 "cidfont" in line.font_name.lower() and
                                 "cidfont" in profile["dominant_font"].lower() and
-                                line.font_name != profile["dominant_font"]
+                                line.font_name != profile["dominant_font"] and
+                                not is_glyph_subsetting_artifact
                             )
                             text_lower = line.text.lower()
                             is_critical = any(kw in text_lower for kw in CRITICAL_VALUE_KEYWORDS)
@@ -849,7 +1016,7 @@ class ContentAnalyzer:
                 score += min(FONT_SIZE_SCORE_CAP, z * FONT_SIZE_SCORE_MULT)
 
             # Character spacing outlier
-            if line.char_spacing > 0 and not self._is_structural_line(line, lines):
+            if line.char_spacing > 0 and not self._is_structural_line(line, lines) and not is_form_field:
                 z = self._z(line.char_spacing, profile["char_spacing"])
                 if z > Z_OUTLIER_THRESHOLD:
                     anomalies.append(
@@ -858,7 +1025,7 @@ class ContentAnalyzer:
                     score += min(CHAR_SPACING_SCORE_CAP, z * CHAR_SPACING_SCORE_MULT)
 
             # Word spacing outlier
-            if line.word_spacing > 0 and not self._is_structural_line(line, lines):
+            if line.word_spacing > 0 and not self._is_structural_line(line, lines) and not is_form_field:
                 z = self._z(line.word_spacing, profile["word_spacing"])
                 if z > Z_OUTLIER_THRESHOLD:
                     anomalies.append(
@@ -867,7 +1034,7 @@ class ContentAnalyzer:
                     score += min(WORD_SPACING_SCORE_CAP, z * WORD_SPACING_SCORE_MULT)
 
             # Line height outlier
-            if not self._is_structural_line(line, lines):
+            if not self._is_structural_line(line, lines) and not is_form_field:
                 z = self._z(line.line_height, profile["line_height"])
                 if z > Z_OUTLIER_THRESHOLD:
                     anomalies.append(
@@ -920,9 +1087,184 @@ class ContentAnalyzer:
     def _z(self, value: float, stats: dict) -> float:
         return abs(value - stats["mean"]) / stats["std"]
 
+    def _trimmed_mean_std(self, values: list[float], trim_percent: int = 10) -> tuple[float, float]:
+        """
+        Mean/std excluding the top/bottom trim_percent of values — avoids
+        threshold saturation where one extreme value inflates std enough
+        that other real outliers no longer clear a z-score threshold.
+        """
+        vals = sorted(v for v in values if v is not None)
+        if len(vals) < 4:
+            if not vals:
+                return 0.0, 1e-9
+            mean = statistics.mean(vals)
+            std = statistics.stdev(vals) if len(vals) >= 2 else 1e-9
+            return mean, max(std, 1e-9)
+        trim = max(1, int(len(vals) * trim_percent / 100))
+        trimmed = vals[trim:-trim]
+        if len(trimmed) < 2:
+            trimmed = vals
+        return statistics.mean(trimmed), max(statistics.stdev(trimmed), 1e-9)
+
+    def _is_line_gap_form_field(self, text: str) -> bool:
+        text_lower = text.lower().strip()
+        return any(re.search(p, text_lower) for p in LINE_GAP_FORM_FIELD_PATTERNS)
+
+    def _check_line_gap_density(self, lines: list[LineProfile]) -> list[dict]:
+        """
+        Flags a line preceded by an abnormally large vertical gap relative
+        to the rest of ITS OWN page — the signature of text dropped into
+        empty page space rather than typed in the normal flow (which would
+        push surrounding lines apart consistently, not just leave one gap).
+        """
+        findings = []
+        by_page: dict = {}
+        for l in lines:
+            by_page.setdefault(l.page, []).append(l)
+
+        for page_num, page_lines in by_page.items():
+            page_lines = sorted(page_lines, key=lambda l: l.bbox[1])
+            if len(page_lines) < LINE_GAP_MIN_LINES_PER_PAGE:
+                continue
+
+            # gap[i] = vertical space between line i and the line below it
+            pairs = [
+                (page_lines[i + 1].bbox[1] - page_lines[i].bbox[3], page_lines[i + 1])
+                for i in range(len(page_lines) - 1)
+            ]
+            positive_gaps = [g for g, _ in pairs if g > 0]
+            if len(positive_gaps) < LINE_GAP_MIN_LINES_PER_PAGE:
+                continue
+            median_gap = statistics.median(positive_gaps)
+
+            # Body-text baseline: exclude negative (overlapping lines —
+            # headers/tables) and very large (section/paragraph breaks,
+            # which are expected) gaps before computing the baseline.
+            body_gaps = [g for g in positive_gaps if g <= median_gap * LINE_GAP_LARGE_MULTIPLIER]
+            if len(body_gaps) < LINE_GAP_MIN_LINES_PER_PAGE:
+                continue
+            mean, std = self._trimmed_mean_std(body_gaps)
+
+            # A gap value recurring 3+ times on the page is the page's
+            # deliberate paragraph-spacing rhythm, not a one-off injection.
+            gap_value_counts = Counter(round(g, 1) for g, _ in pairs if g > 0)
+
+            page_candidates = []
+            for gap, line_below in pairs:
+                if gap <= 0:
+                    continue
+                z = abs(gap - mean) / std
+                if z <= LINE_GAP_Z_THRESHOLD:
+                    continue
+                if gap <= mean:
+                    continue  # smaller gap = compressed text, not injection
+                if gap_value_counts[round(gap, 1)] >= LINE_GAP_REPEAT_EXCLUDE:
+                    continue  # identical gap value recurring = paragraph spacing
+                if len(line_below.text.split()) < LINE_GAP_MIN_WORDS:
+                    continue  # short line = header/label, not the injected content
+                if self._is_line_gap_form_field(line_below.text):
+                    continue
+                page_candidates.append((gap, line_below, z))
+
+            # 3+ DIFFERENT oversized gaps on one page (even at different
+            # exact values) means the page mixes a dense table/list region
+            # with normal section breaks — a single per-page baseline can't
+            # tell a real injection from "the gap before/after the table"
+            # in that layout, so the whole page's candidates are dropped
+            # rather than risk flagging every section break in a payslip/
+            # invoice template. A genuine isolated injection stays a lone
+            # candidate and still fires.
+            if len(page_candidates) >= LINE_GAP_REPEAT_EXCLUDE:
+                continue
+
+            for gap, line_below, z in page_candidates:
+                findings.append({
+                    "page": line_below.page,
+                    "line_num": line_below.line_num,
+                    "bbox": line_below.bbox,
+                    "text": line_below.text[:80],
+                    "gap": round(gap, 1),
+                    "expected_gap": round(mean, 1),
+                    "z_score": round(z, 2),
+                    "reason": (
+                        f"Line preceded by abnormal vertical gap "
+                        f"({gap:.1f}pt vs page baseline {mean:.1f}±{std:.1f}pt, "
+                        f"z={z:.1f}) — possible text inserted into empty space"
+                    ),
+                })
+
+        return findings
+
     def _is_id_card_document(self, lines: list) -> bool:
         text_lower = " ".join(line.text.lower() for line in lines)
         return any(kw in text_lower for kw in ID_CARD_KEYWORDS)
+
+    def _is_form_field_line(self, text: str) -> bool:
+        """
+        True for form-field lines (Date:____, Sign:____, table cells
+        separated by tabs) — these have wide, deliberately irregular
+        spacing by design, not from an edit.
+        """
+        text_lower = text.lower().strip()
+        for pattern in FORM_FIELD_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        # 1-2 words but a long character count = wide gaps/padding between
+        # them ("___________  Authorized Signatory"), not a real sentence.
+        words = text_lower.split()
+        if len(words) <= FORM_FIELD_SHORT_LINE_MAX_WORDS and len(text) > FORM_FIELD_SHORT_LINE_MIN_LEN:
+            return True
+        return False
+
+    def _build_glyph_registry(self, pdf_path: str) -> dict:
+        """
+        First pass over every subset-embedded font ("AAAAAA+Helvetica") in
+        the document: counts how often each watched placeholder/replacement
+        glyph appears, against that font's total character count. A glyph
+        that recurs throughout a subset font's usage is the export tool's
+        own missing-glyph behavior (Canva/Figma/InDesign/Puppeteer/
+        wkhtmltopdf all do this) — see _is_glyph_consistent.
+        """
+        registry: dict = {}
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:
+            return registry
+        try:
+            for page in doc:
+                rawdict = page.get_text("rawdict")
+                for block in rawdict.get("blocks", []):
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            font = span.get("font", "")
+                            if "+" not in font:
+                                continue
+                            text = "".join(ch.get("c", "") for ch in span.get("chars", []))
+                            if not text:
+                                continue
+                            entry = registry.setdefault(font, {})
+                            for char in text:
+                                entry["__total__"] = entry.get("__total__", 0) + 1
+                                if char in GLYPH_WATCH_CHARS:
+                                    entry[char] = entry.get(char, 0) + 1
+        finally:
+            doc.close()
+        return registry
+
+    def _is_glyph_consistent(self, font_name: str, char: str, glyph_registry: dict) -> bool:
+        """
+        True if `char` appears on more than GLYPH_CONSISTENCY_RATIO_THRESHOLD
+        of `font_name`'s subset characters document-wide — platform-
+        generated missing-glyph behavior, not a one-off injected/edited
+        occurrence. Only subset fonts ("+" in name) are tracked at all, so
+        a non-subset font always returns False (never suppressed here).
+        """
+        if "+" not in font_name or font_name not in glyph_registry:
+            return False
+        entry = glyph_registry[font_name]
+        total = entry.get("__total__", 1)
+        char_count = entry.get(char, 0)
+        return (char_count / total) > GLYPH_CONSISTENCY_RATIO_THRESHOLD
 
     def _check_color_consistency_per_line(self, pdf_path: str) -> list[dict]:
         """
@@ -1050,7 +1392,8 @@ class ContentAnalyzer:
         return embedded_families & unembedded_families
 
     def _build_signals(
-        self, lines, suspicious_lines, profile, fonts: list = None, color_issues: list = None
+        self, lines, suspicious_lines, profile, fonts: list = None,
+        color_issues: list = None, gap_findings: list = None,
     ) -> tuple[list[str], int]:
         signals = []
         score   = 0
@@ -1101,6 +1444,19 @@ class ContentAnalyzer:
             )
             score += min(COLOR_CONSISTENCY_SCORE_CAP,
                          len(color_issues) * COLOR_CONSISTENCY_SCORE_PER_SPAN)
+
+        if gap_findings:
+            for g in gap_findings:
+                bbox = g["bbox"]
+                signals.append(
+                    f"[LINE_GAP] Page {g['page']+1}: line preceded by abnormal "
+                    f"vertical gap ({g['gap']:.1f}pt vs page baseline "
+                    f"{g['expected_gap']:.1f}pt, z={g['z_score']:.1f}) — "
+                    f"possible text inserted into empty space "
+                    f"bbox=({bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f})"
+                )
+            gap_score = min(LINE_GAP_SCORE_CAP, len(gap_findings) * LINE_GAP_SCORE_PER_ANOMALY)
+            score += gap_score * LINE_GAP_SCORE_WEIGHT
 
         if not signals:
             signals.append(

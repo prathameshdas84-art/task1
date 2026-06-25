@@ -7,6 +7,7 @@ Test: http://localhost:8000/docs
 import io
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -24,7 +25,10 @@ from numeric_analyzer import NumericAnalyzer
 from ela_analyzer import ELAAnalyzer
 from pymupdf_analyzer import PyMuPDFAnalyzer
 from xref_analyzer import XrefAnalyzer
-from verdict_engine import combine
+from verdict_engine import (
+    combine, WEIGHTS, UNCERTAIN_BAND,
+    CONFIDENCE_BASE, CONFIDENCE_DISTANCE_MULTIPLIER, CONFIDENCE_CAP,
+)
 from models import (
     ForensicResponse, HealthResponse,
     LayerScores, SuspiciousLine, NumericAnomaly, ConfidenceDetail,
@@ -87,6 +91,110 @@ app.add_middleware(
 # ── Supported file types ───────────────────────────────────────────────────────
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"}
+
+
+# ── Upgrade 3: merged-document detection ────────────────────────────────────────
+# A multi-document compilation (merged PDF) legitimately has different fonts/
+# sizes/colors per source page by design — the metadata layer's score is
+# weighted down for these so a global anomaly score doesn't get attributed to
+# "tampering" when it's really just several different original documents.
+MERGE_PRODUCER_KEYWORDS = [
+    "pdf24", "ilovepdf", "smallpdf", "adobe acrobat",
+    "foxit", "pdfcreator", "ghostscript",
+    "microsoft print to pdf", "cups-pdf",
+]
+MERGE_MIN_PAGES                 = 3     # only consider merge detection above this page count
+MERGE_MOD_INTERVAL_MINUTES      = 60    # long creation->modification gap = likely re-assembled from parts
+METADATA_MERGE_SCORE_MULTIPLIER = 0.4
+
+
+def _detect_merged_document(meta_report, total_pages: int) -> bool:
+    if not meta_report or total_pages <= MERGE_MIN_PAGES:
+        return False
+    producer = (meta_report.producer or "").lower()
+    creator  = (meta_report.creator or "").lower()
+    has_merge_producer = any(kw in producer or kw in creator for kw in MERGE_PRODUCER_KEYWORDS)
+    long_mod_interval = (
+        meta_report.time_delta_seconds is not None
+        and meta_report.time_delta_seconds / 60 > MERGE_MOD_INTERVAL_MINUTES
+    )
+    return has_merge_producer or long_mod_interval
+
+
+# ── Upgrade 2: cross-layer timeline assertor ────────────────────────────────────
+# A document printed with "09 July 2024" but digitally created in 2026 is a
+# backdating signal no existing layer catches — metadata only compares its
+# OWN dates against each other, content/OCR never compare against metadata.
+TIMELINE_DATE_PATTERNS = [
+    # "09 July 2024", "9 Jan 2023"
+    re.compile(
+        r'\b\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|'
+        r'jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|'
+        r'nov(?:ember)?|dec(?:ember)?)\s+(20\d{2})\b',
+        re.IGNORECASE,
+    ),
+    # "09/07/2024", "09-07-2024"
+    re.compile(r'\b\d{1,2}[/-]\d{1,2}[/-](20\d{2})\b'),
+    # "2024-07-09" (ISO format)
+    re.compile(r'\b(20\d{2})-\d{2}-\d{2}\b'),
+]
+TIMELINE_YEAR_MIN        = 2000
+TIMELINE_YEAR_MAX        = 2030
+TIMELINE_TOLERANCE_YEARS = 1    # documents may legitimately be prepared slightly before/after their stated date
+TIMELINE_BACKDATE_SCORE  = 35
+TIMELINE_FUTURE_SCORE    = 10
+TIMELINE_SCORE_CAP       = 70
+
+
+def _cross_validate_timeline(pdf_path: str, meta_report) -> tuple[int, list[str]]:
+    """
+    Scans the document's visible text for printed dates and compares their
+    years against the PDF's metadata creation year. Returns (timeline_score,
+    signals) — (0, []) if there's no metadata creation date to compare
+    against, or every printed date is within ±TIMELINE_TOLERANCE_YEARS of it.
+    """
+    if not meta_report or not meta_report.creation_date:
+        return 0, []
+
+    creation_year = meta_report.creation_date.year
+
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        full_text = " ".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return 0, []
+
+    printed_years = set()
+    for pattern in TIMELINE_DATE_PATTERNS:
+        for m in pattern.finditer(full_text):
+            year = int(m.group(1))
+            if TIMELINE_YEAR_MIN <= year <= TIMELINE_YEAR_MAX:
+                printed_years.add(year)
+
+    if not printed_years:
+        return 0, []
+
+    timeline_score = 0
+    signals = []
+    for printed_year in sorted(printed_years):
+        diff = creation_year - printed_year
+        if diff > TIMELINE_TOLERANCE_YEARS:
+            signals.append(
+                f"[TIMELINE] Printed date year {printed_year} predates digital "
+                f"creation year {creation_year} by {diff} years — possible "
+                f"backdated document"
+            )
+            timeline_score += TIMELINE_BACKDATE_SCORE
+        elif -diff > TIMELINE_TOLERANCE_YEARS:
+            signals.append(
+                f"[TIMELINE] Printed date year {printed_year} is {-diff} years "
+                f"AFTER the digital creation year {creation_year}"
+            )
+            timeline_score += TIMELINE_FUTURE_SCORE
+
+    return min(TIMELINE_SCORE_CAP, timeline_score), signals
 
 
 # ── Confidence builder ─────────────────────────────────────────────────────────
@@ -535,6 +643,20 @@ async def analyze_document(file: UploadFile = File(...)):
         has_images = any(len(p.get_images()) > 0 for p in doc_tmp)
         doc_tmp.close()
 
+        # Upgrade 3 — merged-document detection: reduce metadata_score's
+        # contribution before combine() ever sees it, so a multi-file
+        # compilation's per-page style differences don't get weighted as
+        # heavily as a single inconsistent document's would be.
+        try:
+            if _detect_merged_document(meta_report, total_pages):
+                meta_report.anomaly_score = int(meta_report.anomaly_score * METADATA_MERGE_SCORE_MULTIPLIER)
+                meta_report.anomalies.append(
+                    "[INFO] Document appears to be a multi-file compilation — "
+                    "metadata anomalies weighted down accordingly"
+                )
+        except Exception:
+            pass
+
         try:
             ocr_report     = direct_image_ocr if direct_image_ocr is not None else OCRAnalyzer().analyze(pdf_path)
         except Exception as e:
@@ -574,6 +696,31 @@ async def analyze_document(file: UploadFile = File(...)):
             meta_report, content_report, ocr_report,
             numeric_report, ela_report, pymupdf_report, xref_report
         )
+
+        # Upgrade 2 — cross-layer timeline assertion: a backdated printed
+        # date is invisible to every existing layer (none compare printed
+        # text dates against metadata creation date), so it's applied here
+        # as a post-hoc adjustment to the already-combined verdict rather
+        # than as a new weighted layer in verdict_engine.combine().
+        try:
+            timeline_score, timeline_signals = _cross_validate_timeline(pdf_path, meta_report)
+        except Exception:
+            timeline_score, timeline_signals = 0, []
+        if timeline_score > 0:
+            verdict_obj.all_signals = (verdict_obj.all_signals or []) + timeline_signals
+            verdict_obj.metadata_score = min(100, verdict_obj.metadata_score + timeline_score)
+            metadata_weight = WEIGHTS.get(verdict_obj.pdf_type, WEIGHTS["native_text"])["metadata"]
+            verdict_obj.combined_score = round(
+                min(100, verdict_obj.combined_score + timeline_score * metadata_weight), 1
+            )
+            distance = abs(verdict_obj.combined_score - verdict_obj.effective_threshold)
+            verdict_obj.confidence = min(
+                CONFIDENCE_CAP, CONFIDENCE_BASE + int(distance * CONFIDENCE_DISTANCE_MULTIPLIER)
+            )
+            new_verdict = "MODIFIED" if verdict_obj.combined_score >= verdict_obj.effective_threshold else "ORIGINAL"
+            if abs(verdict_obj.combined_score - verdict_obj.effective_threshold) <= UNCERTAIN_BAND:
+                new_verdict = "UNCERTAIN"
+            verdict_obj.verdict = new_verdict
 
         # Gatekeeper — an ORIGINAL verdict means no layer accumulated enough
         # evidence to call this document modified. Surfacing per-region
@@ -627,6 +774,18 @@ async def analyze_document(file: UploadFile = File(...)):
                 "page": 0,  # 0-indexed; surfaces as page 1 in the response
                 "score": meta_report.anomaly_score / 100,
                 "text": "; ".join(meta_report.anomalies[:3]),
+            })
+
+        # Upgrade 2 — surface a backdating signal as its own cross-validated
+        # pseudo-finding too, but only when the metadata layer independently
+        # has anomalies of its own — a timeline mismatch alone (clean
+        # metadata otherwise) isn't corroborated by anything to fuse with.
+        if not is_clean and timeline_score > 0 and meta_report and meta_report.anomaly_score > 0:
+            metadata_findings.append({
+                "layer": "metadata",
+                "page": 0,
+                "score": min(1.0, timeline_score / 100),
+                "text": "; ".join(timeline_signals[:3]),
             })
 
         # Cross-layer signal fusion — surface regions confirmed by 2+ layers as
