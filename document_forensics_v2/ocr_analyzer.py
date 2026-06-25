@@ -17,6 +17,7 @@ no OCR uncertainty on embedded text).
 import os
 import shutil
 import statistics
+from collections import Counter
 from dataclasses import dataclass, field
 
 import fitz
@@ -152,7 +153,25 @@ PIXEL_SCORE_CAP            = 100
 
 # Font height profiling thresholds
 PIXEL_SIZE_DEVIATION_RATIO = 0.20     # 20% deviation from median
-PIXEL_SIZE_DEVIATION_MIN   = 3        # minimum 3px difference to flag
+PIXEL_SIZE_DEVIATION_MIN   = 5        # minimum 5px difference to flag
+
+# Dominant-cluster exemption: a height/brightness that recurs across the
+# document (company header, title, table row) is a legitimate layout
+# element, not an edited word, even though it differs from the median of
+# whatever line/page it happens to sit on. Mirrors the same frequency-
+# clustering principle as _common_value_clusters/_line_dominant_buckets
+# (used by the native-text path) — without it, every document with a
+# header line scores 100 purely from its own header.
+PIXEL_DOMINANT_HEIGHT_BUCKET_PX = 2     # round heights to nearest 2px before clustering
+PIXEL_DOMINANT_TOP_N            = 3     # the 3 most common heights/brightnesses are always exempt
+PIXEL_DOMINANT_MIN_SHARE        = 0.05  # plus anything else used by >=5% of words/page
+
+# Per-line brightness tolerance: a short word ("LTD") naturally averages a
+# slightly different brightness than a long word ("TECHNOLOGIES") in the
+# SAME ink/font due to anti-aliasing — a couple of brightness units of
+# spread among words on the same physical line is normal rendering noise,
+# not a different word matching a different dominant bucket exactly.
+PIXEL_LINE_BRIGHTNESS_TOLERANCE = 6
 
 # Color profiling thresholds
 PIXEL_COLOR_MAD_THRESHOLD  = 3.0      # MAD-based z-score > 3
@@ -1033,7 +1052,13 @@ class OCRAnalyzer:
                     if width < 5 or height < 5:  # Too small
                         continue
 
-                    line_num = data['line_num'][i]
+                    # Tesseract's line_num is only unique WITHIN a given
+                    # (block_num, par_num) — it resets to 0 for every new
+                    # paragraph, so two unrelated visual lines in different
+                    # paragraphs can collide on line_num alone. Combine all
+                    # three so per-line grouping below actually identifies
+                    # one physical line, not an arbitrary cross-paragraph mix.
+                    line_key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
 
                     # Convert pixel coords to PDF points
                     x0_pt = left / scale
@@ -1054,7 +1079,7 @@ class OCRAnalyzer:
                         'bbox_pt': bbox_pt,
                         'bbox_pix': (left, top, left + width, top + height),
                         'height_pix': height,
-                        'line_num': line_num,
+                        'line_num': line_key,
                         'conf': conf,
                         'img': img_bgr,  # Keep reference to image for later pixel extraction
                         'page_height_pix': page_height_pix,
@@ -1112,7 +1137,26 @@ class OCRAnalyzer:
     def _profile_font_heights(self, words):
         """Font HEIGHT profiling per line."""
         anomalies = []
-        
+
+        all_heights = [w['height_pix'] for w in words if w.get('height_pix', 0) > 0]
+        if not all_heights:
+            return []
+
+        # Document-wide dominant height clusters — see PIXEL_DOMINANT_*
+        # comment above. A header/title's height recurs consistently
+        # (every word on that line, often every page), so it's exempt
+        # even though it differs from whatever line-local median it's
+        # being compared against.
+        rounded_heights = [round(h / PIXEL_DOMINANT_HEIGHT_BUCKET_PX) * PIXEL_DOMINANT_HEIGHT_BUCKET_PX
+                            for h in all_heights]
+        height_counts = Counter(rounded_heights)
+        dominant_heights = set(h for h, _ in height_counts.most_common(PIXEL_DOMINANT_TOP_N))
+        total_words = len(all_heights)
+        dominant_heights.update(
+            h for h, count in height_counts.items()
+            if count / total_words >= PIXEL_DOMINANT_MIN_SHARE
+        )
+
         # Group by line number (same page, same line_num)
         lines = {}
         for w in words:
@@ -1120,25 +1164,42 @@ class OCRAnalyzer:
             if key not in lines:
                 lines[key] = []
             lines[key].append(w)
-        
+
         for line_key, line_words in lines.items():
             if len(line_words) < 3:  # Need at least 3 words per line
                 continue
-            
+
             heights = [w['height_pix'] for w in line_words]
             median_h = statistics.median(heights)
-            
+
             # Calculate MAD (Median Absolute Deviation)
             try:
                 mad = self._median_absolute_deviation(heights)
             except:
                 mad = 0
-            
+
             for w in line_words:
+                if len(w.get('text', '').strip()) < 3:
+                    continue  # single chars and 2-char words
+                              # have unreliable bbox heights
+
+                if w.get('conf', 100) < 70:
+                    continue  # low-confidence OCR word —
+                              # bbox measurement unreliable
+
+                # Height matches a document-wide dominant cluster — a
+                # legitimate, recurring layout element, not an isolated
+                # edited word. Skip before flagging.
+                word_height_rounded = round(w['height_pix'] / PIXEL_DOMINANT_HEIGHT_BUCKET_PX) * PIXEL_DOMINANT_HEIGHT_BUCKET_PX
+                if word_height_rounded in dominant_heights:
+                    continue
+
                 deviation = abs(w['height_pix'] - median_h)
-                
-                # Check if height is anomalous
-                if deviation > max(PIXEL_SIZE_DEVIATION_MIN, median_h * PIXEL_SIZE_DEVIATION_RATIO):
+
+                # Check if height is anomalous — must be both absolutely
+                # and proportionally significant to avoid Tesseract noise.
+                if (deviation > PIXEL_SIZE_DEVIATION_MIN
+                        and deviation > median_h * PIXEL_SIZE_DEVIATION_RATIO):
                     anomalies.append({
                         'page': w['page'],
                         'word': w['text'],
@@ -1148,7 +1209,7 @@ class OCRAnalyzer:
                         'confidence': 75,
                         'reason': f"Font height {w['height_pix']}px vs line median {median_h:.0f}px ({deviation/median_h*100:.0f}% deviation)",
                     })
-        
+
         return anomalies
 
     def _profile_pixel_colors(self, words, is_id_card: bool = False):
@@ -1236,14 +1297,53 @@ class OCRAnalyzer:
                             'reason': f"Pure digital black (brightness {brightness:.0f}) on scanned document (median {page_median_brightness:.0f})",
                         })
                         continue
-            
+
+            # Dominant brightness clusters on this page — a header/title
+            # rendered in a different (but consistent, recurring) ink
+            # shade is a legitimate layout element, not an edited word.
+            # Same exemption as _profile_font_heights, scoped per-page to
+            # match this check's existing per-page statistics.
+            rounded_brightness = [round(b) for b in brightness_values]
+            brightness_counts = Counter(rounded_brightness)
+            dominant_brightness = set(b for b, _ in brightness_counts.most_common(PIXEL_DOMINANT_TOP_N))
+            total_words_page = len(brightness_values)
+            dominant_brightness.update(
+                b for b, count in brightness_counts.items()
+                if count / total_words_page >= PIXEL_DOMINANT_MIN_SHARE
+            )
+
+            # Per-line brightness consistency — catches the case the
+            # page-wide cluster check above misses: a short header/title
+            # line (e.g. a 4-word company name) is too rare document-wide
+            # to clear PIXEL_DOMINANT_MIN_SHARE on a page with 100+ body
+            # words, but is internally consistent with its own neighboring
+            # words. Mirrors _line_dominant_buckets' logic for the
+            # native-text path, using a tolerance rather than exact-bucket
+            # equality since a short word ("LTD") legitimately averages a
+            # slightly different brightness than its longer line-mates.
+            line_groups = {}
+            for brightness, w in brightnesses:
+                line_groups.setdefault(w.get('line_num'), []).append(brightness)
+            line_median_brightness = {
+                line_id: statistics.median(vals)
+                for line_id, vals in line_groups.items()
+                if line_id is not None and len(vals) >= 2
+            }
+
             # MAD-based z-score for color anomalies
             for brightness, w in brightnesses:
+                rounded = round(brightness)
+                if rounded in dominant_brightness:
+                    continue
+                line_median = line_median_brightness.get(w.get('line_num'))
+                if line_median is not None and abs(brightness - line_median) <= PIXEL_LINE_BRIGHTNESS_TOLERANCE:
+                    continue
+
                 if page_mad > 0:
                     mad_z = abs(brightness - page_median_brightness) / (page_mad * 1.4826 + 0.01)
                 else:
                     mad_z = 0
-                
+
                 if mad_z > mad_threshold:
                     anomalies.append({
                         'page': w['page'],
