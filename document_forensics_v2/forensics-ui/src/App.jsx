@@ -1,8 +1,9 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import jsPDF from "jspdf";
 import { applyPlugin } from "jspdf-autotable";
 import "./App.css";
+import ForensicCalculator from "./ForensicCalculator";
 
 // jspdf-autotable v5 dropped the auto-patched doc.autoTable() in favor of a
 // standalone autoTable(doc, opts) export; applyPlugin() restores the
@@ -75,10 +76,16 @@ export default function App() {
     }
   };
 
-  const imageUrl = result
-    ? `${API}/annotated-image/${result.analysis_id}?page=${activePage}` +
-      `&t=${Date.now()}`
-    : null;
+  // analysis_id is a unique UUID per analysis and page is explicit, so the
+  // URL itself is a stable cache key — Date.now() is not needed and would
+  // cause the browser to re-fetch the image on every React render (zoom
+  // change, tab switch, etc.), which also triggers stale-session 404s.
+  const imageUrl = useMemo(
+    () => result
+      ? `${API}/annotated-image/${result.analysis_id}?page=${activePage}`
+      : null,
+    [result?.analysis_id, activePage]
+  );
 
   const verdictColor = result?.verdict === "MODIFIED" ? "#ff4444"
                      : result?.verdict === "ORIGINAL" ? "#00cc66"
@@ -1101,63 +1108,33 @@ export default function App() {
               <div className="legend">
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ff4444" }} />
-                  Red = font/spacing
-                </span>
-                <span className="legend-item">
-                  <span className="legend-dot" style={{ background: "#ff6400" }} />
-                  🟠 Orange = font size anomaly (OCR)
+                  Red = Font/spacing anomaly (Content layer)
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ff00c8" }} />
-                  🟣 Magenta = color anomaly (OCR)
+                  Magenta = Color/ink anomaly (suspicious edit)
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ffdd00" }} />
-                  Yellow = numeric outlier
+                  Yellow = Numeric value outlier
                 </span>
                 <span className="legend-item">
-                  <span className="legend-dot" style={{ background: "#cc44ff" }} />
-                  Purple = ELA anomaly
-                </span>
-                <span className="legend-item">
-                  <span className="legend-dot" style={{ background: "#00ffcc" }} />
-                  Cyan = hidden overlay
+                  <span className="legend-dot" style={{ background: "#00ccff" }} />
+                  Cyan = Hidden overlay detected
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ffc800" }} />
-                  🟨 Gold = ghost text (overlapping layers)
+                  Gold = Ghost text / overlapping layers
                 </span>
               </div>
 
-              {/* Age-based color coding */}
+              {/* Confidence note */}
               <div className="legend-section">
-                <div className="legend-title">Box Colors by Edit Age:</div>
-                <div className="legend">
-                  <span className="legend-item">
-                    <span className="legend-dot" style={{background:"#dc1e1e"}} />
-                    Today (most suspicious)
-                  </span>
-                  <span className="legend-item">
-                    <span className="legend-dot" style={{background:"#dc641e"}} />
-                    This week
-                  </span>
-                  <span className="legend-item">
-                    <span className="legend-dot" style={{background:"#dc961e"}} />
-                    This month
-                  </span>
-                  <span className="legend-item">
-                    <span className="legend-dot" style={{background:"#b4961e"}} />
-                    This year
-                  </span>
-                  <span className="legend-item">
-                    <span className="legend-dot" style={{background:"#646464"}} />
-                    Older than 1 year
-                  </span>
-                </div>
                 <div className="legend-note">
-                  ℹ️ A PDF stores only one modification date for the whole file,
-                  so this age reflects the document's <em>last</em> edit — not
-                  when each individual change happened.
+                  ℹ️ Only strong signals are shown: cross-validated findings
+                  (confirmed by 2+ independent layers), high-score anomalies,
+                  or pages where 3+ layers fired simultaneously.
+                  The "Modified: …" badge (top-right of page) shows document age.
                 </div>
               </div>
 
@@ -1180,7 +1157,13 @@ export default function App() {
                   alt={`Page ${activePage} annotated`}
                   className="annotated-image"
                   style={{ width: `${zoom}%`, maxWidth: "none" }}
-                  onError={(e) => { e.target.style.display = "none"; }}
+                  onError={() => {
+                    setResult(null);
+                    setError(
+                      "Annotated image not found — the server may have restarted " +
+                      "and lost this session's results. Please re-upload your PDF and analyze again."
+                    );
+                  }}
                 />
               </div>
             </div>
@@ -1495,6 +1478,7 @@ export default function App() {
               </pre>
             </div>
           )}
+          <ForensicCalculator fileId={result.analysis_id} result={result} />
         </div>
       )}
     </div>

@@ -5,6 +5,7 @@ Uses PyMuPDF at full capability for pixel-level forensic analysis.
 """
 
 import fitz
+import hashlib
 import statistics
 from dataclasses import dataclass, field
 
@@ -51,6 +52,13 @@ GHOST_TEXT_MAX_BLOCK_AREA_FRACTION  = 0.3
 GHOST_TEXT_SCORE_PER_REGION         = 35
 GHOST_TEXT_SCORE_CAP                = 70
 MIN_GHOST_TEXT_LEN                  = 2
+
+# Coordinate-overwrite detection: two different span texts at the exact same
+# bbox (1pt precision) — a very precise paste-over that block-level ghost_text
+# detection misses when the injected span is shorter than MIN_GHOST_TEXT_LEN
+# or falls within the same block.
+COORD_OVERWRITE_SCORE_PER_FINDING = 25
+COORD_OVERWRITE_SCORE_CAP          = 50
 
 # A cover-and-retype edit doesn't have to use a white box — on a colored
 # letterhead/panel background, an editor will fill with whatever color
@@ -301,6 +309,58 @@ class PyMuPDFAnalyzer:
                     ))
         return regions
 
+    def _bbox_overlaps(self, a: tuple, b: tuple) -> bool:
+        """True if two (x0, y0, x1, y1) bboxes share any area."""
+        return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+    def _detect_coordinate_overwrites(self, page: "fitz.Page", page_num: int) -> list:
+        """
+        Flag spans where two DIFFERENT texts share the exact same bounding
+        box (rounded to 1pt to absorb anti-aliasing drift) — a strong signal
+        that text was pasted directly over existing content at the span level
+        without removing the original.  Block-level ghost_text detection
+        catches the coarser case; this catches same-block or very-short
+        overwrites that slip through MIN_GHOST_TEXT_LEN.
+        """
+        spatial_registry = {}  # bbox_key → sha256 of first text seen there
+        findings = []
+
+        # Use "dict" mode (not rawdict) — "dict" spans carry a "text" key
+        # directly; rawdict spans only expose "chars" without a top-level text.
+        textdict = page.get_text("dict")
+        for block in textdict.get("blocks", []):
+            if "lines" not in block:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    text = span.get("text", "").strip()
+                    if not text:
+                        continue
+
+                    # Round to 1pt so floating-point anti-aliasing noise
+                    # in identical glyphs doesn't create false mismatches.
+                    bbox_key = tuple(round(c, 1) for c in span["bbox"])
+
+                    text_hash = hashlib.sha256(
+                        text.encode("utf-8")
+                    ).hexdigest()
+
+                    if bbox_key in spatial_registry:
+                        if spatial_registry[bbox_key] != text_hash:
+                            findings.append(OverlayRegion(
+                                page=page_num,
+                                bbox=span["bbox"],
+                                overlay_type="coordinate_overwrite",
+                                reason=(
+                                    "Different text content at identical coordinates — "
+                                    "possible paste-over injection"
+                                ),
+                            ))
+                    else:
+                        spatial_registry[bbox_key] = text_hash
+
+        return findings
+
     def analyze(self, pdf_path: str) -> PyMuPDFReport:
         doc = fitz.open(pdf_path)
         all_regions = []
@@ -348,7 +408,20 @@ class PyMuPDFAnalyzer:
                 ))
 
             # CHECK 1b — Different text blocks overlapping each other (ghost text)
-            all_regions.extend(self._detect_overlapping_text(page, page_num, page_area))
+            ghost_regions = self._detect_overlapping_text(page, page_num, page_area)
+            all_regions.extend(ghost_regions)
+
+            # CHECK 1c — Coordinate-hash duplicate detection at span level.
+            # Detects different text strings sharing the exact same bbox —
+            # a paste-over that block-level ghost_text can miss (same block,
+            # or spans shorter than MIN_GHOST_TEXT_LEN).  Skip any candidate
+            # whose bbox already overlaps a ghost_text finding to avoid
+            # double-counting the same forgery at two granularities.
+            coord_candidates = self._detect_coordinate_overwrites(page, page_num)
+            ghost_bboxes = [r.bbox for r in ghost_regions]
+            for r in coord_candidates:
+                if not any(self._bbox_overlaps(r.bbox, gb) for gb in ghost_bboxes):
+                    all_regions.append(r)
 
             # CHECK 2 — Images overlapping text regions
             for img in page.get_images(full=True):
@@ -407,10 +480,11 @@ class PyMuPDFAnalyzer:
         doc.close()
 
         # Score and signals
-        covering_rects = [r for r in all_regions if r.overlay_type == "covering_rect"]
-        img_overlays  = [r for r in all_regions if r.overlay_type == "image_overlay"]
-        char_anomalies = [r for r in all_regions if r.overlay_type == "char_spacing"]
-        ghost_text     = [r for r in all_regions if r.overlay_type == "ghost_text"]
+        covering_rects   = [r for r in all_regions if r.overlay_type == "covering_rect"]
+        img_overlays     = [r for r in all_regions if r.overlay_type == "image_overlay"]
+        char_anomalies   = [r for r in all_regions if r.overlay_type == "char_spacing"]
+        ghost_text       = [r for r in all_regions if r.overlay_type == "ghost_text"]
+        coord_overwrites = [r for r in all_regions if r.overlay_type == "coordinate_overwrite"]
 
         signals = []
         score   = 0
@@ -449,7 +523,16 @@ class PyMuPDFAnalyzer:
             score += min(GHOST_TEXT_SCORE_CAP,
                          len(ghost_text) * GHOST_TEXT_SCORE_PER_REGION)
 
-        if not any([covering_rects, img_overlays, char_anomalies, ghost_text]):
+        if coord_overwrites:
+            signals.append(
+                f"{len(coord_overwrites)} coordinate-overwrite(s) detected — "
+                f"different text at identical span coordinates, "
+                f"possible paste-over injection"
+            )
+            score += min(COORD_OVERWRITE_SCORE_CAP,
+                         len(coord_overwrites) * COORD_OVERWRITE_SCORE_PER_FINDING)
+
+        if not any([covering_rects, img_overlays, char_anomalies, ghost_text, coord_overwrites]):
             signals.append(
                 "PyMuPDF deep analysis passed — "
                 "no hidden overlays or character anomalies detected"

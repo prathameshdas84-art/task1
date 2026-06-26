@@ -116,6 +116,17 @@ SCANNED_SIGNATURE_ZONE_FRACTION   = 0.15  # bottom of page — signatures always
 SCANNED_HEADER_ZONE_FRACTION      = 0.12  # top of page — printed logos/letterhead on a scan
 SCANNED_HEADER_WEIGHT_MULTIPLIER  = 0.6   # reduce (not drop) header-zone hits by 40%
 
+# Compiled/merged-document calibration: when multiple separately-scanned
+# source documents are merged into one PDF (via pypdf, PDF24, etc.) each
+# source page has its own independent JPEG compression baseline.  ELA sees
+# those page-boundary differences as "edits" and fires false positives on
+# every page.  Applying stricter thresholds dramatically reduces this noise
+# without suppressing genuine single-page edit signals.
+COMPILED_PHASE1_Z_THRESHOLD  = 4.5   # vs Z_THRESHOLD=3.0 — only keep strong phase-1 hits
+COMPILED_MIN_CLUSTER_SIZE    = 5     # vs SCANNED_MIN_CLUSTER_SIZE=3 — require larger clusters
+COMPILED_SCORE_MULTIPLIER    = 0.35  # vs SCANNED_SCORE_MULTIPLIER=0.6 — reduce score weight
+COMPILED_MIN_PAGES           = 4     # multi-page scanned doc threshold for compiled detection
+
 # High-DPI region refinement: how much padding (in low-DPI block-equivalents)
 # to render around a confirmed block when cropping for exact-location
 # refinement, so the crop has enough surrounding context to compute a
@@ -275,6 +286,7 @@ class ELAAnalyzer:
 
         is_image_doc = self._is_image_based_document(doc, pdf_type)
         is_scanned_type = pdf_type in ("scanned", "scanned_native")
+        is_compiled = self._is_compiled_document(pdf_path, pdf_type)
         page_heights = {p: doc[p].rect.height for p in range(len(doc))}
 
         signals = []
@@ -314,6 +326,20 @@ class ELAAnalyzer:
             f"out of {total_blocks} scanned across {len(doc)} page(s)"
         )
 
+        # Compiled/merged scanned documents: apply a stricter z-threshold to
+        # phase-1 candidates.  Each source page was compressed independently,
+        # so page-boundary compression differences look like "edits" at the
+        # normal Z_THRESHOLD=3.0.  Raising the bar to COMPILED_PHASE1_Z_THRESHOLD
+        # keeps only blocks with a genuinely anomalous error level.
+        if is_compiled and is_scanned_type:
+            for page_num in list(page_candidates.keys()):
+                strong = [r for r in page_candidates[page_num]
+                          if r.z_score >= COMPILED_PHASE1_Z_THRESHOLD]
+                if strong:
+                    page_candidates[page_num] = strong
+                else:
+                    del page_candidates[page_num]
+
         # ── PHASE 2: medium-DPI confirmation — ONLY pages with candidates ──
         confirmed_after_medium = {}     # page_num -> list[ELARegion]
         mat_med = fitz.Matrix(med_dpi / 72, med_dpi / 72)
@@ -348,9 +374,15 @@ class ELAAnalyzer:
         # noise), keep only blocks that are part of a contiguous cluster
         # large enough to plausibly be one edited word/line. See
         # SCANNED_MIN_CLUSTER_SIZE above for why.
+        # Compiled docs use a larger minimum cluster (COMPILED_MIN_CLUSTER_SIZE)
+        # because their higher per-page noise floor means small clusters are
+        # almost certainly compression boundary artifacts, not real edits.
         if is_scanned_type:
+            cluster_min = COMPILED_MIN_CLUSTER_SIZE if is_compiled else SCANNED_MIN_CLUSTER_SIZE
             for page_num in list(confirmed_after_medium.keys()):
-                clustered = self._filter_to_significant_clusters(confirmed_after_medium[page_num])
+                clustered = self._filter_to_significant_clusters(
+                    confirmed_after_medium[page_num], min_size=cluster_min
+                )
                 if clustered:
                     confirmed_after_medium[page_num] = clustered
                 else:
@@ -501,7 +533,11 @@ class ELAAnalyzer:
         n_ela_confirmed = sum(r.score_weight for r in ela_confirmed_regions)
         ela_confirmed_score = min(CONFIRMED_BLOCK_SCORE_CAP, n_ela_confirmed * CONFIRMED_BLOCK_SCORE_PER_BLOCK)
         if is_scanned_type:
-            ela_confirmed_score *= SCANNED_SCORE_MULTIPLIER
+            # Compiled/merged docs use a lower multiplier — surviving blocks are
+            # still more likely to be compression-boundary artifacts than real edits
+            # even after the stricter phase-1/phase-2 gates above.
+            score_mult = COMPILED_SCORE_MULTIPLIER if is_compiled else SCANNED_SCORE_MULTIPLIER
+            ela_confirmed_score *= score_mult
             if len(ela_confirmed_regions) < SCANNED_LOW_HIT_COUNT:
                 ela_confirmed_score *= SCANNED_LOW_HIT_MULTIPLIER
 
@@ -1432,13 +1468,33 @@ class ELAAnalyzer:
                 image_pages += 1
         return image_pages >= max(1, len(doc) // 2)
 
-    def _filter_to_significant_clusters(self, regions: list) -> list:
+    def _is_compiled_document(self, pdf_path: str, pdf_type: str) -> bool:
+        """
+        True when a multi-page scanned PDF is likely a portfolio of several
+        independently-scanned source documents merged together.  Each source
+        page carries its own JPEG compression baseline; ELA sees page-boundary
+        differences as "edits" and produces false positives on every page.
+        Detection heuristic: scanned type + at least COMPILED_MIN_PAGES pages.
+        """
+        if pdf_type not in ("scanned", "scanned_native"):
+            return False
+        try:
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            doc.close()
+        except Exception:
+            return False
+        return total_pages >= COMPILED_MIN_PAGES
+
+    def _filter_to_significant_clusters(self, regions: list, min_size: int = None) -> list:
         """
         Group regions into connected components by bbox proximity (touching
         or near-touching), then keep only blocks belonging to a component
-        with >= SCANNED_MIN_CLUSTER_SIZE members. See the SCANNED_* constant
-        comment above for why this separates a real edit from scan noise.
+        with >= min_size members. See the SCANNED_* constant comment above
+        for why this separates a real edit from scan noise.
         """
+        if min_size is None:
+            min_size = SCANNED_MIN_CLUSTER_SIZE
         n = len(regions)
         if n == 0:
             return []
@@ -1471,7 +1527,7 @@ class ELAAnalyzer:
 
         return [
             regions[i] for i in range(n)
-            if component_sizes[find(i)] >= SCANNED_MIN_CLUSTER_SIZE
+            if component_sizes[find(i)] >= min_size
         ]
 
     def _refine_region_at_high_dpi(self, page, bbox_pts: tuple, high_dpi: float):
