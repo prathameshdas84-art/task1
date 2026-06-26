@@ -1145,6 +1145,12 @@ class ContentAnalyzer:
                 continue
             mean, std = self._trimmed_mean_std(body_gaps)
 
+            # Uniform spacing (std near zero) means there is no anomalous gap
+            # to find — every gap is the same, so z-scores are meaningless and
+            # dividing by std approaches infinity.  Skip the page entirely.
+            if std < 0.5:
+                continue
+
             # A gap value recurring 3+ times on the page is the page's
             # deliberate paragraph-spacing rhythm, not a one-off injection.
             gap_value_counts = Counter(round(g, 1) for g, _ in pairs if g > 0)
@@ -1153,7 +1159,7 @@ class ContentAnalyzer:
             for gap, line_below in pairs:
                 if gap <= 0:
                     continue
-                z = abs(gap - mean) / std
+                z = min(abs(gap - mean) / max(std, 0.5), 100.0)
                 if z <= LINE_GAP_Z_THRESHOLD:
                     continue
                 if gap <= mean:

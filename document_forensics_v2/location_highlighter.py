@@ -65,30 +65,52 @@ class LocationHighlighter:
         ela_regions: list = None,
         overlay_regions: list = None,
         age_days: int = None,
+        fused_findings: list = None,
     ) -> dict:
         """
-        Returns dict of {page_num: PIL.Image} with red boxes drawn.
+        Returns dict of {page_num: PIL.Image} with colored boxes drawn.
         Only returns pages that have at least one suspicious region.
 
         suspicious_lines:    list of SuspiciousLine from content_analyzer
         ocr_word_anomalies:  list of OCRWordAnomaly from ocr_analyzer
         numeric_anomalies:   list of NumericAnomaly from numeric_analyzer
-        ela_regions:         list of ELARegion from ela_analyzer
+        ela_regions:         list of ELARegion from ela_analyzer (not drawn,
+                             but counted for strong-page detection)
         overlay_regions:     list of OverlayRegion from pymupdf_analyzer
-        age_days:          document's last-modification age in days. Box colors
-                           are blended toward red for recent edits and faded
-                           for old ones, and a "Modified: …" badge is drawn in
-                           the top-right corner. NOTE: a PDF stores only ONE
-                           modification date for the whole file, so this age
-                           applies to the entire document's last edit — it
-                           cannot date individual edits.
+        age_days:            document's last-modification age in days
+        fused_findings:      list of FusedFinding from signal_fusion
         """
         # Blend factor applied to box base colors (recent = redder/brighter)
         age_mult = _age_color_intensity(age_days)
 
-        # ALL individual per-layer findings are always drawn. Cross-validated
-        # fusion is surfaced separately (as an additional highlighted section in
-        # the UI Overview tab) and never suppresses these per-layer markings.
+        # ── Signal-strength filtering ───────────────────────────────────────
+        # Pages with cross-validated (2+ layer) findings are always drawn in
+        # full. Single-layer weak signals are suppressed to reduce noise.
+
+        # Pages that appear in fused (cross-validated) findings
+        cross_validated_pages = set()
+        for ff in (fused_findings or []):
+            cross_validated_pages.add(ff.page)
+
+        # Count distinct layers that fired on each page (using raw signals
+        # before any filtering, so the page-strength criterion is unbiased).
+        layer_hits_by_page = {}
+        for sl in (suspicious_lines or []):
+            layer_hits_by_page.setdefault(sl.page, set()).add("content")
+        for r in (ocr_word_anomalies or []):
+            layer_hits_by_page.setdefault(r.page, set()).add("ocr")
+        for r in (numeric_anomalies or []):
+            layer_hits_by_page.setdefault(r.page, set()).add("numeric")
+        for r in (ela_regions or []):
+            layer_hits_by_page.setdefault(r.page, set()).add("ela")
+        for r in (overlay_regions or []):
+            layer_hits_by_page.setdefault(r.page, set()).add("pymupdf")
+
+        # Pages where 3+ distinct layers fired — likely genuinely suspicious
+        strong_pages = set(
+            p for p, layers in layer_hits_by_page.items() if len(layers) >= 3
+        )
+        strong_pages.update(cross_validated_pages)
 
         # Group by page
         lines_by_page = {}
@@ -96,29 +118,20 @@ class LocationHighlighter:
             lines_by_page.setdefault(sl.page, []).append(sl)
 
         ocr_by_page = {}
-        if ocr_word_anomalies:
-            for r in ocr_word_anomalies:
-                ocr_by_page.setdefault(r.page, []).append(r)
+        for r in (ocr_word_anomalies or []):
+            ocr_by_page.setdefault(r.page, []).append(r)
 
         numeric_by_page = {}
-        if numeric_anomalies:
-            for r in numeric_anomalies:
-                numeric_by_page.setdefault(r.page, []).append(r)
-
-        ela_by_page = {}
-        if ela_regions:
-            for r in ela_regions:
-                ela_by_page.setdefault(r.page, []).append(r)
+        for r in (numeric_anomalies or []):
+            numeric_by_page.setdefault(r.page, []).append(r)
 
         overlay_by_page = {}
-        if overlay_regions:
-            for r in overlay_regions:
-                overlay_by_page.setdefault(r.page, []).append(r)
+        for r in (overlay_regions or []):
+            overlay_by_page.setdefault(r.page, []).append(r)
 
         all_pages = (set(lines_by_page.keys()) |
                      set(ocr_by_page.keys()) |
                      set(numeric_by_page.keys()) |
-                     set(ela_by_page.keys()) |
                      set(overlay_by_page.keys()))
         result = {}
 
@@ -132,8 +145,15 @@ class LocationHighlighter:
             img = Image.frombytes("RGB", [pix.w, pix.h], pix.samples)
             draw = ImageDraw.Draw(img)
 
-            # Draw content layer suspicious lines (RED boxes)
+            # Draw content layer suspicious lines (RED boxes).
+            # Only drawn when the signal clears the strength threshold or the
+            # page is already known-suspicious from multiple layers.
             for sl in lines_by_page.get(page_num, []):
+                if not self._should_draw_signal(
+                    page_num, strong_pages, cross_validated_pages,
+                    signal_type="content", score=sl.score,
+                ):
+                    continue
                 self._draw_box(
                     draw=draw,
                     img_size=img.size,
@@ -145,32 +165,37 @@ class LocationHighlighter:
                     thickness=2,
                 )
 
-            # Draw OCR word anomalies — orange-red for size, magenta for
-            # color, green for baseline misalignment, orange for low
-            # confidence (priority order below when a word has more than
-            # one anomaly type).
+            # Draw OCR word anomalies — MAGENTA only for color/digital_paste
+            # anomalies. Size (font-height) and confidence boxes are skipped:
+            # they're too noisy on ID cards and scanned documents to annotate
+            # reliably (bbox measurement artifacts). The scores from those
+            # signals still flow through to the verdict — only the visual box
+            # is suppressed here.
             for r in ocr_by_page.get(page_num, []):
-                if "size" in r.anomaly_types:
-                    color = COLOR_OCR_SIZE
-                elif "color" in r.anomaly_types:
-                    color = COLOR_OCR_COLOR
-                elif "baseline" in r.anomaly_types:
-                    color = COLOR_OCR_BASELINE
-                else:
-                    color = COLOR_OCR_CONF
+                if not any(t in r.anomaly_types for t in ("color", "digital_paste")):
+                    continue  # skip size / confidence / baseline — too noisy
                 self._draw_box(
                     draw=draw,
                     img_size=img.size,
                     bbox=r.bbox,
                     page_h_pts=page_h,
-                    color=color,
+                    color=COLOR_OCR_COLOR,
                     label=f"OCR:{','.join(r.anomaly_types)}",
-                    label_color=color,
+                    label_color=COLOR_OCR_COLOR,
                     thickness=2,
                 )
 
-            # Draw numeric anomalies (YELLOW boxes)
+            # Draw numeric anomalies (YELLOW boxes).
+            # running_balance and arithmetic findings are always drawn (very
+            # reliable signals). Other numeric outliers require a high z-score
+            # or a strongly suspicious page.
             for r in numeric_by_page.get(page_num, []):
+                if not self._should_draw_signal(
+                    page_num, strong_pages, cross_validated_pages,
+                    signal_type="numeric", z_score=r.z_score,
+                    numeric_context=getattr(r, "context", ""),
+                ):
+                    continue
                 self._draw_box(
                     draw=draw,
                     img_size=img.size,
@@ -190,6 +215,7 @@ class LocationHighlighter:
 
             # Draw PyMuPDF overlay regions — CYAN for white-rect cover-ups,
             # MAGENTA for image overlays, GOLD for ghost/overlapping text.
+            # These are rare and reliable signals — always drawn.
             # char_spacing regions are too small (single character bboxes)
             # to usefully draw, so they're skipped.
             for r in overlay_by_page.get(page_num, []):
@@ -235,6 +261,47 @@ class LocationHighlighter:
 
         self.doc.close()
         return result
+
+    # ── Signal-strength gate ────────────────────────────────────────────────
+
+    def _should_draw_signal(
+        self,
+        page_num: int,
+        strong_pages: set,
+        cross_validated_pages: set,
+        signal_type: str,
+        score: float = None,
+        z_score: float = None,
+        numeric_context: str = "",
+    ) -> bool:
+        """
+        Returns True if a signal is strong enough to deserve a visual box.
+
+        Criterion A: page has a cross-validated (2+ layer) finding → always draw
+        Criterion B: signal individually clears a type-specific threshold
+        Criterion C: 3+ distinct layers fired on this page → draw everything
+        """
+        # A — cross-validated page: always annotate
+        if page_num in cross_validated_pages:
+            return True
+
+        # B — high-reliability numeric sub-types
+        if signal_type == "numeric":
+            if (numeric_context == "running_balance"
+                    or numeric_context.startswith("arithmetic_")):
+                return True  # running-balance and cross-field arithmetic always
+            if z_score is not None and z_score >= 5.0:
+                return True
+
+        # B — high-score content anomaly
+        if signal_type == "content" and score is not None and score >= 0.40:
+            return True
+
+        # C — page is strongly suspicious (3+ layers agree)
+        if page_num in strong_pages:
+            return True
+
+        return False
 
     def _draw_age_badge(self, draw, img_w, age_days):
         """Draw the top-right 'Modified: …' age badge. No-op if age unknown."""

@@ -1135,80 +1135,94 @@ class OCRAnalyzer:
                 doc.close()
 
     def _profile_font_heights(self, words):
-        """Font HEIGHT profiling per line."""
+        """Font HEIGHT profiling per line.
+
+        Dominant-cluster detection is scoped per-page so compiled/merged
+        documents (multiple source PDFs merged into one file) don't have
+        their per-page dominant font sizes compete across pages.  A 12-page
+        portfolio where each page has its own dominant size would see no
+        single height clear the document-wide threshold, flagging everything.
+        """
         anomalies = []
 
-        all_heights = [w['height_pix'] for w in words if w.get('height_pix', 0) > 0]
-        if not all_heights:
+        if not words:
             return []
 
-        # Document-wide dominant height clusters — see PIXEL_DOMINANT_*
-        # comment above. A header/title's height recurs consistently
-        # (every word on that line, often every page), so it's exempt
-        # even though it differs from whatever line-local median it's
-        # being compared against.
-        rounded_heights = [round(h / PIXEL_DOMINANT_HEIGHT_BUCKET_PX) * PIXEL_DOMINANT_HEIGHT_BUCKET_PX
-                            for h in all_heights]
-        height_counts = Counter(rounded_heights)
-        dominant_heights = set(h for h, _ in height_counts.most_common(PIXEL_DOMINANT_TOP_N))
-        total_words = len(all_heights)
-        dominant_heights.update(
-            h for h, count in height_counts.items()
-            if count / total_words >= PIXEL_DOMINANT_MIN_SHARE
-        )
-
-        # Group by line number (same page, same line_num)
-        lines = {}
+        # Group words by page — each page in a compiled doc is its own
+        # independent layout with its own dominant font size(s).
+        words_by_page = {}
         for w in words:
-            key = (w['page'], w['line_num'])
-            if key not in lines:
-                lines[key] = []
-            lines[key].append(w)
+            words_by_page.setdefault(w['page'], []).append(w)
 
-        for line_key, line_words in lines.items():
-            if len(line_words) < 3:  # Need at least 3 words per line
+        for page_num, page_words in words_by_page.items():
+            page_heights = [w['height_pix'] for w in page_words if w.get('height_pix', 0) > 0]
+            if not page_heights:
                 continue
 
-            heights = [w['height_pix'] for w in line_words]
-            median_h = statistics.median(heights)
+            # Dominant height clusters FOR THIS PAGE only — see PIXEL_DOMINANT_*
+            # constants.  A header/title that recurs on every line of this page is
+            # a legitimate layout element, not an isolated edited word.
+            rounded_heights = [
+                round(h / PIXEL_DOMINANT_HEIGHT_BUCKET_PX) * PIXEL_DOMINANT_HEIGHT_BUCKET_PX
+                for h in page_heights
+            ]
+            height_counts = Counter(rounded_heights)
+            dominant_heights = set(h for h, _ in height_counts.most_common(PIXEL_DOMINANT_TOP_N))
+            total_page_words = len(page_heights)
+            dominant_heights.update(
+                h for h, count in height_counts.items()
+                if count / total_page_words >= PIXEL_DOMINANT_MIN_SHARE
+            )
 
-            # Calculate MAD (Median Absolute Deviation)
-            try:
-                mad = self._median_absolute_deviation(heights)
-            except:
-                mad = 0
+            # Group by line number within this page only
+            lines = {}
+            for w in page_words:
+                lines.setdefault(w['line_num'], []).append(w)
 
-            for w in line_words:
-                if len(w.get('text', '').strip()) < 3:
-                    continue  # single chars and 2-char words
-                              # have unreliable bbox heights
-
-                if w.get('conf', 100) < 70:
-                    continue  # low-confidence OCR word —
-                              # bbox measurement unreliable
-
-                # Height matches a document-wide dominant cluster — a
-                # legitimate, recurring layout element, not an isolated
-                # edited word. Skip before flagging.
-                word_height_rounded = round(w['height_pix'] / PIXEL_DOMINANT_HEIGHT_BUCKET_PX) * PIXEL_DOMINANT_HEIGHT_BUCKET_PX
-                if word_height_rounded in dominant_heights:
+            for line_key, line_words in lines.items():
+                if len(line_words) < 3:  # Need at least 3 words per line
                     continue
 
-                deviation = abs(w['height_pix'] - median_h)
+                heights = [w['height_pix'] for w in line_words]
+                median_h = statistics.median(heights)
 
-                # Check if height is anomalous — must be both absolutely
-                # and proportionally significant to avoid Tesseract noise.
-                if (deviation > PIXEL_SIZE_DEVIATION_MIN
-                        and deviation > median_h * PIXEL_SIZE_DEVIATION_RATIO):
-                    anomalies.append({
-                        'page': w['page'],
-                        'word': w['text'],
-                        'bbox': w['bbox_pt'],
-                        'anomaly_type': 'size',
-                        'severity': 'high' if deviation > median_h * 0.3 else 'medium',
-                        'confidence': 75,
-                        'reason': f"Font height {w['height_pix']}px vs line median {median_h:.0f}px ({deviation/median_h*100:.0f}% deviation)",
-                    })
+                # Calculate MAD (Median Absolute Deviation)
+                try:
+                    mad = self._median_absolute_deviation(heights)
+                except Exception:
+                    mad = 0
+
+                for w in line_words:
+                    if len(w.get('text', '').strip()) < 3:
+                        continue  # single chars and 2-char words
+                                  # have unreliable bbox heights
+
+                    if w.get('conf', 100) < 70:
+                        continue  # low-confidence OCR word —
+                                  # bbox measurement unreliable
+
+                    # Height matches this page's dominant cluster — a
+                    # legitimate, recurring layout element, not an isolated
+                    # edited word. Skip before flagging.
+                    word_height_rounded = round(w['height_pix'] / PIXEL_DOMINANT_HEIGHT_BUCKET_PX) * PIXEL_DOMINANT_HEIGHT_BUCKET_PX
+                    if word_height_rounded in dominant_heights:
+                        continue
+
+                    deviation = abs(w['height_pix'] - median_h)
+
+                    # Check if height is anomalous — must be both absolutely
+                    # and proportionally significant to avoid Tesseract noise.
+                    if (deviation > PIXEL_SIZE_DEVIATION_MIN
+                            and deviation > median_h * PIXEL_SIZE_DEVIATION_RATIO):
+                        anomalies.append({
+                            'page': w['page'],
+                            'word': w['text'],
+                            'bbox': w['bbox_pt'],
+                            'anomaly_type': 'size',
+                            'severity': 'high' if deviation > median_h * 0.3 else 'medium',
+                            'confidence': 75,
+                            'reason': f"Font height {w['height_pix']}px vs line median {median_h:.0f}px ({deviation/median_h*100:.0f}% deviation)",
+                        })
 
         return anomalies
 

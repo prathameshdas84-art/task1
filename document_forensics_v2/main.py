@@ -4,6 +4,7 @@ Run: uvicorn main:app --reload --port 8000
 Test: http://localhost:8000/docs
 """
 
+import asyncio
 import io
 import json
 import os
@@ -17,6 +18,8 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Optional
 
 from metadata_extractor import MetadataExtractor, PRODUCER_DB, _DB_PATH as _PRODUCER_DB_PATH
 from content_analyzer import ContentAnalyzer
@@ -36,6 +39,17 @@ from models import (
     FusedFindingModel, FusionStats,
 )
 from signal_fusion import SignalFusion, FusedFinding
+from forensic_calculator import ForensicCalculator
+
+
+class CalcRequest(BaseModel):
+    col_a_index: int
+    col_b_index: int
+    operation: str = "+-"
+    balance_col_index: int
+    starting_balance: Optional[float] = None
+    tolerance: float = 1.0
+    page_filter: Optional[int] = None
 
 # In-memory cache — stores last 100 analysis results + pdf paths so the
 # annotated-image endpoint can re-render a page without re-uploading.
@@ -638,10 +652,17 @@ async def analyze_document(file: UploadFile = File(...)):
             content_report = None
 
         import fitz
-        doc_tmp = fitz.open(pdf_path)
-        total_pages = len(doc_tmp)
-        has_images = any(len(p.get_images()) > 0 for p in doc_tmp)
-        doc_tmp.close()
+        try:
+            doc_tmp = fitz.open(pdf_path)
+            total_pages = len(doc_tmp)
+            try:
+                has_images = any(len(p.get_images()) > 0 for p in doc_tmp)
+            except Exception:
+                has_images = False
+            doc_tmp.close()
+        except Exception:
+            total_pages = 1
+            has_images = False
 
         # Upgrade 3 — merged-document detection: reduce metadata_score's
         # contribution before combine() ever sees it, so a multi-file
@@ -686,9 +707,11 @@ async def analyze_document(file: UploadFile = File(...)):
             xref_report = None
 
         if not all([meta_report, content_report, ocr_report]):
+            failed = [name for name, r in [("metadata", meta_report), ("content", content_report), ("ocr", ocr_report)] if not r]
             raise HTTPException(
-                status_code=500,
-                detail="Core analysis layers failed. File may be corrupted."
+                status_code=422,
+                detail=f"Could not parse the uploaded file — the following core layers failed: {', '.join(failed)}. "
+                       f"The file may be corrupt or password-protected. Try re-saving the PDF and re-uploading."
             )
 
         # Combine verdict
@@ -920,6 +943,13 @@ async def analyze_document(file: UploadFile = File(...)):
         result_dict["incremental_updates"] = ela_report.incremental_updates if ela_report else {}
         return result_dict
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected analysis error: {type(e).__name__}: {e}"
+        )
     finally:
         # Cleanup — handle both original and converted paths. The PDF path
         # that was just stored in _analysis_cache (cached_pdf_path) must
@@ -992,6 +1022,7 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
                 ela_regions=cached["ela_regions"],
                 overlay_regions=cached.get("overlay_regions", []),
                 age_days=age_days,
+                fused_findings=cached.get("fused_findings", []),
             )
             cached["highlighted_pages"] = highlighted
 
@@ -1034,3 +1065,124 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
+
+
+# ── Forensic Calculator endpoints ─────────────────────────────────────────────
+
+@app.get("/calculator/columns/{file_id}", tags=["Calculator"])
+async def get_calculator_columns(file_id: str):
+    """
+    Return detected numeric columns for a previously analysed document.
+    Each column includes its x-position, sample values, and a likely_type hint
+    ('balance', 'transaction', or 'unknown').
+    """
+    if file_id not in _analysis_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="Analysis not found. Please analyse the document first."
+        )
+    pdf_path = _analysis_cache[file_id]["pdf_path"]
+    if not os.path.exists(pdf_path):
+        raise HTTPException(
+            status_code=410,
+            detail="PDF no longer available — please re-upload and analyse."
+        )
+    try:
+        columns = ForensicCalculator().extract_columns(pdf_path)
+        return {"file_id": file_id, "columns": columns, "total_columns": len(columns)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Column extraction failed: {e}")
+
+
+@app.post("/calculator/run/{file_id}", tags=["Calculator"])
+async def run_calculator(file_id: str, request: CalcRequest):
+    """
+    Run arithmetic running-balance verification on a previously analysed document.
+    Returns every row with its expected vs printed balance and a mismatch severity flag.
+    """
+    if file_id not in _analysis_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="Analysis not found. Please analyse the document first."
+        )
+    if request.operation not in ("+", "-", "*", "/", "+-"):
+        raise HTTPException(status_code=400, detail="Invalid operation")
+    pdf_path = _analysis_cache[file_id]["pdf_path"]
+    if not os.path.exists(pdf_path):
+        raise HTTPException(
+            status_code=410,
+            detail="PDF no longer available — please re-upload and analyse."
+        )
+    try:
+        result = ForensicCalculator().run_calculation(pdf_path, request)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Calculator failed: {e}")
+
+
+@app.post("/calculator/run-stream/{file_id}", tags=["Calculator"])
+async def run_calculator_stream(file_id: str, request: CalcRequest):
+    """
+    Stream arithmetic running-balance verification row-by-row as SSE events.
+    Event types: 'columns', 'row', 'done', 'error'.
+    """
+    if file_id not in _analysis_cache:
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    if request.operation not in ("+", "-", "*", "/", "+-"):
+        raise HTTPException(status_code=400, detail="Invalid operation")
+    pdf_path = _analysis_cache[file_id]["pdf_path"]
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=410, detail="PDF no longer available.")
+
+    async def generate():
+        try:
+            calc = ForensicCalculator()
+            columns = calc.extract_columns(pdf_path)
+            yield f"data: {json.dumps({'type': 'columns', 'data': columns})}\n\n"
+            await asyncio.sleep(0)
+
+            result = calc.run_calculation(pdf_path, request)
+
+            if result.get("error"):
+                yield f"data: {json.dumps({'type': 'error', 'data': result['error']})}\n\n"
+                return
+
+            rows = result.get("rows", [])
+            total = len(rows)
+
+            for row in rows:
+                payload = {
+                    "type":       "row",
+                    "data":       row,
+                    "current":    row["row_num"],
+                    "total":      total,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(0.05)
+
+            summary_payload = {
+                "type":    "done",
+                "data": {
+                    "total_rows":                     result["total_rows"],
+                    "mismatch_count":                 result["mismatch_count"],
+                    "mismatch_rows":                  result["mismatch_rows"],
+                    "opening_balance_method":         result["opening_balance_method"],
+                    "opening_balance_confidence":     result["opening_balance_confidence"],
+                    "opening_balance_anomaly":        result["opening_balance_anomaly"],
+                    "opening_balance_anomaly_reason": result["opening_balance_anomaly_reason"],
+                    "summary":                        result["summary"],
+                },
+            }
+            yield f"data: {json.dumps(summary_payload)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'data': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
