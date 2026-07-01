@@ -421,14 +421,46 @@ class ForensicCalculator:
         first_row_printed_balance,
         user_provided=None,
         operation: str = "+-",
+        user_marked_start: bool = False,
     ) -> dict:
         """
-        4-path opening-balance resolver:
+        Opening-balance resolver:
+        0) Marked    — user placed a Start-of-Table marker; that row's own
+                       printed balance is trusted directly (only checked
+                       when user_marked_start is True)
         A) Lookback  — balance cell above the first data row
         B) Inverse   — back-calculate from row-1 printed balance
         C) User      — caller-supplied starting_balance
         D) Fallback  — assume opening == first-row balance (LOW confidence)
         """
+        # PATH 0 — user manually marked which row is the table's first row
+        # (by dragging the Cr./Dr./Balance handles there). Back-solve the
+        # balance BEFORE that row the same way PATH B does — NOT the row's
+        # own printed balance directly, which would make the row-by-row
+        # loop apply that row's delta on top of its own already-final
+        # balance and flag a false-positive mismatch on row 1 every time.
+        # Solving for the pre-row balance guarantees row 1 reconciles
+        # correctly, same as PATH B, just at HIGH confidence since the user
+        # confirmed this is really the first row (not a heuristic guess).
+        # An explicit typed override (user_provided) still wins if both are
+        # set — a literal number is a more deliberate signal than a marker.
+        if user_marked_start and user_provided is None and first_row_printed_balance is not None:
+            if operation == "+-":
+                ob = first_row_printed_balance - first_row_deposit + first_row_withdrawal
+            elif operation == "+":
+                ob = first_row_printed_balance - first_row_deposit - first_row_withdrawal
+            elif operation == "-":
+                ob = first_row_printed_balance + first_row_withdrawal
+            else:
+                ob = first_row_printed_balance
+            return {
+                "opening_balance": ob,
+                "method":          "user_marked_first_row",
+                "confidence":      "HIGH",
+                "anomaly":         False,
+                "anomaly_reason":  None,
+            }
+
         # PATH A
         candidates = [
             e for e in bal_entries
@@ -501,7 +533,8 @@ class ForensicCalculator:
         """
         Full running-balance arithmetic check using table-region-filtered entries.
         request attributes: col_a_index, col_b_index, operation, balance_col_index,
-                            starting_balance, tolerance, page_filter
+                            starting_balance, tolerance, page_filter,
+                            end_page, end_y (optional user-placed table-end marker)
         """
         self._pdf_path = pdf_path
         try:
@@ -542,6 +575,37 @@ class ForensicCalculator:
                 })
             aligned_rows.sort(key=lambda r: (r["page"], r["y_center"]))
 
+            # User-placed "start of table" marker — drop every row strictly
+            # above the marked point (report titles, column headers, or an
+            # unrelated number block above the real table). start_page is
+            # 1-indexed (matches what the UI displays); ar["page"] is
+            # 0-indexed internally.
+            start_page = getattr(request, "start_page", None)
+            start_y    = getattr(request, "start_y", None)
+            user_marked_start = start_page is not None and start_y is not None
+            if user_marked_start:
+                start_page_idx = start_page - 1
+                aligned_rows = [
+                    ar for ar in aligned_rows
+                    if ar["page"] > start_page_idx
+                    or (ar["page"] == start_page_idx and ar["y_center"] >= start_y)
+                ]
+
+            # User-placed "end of table" marker — drop every row at or after
+            # the marked point so a trailing signature block, footer totals,
+            # or a second unrelated table on the same page can't be pulled
+            # into the running-balance check. end_page is 1-indexed (matches
+            # what the UI displays); ar["page"] is 0-indexed internally.
+            end_page = getattr(request, "end_page", None)
+            end_y    = getattr(request, "end_y", None)
+            if end_page is not None and end_y is not None:
+                end_page_idx = end_page - 1
+                aligned_rows = [
+                    ar for ar in aligned_rows
+                    if ar["page"] < end_page_idx
+                    or (ar["page"] == end_page_idx and ar["y_center"] <= end_y)
+                ]
+
             if not aligned_rows:
                 return self._empty_result("Could not align columns into rows")
 
@@ -555,6 +619,7 @@ class ForensicCalculator:
                 first_row_printed_balance=first["printed_balance"],
                 user_provided=request.starting_balance,
                 operation=request.operation,
+                user_marked_start=user_marked_start,
             )
             running_balance = resolution["opening_balance"]
             tolerance       = request.tolerance
