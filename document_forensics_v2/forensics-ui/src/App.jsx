@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import axios from "axios";
 import jsPDF from "jspdf";
 import { applyPlugin } from "jspdf-autotable";
@@ -47,12 +47,14 @@ export default function App() {
   const [activeTab, setActiveTab]   = useState("overview");
   const [zoom, setZoom]             = useState(100);
   const [reportGenerating, setReportGenerating] = useState(false);
+  const [hiddenTextData, setHiddenTextData] = useState(null);
+  const [calculatorActive, setCalculatorActive] = useState(false);
 
   const onDrop = useCallback((e) => {
     e.preventDefault();
     setDragging(false);
     const f = e.dataTransfer.files[0];
-    if (f) { setFile(f); setResult(null); setError(null); }
+    if (f) { setFile(f); setResult(null); setError(null); setHiddenTextData(null); setCalculatorActive(false); }
   }, []);
 
   const analyze = async () => {
@@ -86,6 +88,46 @@ export default function App() {
       : null,
     [result?.analysis_id, activePage]
   );
+
+  // Hidden Text Recovery — fetched automatically once an analysis result
+  // (with an analysis_id) exists, so /hidden-text/{analysis_id} is ready
+  // by the time the panel below decides whether to render.
+  useEffect(() => {
+    if (!result || !result.analysis_id) return;
+
+    fetch(`${API}/hidden-text/${result.analysis_id}`)
+      .then(r => r.json())
+      .then(data => setHiddenTextData(data))
+      .catch(() => setHiddenTextData(null));
+  }, [result]);
+
+  const fieldIcons = {
+    name:       "👤",
+    amount:     "💰",
+    date:       "📅",
+    id_number:  "🔢",
+    address:    "📍",
+    score:      "📊",
+    unknown:    "📄",
+  };
+
+  const methodBadges = {
+    white_rectangle_cover: {
+      label: "White-out detected",
+      color: "#dc2626",
+      icon: "🟥",
+    },
+    text_overlap: {
+      label: "Text layered over original",
+      color: "#d97706",
+      icon: "📑",
+    },
+    incremental_update: {
+      label: "Previous version found",
+      color: "#7c3aed",
+      icon: "🕐",
+    },
+  };
 
   const verdictColor = result?.verdict === "MODIFIED" ? "#ff4444"
                      : result?.verdict === "ORIGINAL" ? "#00cc66"
@@ -133,6 +175,23 @@ export default function App() {
   const generateReport = async () => {
     if (!result || reportGenerating) return;
     setReportGenerating(true);
+
+    // The Hidden Text panel's own fetch (triggered by the result-changed
+    // effect) may still be in flight — or may never have been kicked off
+    // for a stale/cached result — when the user hits Download. Report
+    // generation can't rely on that passive state; it fetches directly so
+    // the report always reflects real extraction results, never a
+    // premature "nothing found" from data that just hadn't loaded yet.
+    let hiddenTextForReport = hiddenTextData;
+    if (result.analysis_id && hiddenTextForReport?.file_id !== result.analysis_id) {
+      try {
+        const { data } = await axios.get(`${API}/hidden-text/${result.analysis_id}`);
+        hiddenTextForReport = data;
+        setHiddenTextData(data);
+      } catch {
+        hiddenTextForReport = null;
+      }
+    }
 
     const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
     const pageW = doc.internal.pageSize.getWidth();
@@ -299,64 +358,77 @@ export default function App() {
     y = doc.lastAutoTable.finalY + 8;
 
     // ══════════════════════════════════════════════════════════
-    // PAGE 3 - FORENSIC SIGNALS
+    // PAGE 3 - ENGINE SUMMARY (plain-English narrative — ALWAYS rendered
+    // for every input regardless of verdict: states what the engine
+    // concluded, then explicitly states whether hidden/original text was
+    // recovered from beneath any edits, one way or the other. Not a raw
+    // signal dump — this is the labeled, human-readable account.)
     // ══════════════════════════════════════════════════════════
     checkY(20);
-    addSectionTitle("3. ALL FORENSIC SIGNALS", [60, 20, 80]);
-    addText(`Total signals detected: ${result.signals.length}`, 9, true);
-    y += 2;
+    addSectionTitle("3. ENGINE SUMMARY & DETECTION FINDINGS", [40, 40, 100]);
 
-    // Group signals by layer
-    const layerPrefixes = {
-      "[METADATA]": { name: "Metadata", color: [180, 80, 20] },
-      "[CONTENT]":  { name: "Content",  color: [180, 30, 50] },
-      "[OCR]":      { name: "OCR",      color: [30, 100, 180] },
-      "[NUMERIC]":  { name: "Numeric",  color: [160, 140, 0] },
-      "[ELA]":      { name: "ELA",      color: [120, 0, 180] },
-      "[PYMUPDF]":  { name: "PyMuPDF",  color: [0, 140, 140] },
-      "[INCREMENTAL]": { name: "Incremental", color: [180, 60, 0] },
+    const fieldLabel = (ft) =>
+      !ft || ft === "unknown" ? "Content" : ft.charAt(0).toUpperCase() + ft.slice(1);
+
+    const methodPhrase = {
+      white_rectangle_cover: "a white box placed over the original text with new text typed on top",
+      text_overlap:          "new text layered directly over the original text",
+      incremental_update:    "an edit made in a later saved revision of the file",
     };
 
-    Object.entries(layerPrefixes).forEach(([prefix, { name, color }]) => {
-      const layerSignals = result.signals.filter(s => s.includes(prefix));
-      if (layerSignals.length === 0) return;
+    const verdictLead = {
+      MODIFIED:  `This document was flagged as MODIFIED with a combined forensic score of ${result.combined_score.toFixed(1)}/100 (${result.confidence.label} confidence).`,
+      ORIGINAL:  `This document was assessed as ORIGINAL with a combined forensic score of ${result.combined_score.toFixed(1)}/100 (${result.confidence.label} confidence).`,
+      UNCERTAIN: `This document's evidence was inconclusive (UNCERTAIN) with a combined forensic score of ${result.combined_score.toFixed(1)}/100 — manual review is recommended.`,
+    }[result.verdict] || `Combined forensic score: ${result.combined_score.toFixed(1)}/100.`;
 
-      checkY(10);
-      doc.setFillColor(...color);
-      doc.rect(margin, y, contentW, 6, "F");
-      doc.setTextColor(255, 255, 255);
-      doc.setFontSize(9);
-      doc.setFont("helvetica", "bold");
-      doc.text(`${name} Layer (${layerSignals.length} signals)`, margin + 3, y + 4.5);
-      doc.setTextColor(0, 0, 0);
-      y += 8;
+    addText(`${verdictLead} ${result.summary}`, 9, false);
+    y += 4;
 
-      layerSignals.forEach(sig => {
-        checkY(6);
-        const cleanSig = sig.replace(prefix, "").trim();
-        const isAnomaly = !cleanSig.includes("passed") &&
-                          !cleanSig.includes("skipped") &&
-                          !cleanSig.includes("consistent") &&
-                          !cleanSig.includes("No significant");
+    addText("Hidden Text Recovery", 9.5, true);
+    if (hiddenTextForReport?.total_found > 0) {
+      addText(
+        "The underlying PDF text layers contain content that does not match what is visible when the " +
+        "document is opened normally. The original text beneath each edit is still present in the file's " +
+        "data and was recovered below:",
+        9, false
+      );
+      y += 2;
 
-        doc.setFontSize(8);
-        doc.setFont("helvetica", isAnomaly ? "bold" : "normal");
-        doc.setTextColor(...(isAnomaly ? [150, 30, 30] : [80, 80, 80]));
-
-        // jsPDF's built-in "helvetica" font only covers WinAnsi (CP1252) -
-        // U+26A0/U+2713 aren't in that set and render as garbage glyphs, so
-        // plain-ASCII markers are used here instead of the emoji the React
-        // UI uses (browsers render those fine via system fonts; jsPDF can't).
-        const prefixChar = isAnomaly ? "[!] " : "[OK] ";
-        const lines = doc.splitTextToSize(prefixChar + cleanSig, contentW - 5);
-        lines.forEach(line => {
-          checkY(5);
-          doc.text(line, margin + 3, y);
-          y += 4.5;
-        });
+      hiddenTextForReport.findings.forEach((f, i) => {
+        checkY(18);
+        addText(`${i + 1}. Page ${f.page} — ${fieldLabel(f.field_type)}`, 9.5, true, [127, 29, 29]);
+        addText(`Original text hidden in the file: "${f.original_text}"`, 9, false, [21, 128, 61]);
+        addText(`Text placed over it: "${f.covering_text}"`, 9, false, [185, 28, 28]);
+        addText(
+          `How it was done: ${f.plain_explanation || `This was done using ${methodPhrase[f.method] || f.method}.`}`,
+          8.5, false, [80, 80, 80]
+        );
+        y += 3;
       });
-      y += 3;
-    });
+
+      y += 1;
+      addText("Conclusion", 9.5, true);
+      addText(hiddenTextForReport.conclusion, 9, false);
+      if (result.verdict === "MODIFIED") {
+        y += 3;
+        addText(
+          "Next steps: treat this document with caution. If independent verification is required, request " +
+          "confirmation directly from the original issuing organization referenced in the document, rather " +
+          "than relying on the copy provided.",
+          9, false, [60, 60, 60]
+        );
+      }
+    } else {
+      // Explicitly state the negative result too — every input gets a
+      // definitive statement either way, never silence.
+      addText(
+        hiddenTextForReport?.summary
+          || "No hidden or covered-up original text was found in the underlying PDF data for this document.",
+        9, false, [60, 60, 60]
+      );
+    }
+    y += 5;
 
     // ══════════════════════════════════════════════════════════
     // PAGE 4 - SPECIFIC FINDINGS
@@ -458,110 +530,15 @@ export default function App() {
     }
 
     // ══════════════════════════════════════════════════════════
-    // PAGE 5 - METADATA
-    // ══════════════════════════════════════════════════════════
-    if (result.metadata) {
-      checkY(20);
-      addSectionTitle("7. FULL METADATA ANALYSIS", [20, 80, 120]);
-
-      const meta = result.metadata;
-      const metaRows = [
-        ["Producer",            meta.producer ?? "-"],
-        ["Creator",             meta.creator ?? "-"],
-        ["Author",              meta.author ?? "-"],
-        ["Title",               meta.title ?? "-"],
-        ["PDF Version",         meta.pdf_version ?? "-"],
-        ["Created",             meta.created ?? "-"],
-        ["Modified",            meta.modified ?? "-"],
-        ["Was Modified",        meta.was_modified ? "YES (!)" : "No"],
-        ["Modification Interval", meta.modification_interval ?? "-"],
-        ["Last Edit Age",       meta.edit_age_human ?? "-"],
-        ["XMP Mismatch",        meta.xmp_mismatch ? "YES (!)" : "No"],
-        ["Multiple Producers",  meta.multiple_producers ? "YES (!)" : "No"],
-        ["Source Risk",         meta.source_risk ?? "-"],
-        ["Source Name",         meta.source_name ?? "-"],
-        ["Total Pages",         String(meta.total_pages ?? "-")],
-        ["Has JavaScript",      meta.has_javascript ? "YES (!)" : "No"],
-        ["JS Context",          meta.js_context ?? "-"],
-        ["Has Embedded Files",  meta.has_embedded_files ? "YES (!)" : "No"],
-        ["Is Encrypted",        meta.is_encrypted ? "Yes" : "No"],
-        ["Font Count",          String(meta.font_count ?? "-")],
-        ["Has Images",          meta.has_images ? "Yes" : "No"],
-        ["Has ICC Profile",     meta.has_icc_profiles ? "Yes" : "No"],
-        ["Page Format",         meta.dimensions?.format ?? "-"],
-        ["Dimensions",          meta.dimensions ? `${meta.dimensions.width_mm}x${meta.dimensions.height_mm}mm` : "-"],
-        ["Orientation",         meta.dimensions?.orientation ?? "-"],
-        ["Authenticity Score",  meta.authenticity ? `${meta.authenticity.score}/100 (${meta.authenticity.assessment})` : "-"],
-      ];
-
-      doc.autoTable({
-        startY: y,
-        head: [["Field", "Value"]],
-        body: metaRows,
-        margin: { left: margin, right: margin },
-        headStyles: { fillColor: [20, 80, 120], textColor: 255 },
-        bodyStyles: { fontSize: 8.5 },
-        alternateRowStyles: { fillColor: [240, 248, 255] },
-        columnStyles: {
-          0: { cellWidth: 55, fontStyle: "bold" },
-          1: { cellWidth: 125 },
-        },
-        didParseCell: (data) => {
-          if (data.section === "body" && data.column.index === 1) {
-            if (String(data.cell.raw).includes("(!)")) {
-              data.cell.styles.textColor = [200, 80, 0];
-              data.cell.styles.fontStyle = "bold";
-            }
-          }
-        },
-      });
-      y = doc.lastAutoTable.finalY + 8;
-
-      // Fonts table
-      if (meta.fonts?.length > 0) {
-        checkY(20);
-        addSectionTitle("8. FONT INVENTORY", [20, 80, 120]);
-
-        const fontRows = meta.fonts.map(f => [
-          f.name,
-          f.type,
-          f.encoding,
-          f.embedded ? "Yes" : "NO (!)",
-        ]);
-
-        doc.autoTable({
-          startY: y,
-          head: [["Font Name", "Type", "Encoding", "Embedded"]],
-          body: fontRows,
-          margin: { left: margin, right: margin },
-          headStyles: { fillColor: [20, 80, 120], textColor: 255 },
-          bodyStyles: { fontSize: 8 },
-          alternateRowStyles: { fillColor: [240, 248, 255] },
-          columnStyles: {
-            0: { cellWidth: 65 },
-            1: { cellWidth: 35 },
-            2: { cellWidth: 50 },
-            3: { cellWidth: 30, halign: "center" },
-          },
-          didParseCell: (data) => {
-            if (data.section === "body" && data.column.index === 3) {
-              if (String(data.cell.raw).includes("(!)")) {
-                data.cell.styles.textColor = [200, 80, 0];
-                data.cell.styles.fontStyle = "bold";
-              }
-            }
-          },
-        });
-        y = doc.lastAutoTable.finalY + 8;
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // PAGE 6 - ANNOTATED IMAGES
+    // PAGE 5 - ANNOTATED IMAGES
+    // (Full metadata / font inventory tables intentionally dropped from
+    // this report — the report now shows only labeled findings, the
+    // marked-up document pages, and the summary, not the raw technical
+    // dump. That detail is still available in the app's Metadata tab.)
     // ══════════════════════════════════════════════════════════
     if (result.analysis_id && result.total_pages > 0) {
       addPage();
-      addSectionTitle("9. ANNOTATED DOCUMENT PAGES", [80, 80, 80]);
+      addSectionTitle("7. ANNOTATED DOCUMENT PAGES", [80, 80, 80]);
       addText("Red/Orange/Yellow/Purple/Cyan/Gold boxes indicate detected anomaly locations.", 8, false, [80, 80, 80]);
       y += 3;
 
@@ -685,7 +662,7 @@ export default function App() {
           style={{ display: "none" }}
           onChange={(e) => {
             const f = e.target.files[0];
-            if (f) { setFile(f); setResult(null); setError(null); }
+            if (f) { setFile(f); setResult(null); setError(null); setHiddenTextData(null); setCalculatorActive(false); }
           }}
         />
         {file ? (
@@ -785,6 +762,235 @@ export default function App() {
               💡 {result.confidence.explanation}
             </div>
           </div>
+
+          {/* Hidden Text Recovery panel */}
+          {hiddenTextData && hiddenTextData.total_found > 0 && (
+            <div style={{
+              marginTop: '24px',
+              border: '2px solid #ef4444',
+              borderRadius: '12px',
+              overflow: 'hidden',
+              boxShadow: '0 4px 12px rgba(239,68,68,0.15)',
+              marginBottom: '16px',
+            }}>
+
+              {/* Header */}
+              <div style={{
+                backgroundColor: '#7f1d1d',
+                color: 'white',
+                padding: '16px 20px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '10px',
+              }}>
+                <span style={{fontSize: '20px'}}>🔍</span>
+                <div>
+                  <div style={{fontWeight: 'bold', fontSize: '16px'}}>
+                    HIDDEN TEXT RECOVERY
+                  </div>
+                  <div style={{fontSize: '12px', opacity: 0.85}}>
+                    Original content found beneath the edits
+                  </div>
+                </div>
+                <div style={{
+                  marginLeft: 'auto',
+                  backgroundColor: '#ef4444',
+                  borderRadius: '20px',
+                  padding: '4px 12px',
+                  fontSize: '13px',
+                  fontWeight: 'bold',
+                }}>
+                  {hiddenTextData.total_found} region
+                  {hiddenTextData.total_found > 1 ? 's' : ''} found
+                </div>
+              </div>
+
+              {/* Warning banner */}
+              <div style={{
+                backgroundColor: '#fef2f2',
+                borderBottom: '1px solid #fecaca',
+                padding: '12px 20px',
+                fontSize: '13px',
+                color: '#991b1b',
+              }}>
+                ⚠️ This document contains hidden layers.
+                The following original content was found
+                beneath the visible text:
+              </div>
+
+              {/* Findings */}
+              <div style={{padding: '16px 20px'}}>
+                {hiddenTextData.findings.map((finding, idx) => (
+                  <div key={idx} style={{
+                    backgroundColor: '#fff',
+                    border: '1px solid #e5e7eb',
+                    borderRadius: '8px',
+                    marginBottom: '12px',
+                    overflow: 'hidden',
+                  }}>
+
+                    {/* Finding header */}
+                    <div style={{
+                      backgroundColor: '#f8fafc',
+                      padding: '10px 16px',
+                      borderBottom: '1px solid #e5e7eb',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                    }}>
+                      <span>
+                        {fieldIcons[finding.field_type] || '📄'}
+                      </span>
+                      <span style={{
+                        fontWeight: 'bold',
+                        fontSize: '14px',
+                      }}>
+                        Page {finding.page} — {
+                          finding.field_type === 'unknown'
+                            ? 'Content'
+                            : finding.field_type.charAt(0).toUpperCase()
+                              + finding.field_type.slice(1)
+                        } Field
+                      </span>
+                      <span style={{
+                        marginLeft: 'auto',
+                        backgroundColor: methodBadges[finding.method]?.color || '#6b7280',
+                        color: 'white',
+                        fontSize: '11px',
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                      }}>
+                        {methodBadges[finding.method]?.icon} {' '}
+                        {methodBadges[finding.method]?.label || finding.method}
+                      </span>
+                    </div>
+
+                    {/* Original vs Replaced */}
+                    <div style={{padding: '16px'}}>
+
+                      {/* Side by side comparison */}
+                      <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 1fr',
+                        gap: '12px',
+                        marginBottom: '12px',
+                      }}>
+
+                        {/* Original */}
+                        <div style={{
+                          backgroundColor: '#f0fdf4',
+                          border: '1px solid #86efac',
+                          borderRadius: '6px',
+                          padding: '12px',
+                        }}>
+                          <div style={{
+                            fontSize: '11px',
+                            color: '#166534',
+                            fontWeight: 'bold',
+                            marginBottom: '6px',
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.5px',
+                          }}>
+                            ✅ ORIGINAL (hidden in file)
+                          </div>
+                          <div style={{
+                            fontSize: '15px',
+                            fontWeight: 'bold',
+                            color: '#15803d',
+                            wordBreak: 'break-word',
+                          }}>
+                            {finding.original_text}
+                          </div>
+                        </div>
+
+                        {/* Replaced with */}
+                        <div style={{
+                          backgroundColor: '#fef2f2',
+                          border: '1px solid #fca5a5',
+                          borderRadius: '6px',
+                          padding: '12px',
+                        }}>
+                          <div style={{
+                            fontSize: '11px',
+                            color: '#991b1b',
+                            fontWeight: 'bold',
+                            marginBottom: '6px',
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.5px',
+                          }}>
+                            ❌ REPLACED WITH (visible text)
+                          </div>
+                          <div style={{
+                            fontSize: '15px',
+                            fontWeight: 'bold',
+                            color: '#dc2626',
+                            wordBreak: 'break-word',
+                          }}>
+                            {finding.covering_text || 'Unknown'}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* How it was done */}
+                      <div style={{
+                        backgroundColor: '#f8fafc',
+                        borderRadius: '6px',
+                        padding: '10px 12px',
+                        fontSize: '13px',
+                        color: '#475569',
+                        lineHeight: '1.5',
+                      }}>
+                        <span style={{
+                          fontWeight: 'bold',
+                          color: '#334155',
+                        }}>
+                          How it was done:{' '}
+                        </span>
+                        {finding.plain_explanation}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Conclusion */}
+              {hiddenTextData.conclusion && (
+                <div style={{
+                  backgroundColor: '#1e293b',
+                  color: 'white',
+                  padding: '16px 20px',
+                  fontSize: '13px',
+                  lineHeight: '1.6',
+                }}>
+                  <div style={{
+                    fontWeight: 'bold',
+                    marginBottom: '6px',
+                    fontSize: '14px',
+                  }}>
+                    CONCLUSION
+                  </div>
+                  {hiddenTextData.conclusion}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Show message if no hidden text found */}
+          {hiddenTextData && hiddenTextData.total_found === 0 && (
+            <div style={{
+              marginTop: '16px',
+              marginBottom: '16px',
+              padding: '12px 16px',
+              backgroundColor: '#f0fdf4',
+              border: '1px solid #86efac',
+              borderRadius: '8px',
+              fontSize: '13px',
+              color: '#166534',
+            }}>
+              ✅ No hidden text detected — visible content
+              appears to be original
+            </div>
+          )}
 
           {/* Tab bar */}
           <div className="tab-bar">
@@ -1478,7 +1684,62 @@ export default function App() {
               </pre>
             </div>
           )}
-          <ForensicCalculator fileId={result.analysis_id} result={result} />
+          {!calculatorActive && (
+            <div
+              onClick={() => setCalculatorActive(true)}
+              style={{
+                marginTop: 32,
+                border: "1px dashed #cbd5e1",
+                borderRadius: 10,
+                padding: "18px 20px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                cursor: "pointer",
+                background: "#f8fafc",
+                transition: "background 0.15s, border-color 0.15s",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "#f1f5f9"; e.currentTarget.style.borderColor = "#94a3b8"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "#f8fafc"; e.currentTarget.style.borderColor = "#cbd5e1"; }}
+            >
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>
+                  🧮 Forensic Calculator
+                </div>
+                <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+                  Running-balance arithmetic verification — click to activate
+                </div>
+              </div>
+              <button
+                onClick={(e) => { e.stopPropagation(); setCalculatorActive(true); }}
+                style={{
+                  background: "#1e293b", color: "#fff", border: "none",
+                  borderRadius: 8, padding: "10px 20px", fontWeight: 700,
+                  fontSize: 13, cursor: "pointer", whiteSpace: "nowrap",
+                }}
+              >
+                ▶ Activate
+              </button>
+            </div>
+          )}
+          {calculatorActive && (
+            <div>
+              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 32, marginBottom: 8 }}>
+                <button
+                  onClick={() => setCalculatorActive(false)}
+                  style={{
+                    background: "#fff", color: "#475569",
+                    border: "1px solid #cbd5e1", borderRadius: 6,
+                    padding: "5px 12px", fontSize: 12, fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  ✕ Deactivate Calculator
+                </button>
+              </div>
+              <ForensicCalculator fileId={result.analysis_id} result={result} />
+            </div>
+          )}
         </div>
       )}
     </div>

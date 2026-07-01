@@ -8,12 +8,14 @@ const COLORS = {
   deposit:    "#3b82f6",
   withdrawal: "#ef4444",
   balance:    "#d97706",
+  end:        "#8b5cf6",
 };
 
 const META = {
-  deposit:    { icon: "📥", label: "Deposit / Credit" },
-  withdrawal: { icon: "📤", label: "Withdrawal / Debit" },
+  deposit:    { icon: "📥", label: "Deposit / Credit (Cr.)" },
+  withdrawal: { icon: "📤", label: "Withdrawal / Debit (Dr.)" },
   balance:    { icon: "⚖️",  label: "Balance" },
+  end:        { icon: "🏁", label: "End of Table" },
 };
 
 const OPERATIONS = [
@@ -62,7 +64,7 @@ const KEYFRAMES = `
   .fc-row-active { animation: rowPulse 0.9s ease-in-out infinite; }
 `;
 
-export default function ForensicCalculator({ fileId }) {
+export default function ForensicCalculator({ fileId, result }) {
   // Column selection
   const [activeSelection, setActiveSelection] = useState(null);
   const [selectedCols, setSelectedCols] = useState({ deposit: null, withdrawal: null, balance: null });
@@ -70,6 +72,24 @@ export default function ForensicCalculator({ fileId }) {
   const [openingOverride, setOpeningOverride] = useState("");
   const [showOpeningOverride, setShowOpeningOverride] = useState(false);
   const [tolerance, setTolerance]         = useState("1.0");
+
+  // "End of table" marker — { page (1-indexed), y (PDF points) }. Rows at
+  // or after this point are excluded from the calculation on the backend.
+  const [endMarker, setEndMarker]         = useState(null);
+  // Which marker (deposit/withdrawal/balance/end) is currently being
+  // dragged, so a window-level mousemove listener can live-update it.
+  const [draggingType, setDraggingType]   = useState(null);
+  // Vertical position of the Cr./Dr./Balance handles — { page, y (PDF pts) }
+  // per marker. X position still determines which detected column is
+  // selected; Y position (this) marks WHERE the table's first row is —
+  // the earliest of the three placed handles becomes the "start of table"
+  // boundary sent to the backend, so header/title rows above it get
+  // excluded and the marked row's own balance anchors the calculation.
+  const [handlePos, setHandlePos]         = useState({
+    deposit:    { page: 1, y: 40 },
+    withdrawal: { page: 1, y: 40 },
+    balance:    { page: 1, y: 40 },
+  });
 
   // API data
   const [columns, setColumns]             = useState([]);
@@ -137,11 +157,28 @@ export default function ForensicCalculator({ fileId }) {
     }
   }, []);
 
+  // PDF-point page height, derived from the loaded image's natural size —
+  // needed to convert a click's Y-fraction into a Y position in points.
+  const pageHeightPts = imageNaturalSize.h ? imageNaturalSize.h / RENDER_SCALE : 842;
+
   const handleImageClick = useCallback((e) => {
-    if (!activeSelection || columns.length === 0) return;
+    if (!activeSelection) return;
+
     const rect = e.currentTarget.getBoundingClientRect();
+
+    if (activeSelection === "end") {
+      const yFraction = (e.clientY - rect.top) / rect.height;
+      const yPts = Math.max(0, Math.min(pageHeightPts, yFraction * pageHeightPts));
+      setEndMarker({ page: displayedPage, y: Math.round(yPts * 10) / 10 });
+      setActiveSelection(null);
+      return;
+    }
+
+    if (columns.length === 0) return;
     const fraction = (e.clientX - rect.left) / rect.width;
     const clickXPts = fraction * pageWidthPts;
+    const yFraction  = (e.clientY - rect.top) / rect.height;
+    const clickYPts  = Math.max(0, Math.min(pageHeightPts, yFraction * pageHeightPts));
 
     const nearest = columns.reduce((best, col) =>
       Math.abs(col.x_center - clickXPts) < Math.abs(best.x_center - clickXPts) ? col : best
@@ -149,6 +186,10 @@ export default function ForensicCalculator({ fileId }) {
 
     const newCols = { ...selectedCols, [activeSelection]: nearest.col_index };
     setSelectedCols(newCols);
+    setHandlePos((prev) => ({
+      ...prev,
+      [activeSelection]: { page: displayedPage, y: Math.round(clickYPts * 10) / 10 },
+    }));
 
     if (activeSelection === "deposit" && newCols.withdrawal === null) {
       setActiveSelection("withdrawal");
@@ -157,7 +198,52 @@ export default function ForensicCalculator({ fileId }) {
     } else {
       setActiveSelection(null);
     }
-  }, [activeSelection, columns, pageWidthPts, selectedCols]);
+  }, [activeSelection, columns, pageWidthPts, pageHeightPts, selectedCols, displayedPage]);
+
+  // Live drag — once a marker handle is grabbed (mousedown sets
+  // draggingType), track window-level mouse movement so the column
+  // assignment / end-of-table Y position follows the pointer until
+  // mouseup, instead of requiring a fresh click each time.
+  useEffect(() => {
+    if (!draggingType || !imageContainerRef.current) return;
+
+    const handleMove = (e) => {
+      const rect = imageContainerRef.current.getBoundingClientRect();
+
+      if (draggingType === "end") {
+        const yFraction = (e.clientY - rect.top) / rect.height;
+        const yPts = Math.max(0, Math.min(pageHeightPts, yFraction * pageHeightPts));
+        setEndMarker((prev) => ({ page: prev?.page ?? displayedPage, y: Math.round(yPts * 10) / 10 }));
+        return;
+      }
+
+      // Vertical position always follows the pointer — this is what marks
+      // where the table's first row is (see handlePos comment above).
+      const yFraction = (e.clientY - rect.top) / rect.height;
+      const yPts = Math.max(0, Math.min(pageHeightPts, yFraction * pageHeightPts));
+      setHandlePos((prev) => ({
+        ...prev,
+        [draggingType]: { page: displayedPage, y: Math.round(yPts * 10) / 10 },
+      }));
+
+      if (columns.length === 0) return;
+      const fraction = (e.clientX - rect.left) / rect.width;
+      const clickXPts = Math.max(0, Math.min(pageWidthPts, fraction * pageWidthPts));
+      const nearest = columns.reduce((best, col) =>
+        Math.abs(col.x_center - clickXPts) < Math.abs(best.x_center - clickXPts) ? col : best
+      );
+      setSelectedCols((prev) => ({ ...prev, [draggingType]: nearest.col_index }));
+    };
+
+    const handleUp = () => setDraggingType(null);
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [draggingType, columns, pageWidthPts, pageHeightPts, displayedPage]);
 
   // Start SSE stream
   const startStream = useCallback(() => {
@@ -185,6 +271,10 @@ export default function ForensicCalculator({ fileId }) {
       starting_balance:  openingOverride !== "" ? parseFloat(openingOverride) : null,
       tolerance:         parseFloat(tolerance) || 1.0,
       page_filter:       null,
+      end_page:          endMarker?.page ?? null,
+      end_y:             endMarker?.y ?? null,
+      start_page:        startMarker?.page ?? null,
+      start_y:           startMarker?.y ?? null,
     };
 
     // SSE via fetch (EventSource doesn't support POST)
@@ -239,7 +329,7 @@ export default function ForensicCalculator({ fileId }) {
       setStreamError(String(err));
       setPhase("done");
     });
-  }, [fileId, selectedCols, operation, openingOverride, tolerance]);
+  }, [fileId, selectedCols, operation, openingOverride, tolerance, endMarker, handlePos]);
 
 
   const exportCSV = useCallback(() => {
@@ -258,6 +348,19 @@ export default function ForensicCalculator({ fileId }) {
   const balCol = getCol(selectedCols.balance);
   const rowCount = balCol?.value_count ?? "?";
   const canRun = selectedCols.balance !== null;
+
+  // Derived "start of table" marker — the earliest (topmost, then
+  // lowest-page) of the three placed Cr./Dr./Balance handles. Sent to the
+  // backend so rows above it (headers, titles) are excluded and that
+  // row's own balance anchors the opening balance.
+  const placedHandles = ["deposit", "withdrawal", "balance"].filter((t) => selectedCols[t] !== null);
+  const startMarker = placedHandles.length > 0
+    ? placedHandles
+        .map((t) => handlePos[t])
+        .reduce((earliest, h) =>
+          (h.page < earliest.page || (h.page === earliest.page && h.y < earliest.y)) ? h : earliest
+        )
+    : null;
 
   // Column stripe positions
   const highlights = ["deposit", "withdrawal", "balance"].map((type) => {
@@ -371,15 +474,20 @@ export default function ForensicCalculator({ fileId }) {
         {phase === "selector" && (
           <>
             <p style={{ margin: "0 0 14px", fontSize: 13, color: "#64748b" }}>
-              Click a column type, then click on the document image to assign that column.
+              Click a marker, then click on the document image to place it.
+              Drag a placed handle left/right to change its column, or up/down
+              to the table's first row — the topmost Cr./Dr./Balance handle marks
+              where the table starts, and its row's own balance anchors the calculation.
             </p>
 
-            {/* 3 selection buttons */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
-              {["deposit", "withdrawal", "balance"].map((type) => {
+            {/* 4 marker buttons: Deposit/Credit, Withdrawal/Debit, Balance, End of Table */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
+              {["deposit", "withdrawal", "balance", "end"].map((type) => {
                 const isActive = activeSelection === type;
-                const colIdx   = selectedCols[type];
+                const isEnd    = type === "end";
+                const colIdx   = isEnd ? null : selectedCols[type];
                 const col      = colIdx !== null ? getCol(colIdx) : null;
+                const isPlaced = isEnd ? !!endMarker : !!col;
                 const color    = COLORS[type];
                 const { icon, label } = META[type];
                 return (
@@ -388,18 +496,30 @@ export default function ForensicCalculator({ fileId }) {
                     onClick={() => setActiveSelection(isActive ? null : type)}
                     style={{
                       position: "relative",
-                      background: isActive ? color + "18" : col ? color + "0d" : "#f8fafc",
-                      border: isActive ? `2px solid ${color}` : col ? `2px solid ${color}` : "2px dashed #cbd5e1",
+                      background: isActive ? color + "18" : isPlaced ? color + "0d" : "#f8fafc",
+                      border: isActive ? `2px solid ${color}` : isPlaced ? `2px solid ${color}` : "2px dashed #cbd5e1",
                       borderRadius: 8, padding: "12px 10px", cursor: "pointer",
                       textAlign: "left", transition: "all 0.15s",
                     }}>
                     {isActive && (
                       <span style={{ position: "absolute", top: 7, right: 8, width: 8, height: 8, borderRadius: "50%", background: color, display: "block" }} />
                     )}
-                    <div style={{ fontSize: 12, fontWeight: 700, color: isActive || col ? color : "#94a3b8", marginBottom: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: isActive || isPlaced ? color : "#94a3b8", marginBottom: 4 }}>
                       {icon} {label}
                     </div>
-                    {col ? (
+                    {isEnd ? (
+                      endMarker ? (
+                        <div style={{ fontSize: 11, color: "#374151" }}>
+                          Page {endMarker.page} · y={endMarker.y}
+                          <span role="button" onClick={(e) => { e.stopPropagation(); setEndMarker(null); }}
+                            style={{ marginLeft: 8, color: "#9ca3af", cursor: "pointer", fontWeight: 700 }}>✕</span>
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: 11, color: isActive ? color : "#9ca3af" }}>
+                          {isActive ? "👆 Click the last row on the image" : "Optional — marks last row"}
+                        </div>
+                      )
+                    ) : col ? (
                       <div style={{ fontSize: 11, color: "#374151" }}>
                         Column {colIdx} · {col.value_count} values
                         <span role="button" onClick={(e) => { e.stopPropagation(); setSelectedCols((p) => ({ ...p, [type]: null })); }}
@@ -414,6 +534,37 @@ export default function ForensicCalculator({ fileId }) {
                 );
               })}
             </div>
+
+            {/* Page navigator — needed to place markers (especially End of
+                Table) on documents where the table spans multiple pages. */}
+            {(result?.total_pages ?? 1) > 1 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, fontSize: 12, color: "#475569" }}>
+                <button
+                  onClick={() => setDisplayedPage((p) => Math.max(1, p - 1))}
+                  disabled={displayedPage <= 1}
+                  style={{ background: "#f8fafc", border: "1px solid #d1d5db", borderRadius: 6, padding: "3px 10px", cursor: displayedPage <= 1 ? "not-allowed" : "pointer", opacity: displayedPage <= 1 ? 0.5 : 1 }}>
+                  ◀ Prev
+                </button>
+                <span>Page {displayedPage} of {result.total_pages}</span>
+                <button
+                  onClick={() => setDisplayedPage((p) => Math.min(result.total_pages, p + 1))}
+                  disabled={displayedPage >= result.total_pages}
+                  style={{ background: "#f8fafc", border: "1px solid #d1d5db", borderRadius: 6, padding: "3px 10px", cursor: displayedPage >= result.total_pages ? "not-allowed" : "pointer", opacity: displayedPage >= result.total_pages ? 0.5 : 1 }}>
+                  Next ▶
+                </button>
+              </div>
+            )}
+
+            {startMarker && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 8, marginBottom: 12,
+                background: COLORS.balance + "0d", border: `1px solid ${COLORS.balance}55`,
+                borderRadius: 6, padding: "6px 12px", fontSize: 12, color: "#78350f",
+              }}>
+                🚩 Table starts at Page {startMarker.page}, y={startMarker.y} — rows above this are ignored,
+                and that row's own balance anchors the calculation.
+              </div>
+            )}
 
             {colsLoading && <p style={{ color: "#94a3b8", fontSize: 13, textAlign: "center", padding: "16px 0" }}>Detecting columns…</p>}
             {colsError && (
@@ -431,7 +582,7 @@ export default function ForensicCalculator({ fileId }) {
                 cursor: activeSelection ? "crosshair" : "default",
                 transition: "border 0.2s", marginBottom: 16, userSelect: "none",
               }}>
-              <img src={pageImageUrl} alt="Document page 1" onLoad={handleImageLoad} draggable={false}
+              <img src={pageImageUrl} alt={`Document page ${displayedPage}`} onLoad={handleImageLoad} draggable={false}
                 style={{ display: "block", width: "100%", pointerEvents: "none" }} />
               {highlights.map(({ type, xPct }) => (
                 <div key={type} style={{
@@ -441,6 +592,54 @@ export default function ForensicCalculator({ fileId }) {
                   borderLeft: `2px solid ${COLORS[type]}`, borderRight: `2px solid ${COLORS[type]}`,
                 }} />
               ))}
+              {/* Draggable handles — drag left/right to reassign which
+                  column this marker points to; drag up/down to mark WHERE
+                  the table's first row is (only shown on the page it was
+                  placed on — same as the End-of-Table marker below). */}
+              {highlights.filter(({ type }) => handlePos[type].page === displayedPage).map(({ type, xPct }) => (
+                <div key={`handle-${type}`}
+                  onMouseDown={(e) => { e.stopPropagation(); setDraggingType(type); }}
+                  title={`Drag to move ${META[type].label}`}
+                  style={{
+                    position: "absolute", top: `${(handlePos[type].y / pageHeightPts) * 100}%`,
+                    left: `${xPct}%`, transform: "translate(-50%, -50%)",
+                    width: 22, height: 22, borderRadius: "50%",
+                    background: COLORS[type], border: "2px solid #fff",
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.4)",
+                    cursor: "move", zIndex: 5,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 11,
+                  }}>
+                  {META[type].icon}
+                </div>
+              ))}
+              {/* End-of-table marker — full-width line + draggable handle,
+                  only rendered on the page it was placed on. */}
+              {endMarker && endMarker.page === displayedPage && imageNaturalSize.h > 0 && (() => {
+                const topPct = (endMarker.y / pageHeightPts) * 100;
+                return (
+                  <>
+                    <div style={{
+                      position: "absolute", left: 0, right: 0,
+                      top: `${topPct}%`, height: 0,
+                      borderTop: `2px dashed ${COLORS.end}`, pointerEvents: "none", zIndex: 4,
+                    }} />
+                    <div
+                      onMouseDown={(e) => { e.stopPropagation(); setDraggingType("end"); }}
+                      title="Drag to move End of Table"
+                      style={{
+                        position: "absolute", top: `${topPct}%`, right: 8,
+                        transform: "translateY(-50%)",
+                        background: COLORS.end, color: "#fff",
+                        borderRadius: 14, padding: "2px 10px", fontSize: 11, fontWeight: 700,
+                        cursor: "ns-resize", zIndex: 5, whiteSpace: "nowrap",
+                        boxShadow: "0 1px 4px rgba(0,0,0,0.4)",
+                      }}>
+                      🏁 End
+                    </div>
+                  </>
+                );
+              })()}
               {activeSelection && (
                 <div style={{
                   position: "absolute", bottom: 12, left: "50%", transform: "translateX(-50%)",
@@ -448,7 +647,9 @@ export default function ForensicCalculator({ fileId }) {
                   padding: "5px 16px", borderRadius: 20, fontSize: 12, fontWeight: 700,
                   pointerEvents: "none", whiteSpace: "nowrap", boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
                 }}>
-                  Click to mark {META[activeSelection].label} column
+                  {activeSelection === "end"
+                    ? "Click the last row of the table"
+                    : `Click to mark ${META[activeSelection].label} column`}
                 </div>
               )}
             </div>

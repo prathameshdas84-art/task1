@@ -40,6 +40,7 @@ from models import (
 )
 from signal_fusion import SignalFusion, FusedFinding
 from forensic_calculator import ForensicCalculator
+from hidden_text_extractor import HiddenTextExtractor
 
 
 class CalcRequest(BaseModel):
@@ -50,6 +51,18 @@ class CalcRequest(BaseModel):
     starting_balance: Optional[float] = None
     tolerance: float = 1.0
     page_filter: Optional[int] = None
+    # User-placed "end of table" marker (1-indexed page + PDF-point Y
+    # position) — rows at or after this point are excluded from the
+    # calculation. Optional: when omitted, the full auto-detected table
+    # region is used, unchanged from prior behavior.
+    end_page: Optional[int] = None
+    end_y: Optional[float] = None
+    # User-placed "start of table" marker — mirrors end_page/end_y but as
+    # the top boundary: rows strictly above this point are excluded, and
+    # this row's own printed balance is trusted directly as the opening
+    # balance (see ForensicCalculator.resolve_opening_balance).
+    start_page: Optional[int] = None
+    start_y: Optional[float] = None
 
 # In-memory cache — stores last 100 analysis results + pdf paths so the
 # annotated-image endpoint can re-render a page without re-uploading.
@@ -1186,3 +1199,55 @@ async def run_calculator_stream(file_id: str, request: CalcRequest):
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+# ── Hidden Text Recovery endpoint ──────────────────────────────────────────────
+
+@app.get("/hidden-text/{file_id}", tags=["Forensics"])
+async def get_hidden_text(file_id: str):
+    """
+    Attempt to recover original text that was covered up by a later edit
+    (white-out rectangles, layered text overlaps, or incremental-update
+    revisions). Read-only — never modifies the analyzed PDF.
+    """
+    if file_id not in _analysis_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="Analysis not found"
+        )
+
+    pdf_path = _analysis_cache[file_id]["pdf_path"]
+
+    if not os.path.exists(pdf_path):
+        raise HTTPException(
+            status_code=410,
+            detail="PDF no longer available"
+        )
+
+    try:
+        report = HiddenTextExtractor().analyze(pdf_path)
+        return {
+            "file_id": file_id,
+            "total_found": report.total_found,
+            "summary": report.recovery_summary,
+            "conclusion": report.conclusion,
+            "findings": [
+                {
+                    "page": f.page,
+                    "method": f.method,
+                    "original_text": f.original_text,
+                    "covering_text": f.covering_text,
+                    "bbox": f.bbox,
+                    "confidence": f.confidence,
+                    "description": f.description,
+                    "field_type": f.field_type,
+                    "plain_explanation": f.plain_explanation
+                }
+                for f in report.findings
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Hidden text extraction failed: {e}"
+        )

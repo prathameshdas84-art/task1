@@ -1,0 +1,8 @@
+D:\task1\.venv\Lib\site-packages\pypdf\_crypt_providers\_cryptography.py:32: CryptographyDeprecationWarning: ARC4 has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.ARC4 and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  from cryptography.hazmat.primitives.ciphers.algorithms import AES, ARC4
+INFO:     Started server process [2196]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58654 - "POST /analyze HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58663 - "GET /hidden-text/b9a80ca4-1f3b-4609-9069-80aaed0df8c7 HTTP/1.1" 200 OK
