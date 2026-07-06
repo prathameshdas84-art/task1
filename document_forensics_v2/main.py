@@ -42,7 +42,7 @@ from models import (
 )
 from fusion.signal_fusion import SignalFusion, FusedFinding
 from hidden_text_extractor import HiddenTextExtractor
-from gemini_advisor import GeminiAdvisor, GeminiNotConfigured, GeminiRequestError
+from ai_review.gemini_advisor import GeminiAdvisor, GeminiNotConfigured, GeminiRequestError
 
 # In-memory cache — stores last 100 analysis results + pdf paths so the
 # annotated-image endpoint can re-render a page without re-uploading.
