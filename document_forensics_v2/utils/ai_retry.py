@@ -20,9 +20,11 @@ import requests
 
 logger = logging.getLogger("document_forensics")
 
-# Retry/backoff for transient failures only — a 429 rate limit OR a request
-# timeout/connection error. Other 4xx/5xx are not retried since waiting
-# won't fix a bad key or a malformed request.
+# Retry/backoff for transient failures only — a 429 rate limit, a 502/503/
+# 504 capacity/gateway blip (NVIDIA NIM returns 503 "Worker local total
+# request limit reached" under load — retryable, unlike a bad key), OR a
+# request timeout/connection error. Other 4xx/5xx are not retried since
+# waiting won't fix a bad key or a malformed request.
 MAX_RETRY_ATTEMPTS         = 3   # total attempts, including the first
 RETRY_BACKOFF_BASE_SECONDS = 2   # attempt N (1-indexed) waits BASE * 2**(N-1)s: 2s, 4s
 
@@ -86,15 +88,17 @@ def post_with_retry(url: str, *, headers: dict = None, params: dict = None, json
         except requests.RequestException as e:
             raise AIProviderRequestError(f"Network error calling {provider_label}: {e}")
 
-        if resp.status_code == 429:
+        if resp.status_code in (429, 502, 503, 504):
             retryable_error = AIProviderRequestError(
                 f"{provider_label} rate limit reached — try again shortly."
+                if resp.status_code == 429 else
+                f"{provider_label} temporarily unavailable (HTTP {resp.status_code}) — try again shortly."
             )
             if attempt < MAX_RETRY_ATTEMPTS:
                 wait = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
                 logger.info(
-                    "%s: rate limited (attempt %d/%d), retrying in %ds",
-                    provider_label, attempt, MAX_RETRY_ATTEMPTS, wait,
+                    "%s: transient HTTP %d (attempt %d/%d), retrying in %ds",
+                    provider_label, resp.status_code, attempt, MAX_RETRY_ATTEMPTS, wait,
                 )
                 time.sleep(wait)
                 continue
