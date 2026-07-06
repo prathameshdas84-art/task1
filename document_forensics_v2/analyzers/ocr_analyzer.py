@@ -327,7 +327,7 @@ class OCRAnalyzer:
     @staticmethod
     def _is_scanner_or_vector(pdf_path: str) -> bool:
         try:
-            from content_analyzer import ContentAnalyzer, SCANNER_KEYWORDS
+            from analyzers.content_analyzer import ContentAnalyzer, SCANNER_KEYWORDS
             if ContentAnalyzer()._is_vector_pdf(pdf_path):
                 return True
             import pikepdf

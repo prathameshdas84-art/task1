@@ -2,12 +2,12 @@ import os
 import tempfile
 import fitz
 import streamlit as st
-from metadata_extractor import MetadataExtractor
-from content_analyzer import ContentAnalyzer
-from ocr_analyzer import OCRAnalyzer
-from numeric_analyzer import NumericAnalyzer
-from ela_analyzer import ELAAnalyzer
-from pymupdf_analyzer import PyMuPDFAnalyzer
+from analyzers.metadata_extractor import MetadataExtractor
+from analyzers.content_analyzer import ContentAnalyzer
+from analyzers.ocr_analyzer import OCRAnalyzer
+from analyzers.numeric_analyzer import NumericAnalyzer
+from analyzers.ela_analyzer import ELAAnalyzer
+from analyzers.pymupdf_analyzer import PyMuPDFAnalyzer
 from verdict_engine import combine
 from location_highlighter import LocationHighlighter, RENDER_DPI
 

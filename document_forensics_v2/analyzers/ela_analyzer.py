@@ -276,7 +276,7 @@ class ELAAnalyzer:
 
         # Use higher DPI for vector PDFs (no compression artifacts at low
         # DPI, need more pixels for meaningful ELA).
-        from content_analyzer import ContentAnalyzer
+        from analyzers.content_analyzer import ContentAnalyzer
         try:
             is_vector = ContentAnalyzer()._is_vector_pdf(pdf_path)
         except Exception:

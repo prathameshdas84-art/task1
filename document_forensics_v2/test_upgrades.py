@@ -15,7 +15,7 @@ print("=" * 70)
 # Test 1: Import Upgrade 1 (OCRAnalyzer with pixel profiling)
 print("\n[TEST 1] Upgrade 1 — Universal OCR Pixel Profiling")
 try:
-    from ocr_analyzer import OCRAnalyzer, PixelAnomaly
+    from analyzers.ocr_analyzer import OCRAnalyzer, PixelAnomaly
     print("  ✓ OCRAnalyzer imported successfully")
     print("  ✓ PixelAnomaly dataclass available")
     # Check that pixel profiling methods exist
@@ -34,7 +34,7 @@ print("\n[TEST 2] Upgrade 2 — Multi-location Detection Fix (Trimmed Mean)")
 try:
     # Check syntax by compiling
     import py_compile
-    py_compile.compile(r"d:\task1\document_forensics_v2\numeric_analyzer.py", doraise=True)
+    py_compile.compile(r"d:\task1\document_forensics_v2\analyzers\numeric_analyzer.py", doraise=True)
     print("  ✓ NumericAnalyzer syntax verified")
     print("  ✓ Trimmed mean implementation confirmed")
     print("  ✓ Upgrade 2 test PASSED")
@@ -58,7 +58,7 @@ print("\n[TEST 4] Upgrade 4 — XREF Sequence Check for Canva Edits")
 try:
     # Check syntax by compiling
     import py_compile
-    py_compile.compile(r"d:\task1\document_forensics_v2\xref_analyzer.py", doraise=True)
+    py_compile.compile(r"d:\task1\document_forensics_v2\analyzers\xref_analyzer.py", doraise=True)
     print("  ✓ XrefAnalyzer syntax verified")
     print("  ✓ XREF analysis methods confirmed")
     print("  ✓ Upgrade 4 test PASSED")

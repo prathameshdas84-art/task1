@@ -23,13 +23,13 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from metadata_extractor import MetadataExtractor, PRODUCER_DB, _DB_PATH as _PRODUCER_DB_PATH
-from content_analyzer import ContentAnalyzer
-from ocr_analyzer import OCRAnalyzer
-from numeric_analyzer import NumericAnalyzer
-from ela_analyzer import ELAAnalyzer
-from pymupdf_analyzer import PyMuPDFAnalyzer
-from xref_analyzer import XrefAnalyzer
+from analyzers.metadata_extractor import MetadataExtractor, PRODUCER_DB, _DB_PATH as _PRODUCER_DB_PATH
+from analyzers.content_analyzer import ContentAnalyzer
+from analyzers.ocr_analyzer import OCRAnalyzer
+from analyzers.numeric_analyzer import NumericAnalyzer
+from analyzers.ela_analyzer import ELAAnalyzer
+from analyzers.pymupdf_analyzer import PyMuPDFAnalyzer
+from analyzers.xref_analyzer import XrefAnalyzer
 from verdict_engine import (
     combine, WEIGHTS, UNCERTAIN_BAND,
     CONFIDENCE_BASE, CONFIDENCE_DISTANCE_MULTIPLIER, CONFIDENCE_CAP,

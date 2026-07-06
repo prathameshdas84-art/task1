@@ -4,12 +4,12 @@ Weights adjust automatically based on PDF type.
 """
 
 from dataclasses import dataclass
-from metadata_extractor import MetadataReport
-from content_analyzer import ContentReport
-from ocr_analyzer import OCRReport
-from numeric_analyzer import NumericReport
-from ela_analyzer import ELAReport
-from pymupdf_analyzer import PyMuPDFReport
+from analyzers.metadata_extractor import MetadataReport
+from analyzers.content_analyzer import ContentReport
+from analyzers.ocr_analyzer import OCRReport
+from analyzers.numeric_analyzer import NumericReport
+from analyzers.ela_analyzer import ELAReport
+from analyzers.pymupdf_analyzer import PyMuPDFReport
 
 
 # Weights per PDF type — must sum to 1.0
