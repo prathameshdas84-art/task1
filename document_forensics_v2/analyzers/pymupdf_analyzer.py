@@ -9,7 +9,7 @@ import hashlib
 import statistics
 from dataclasses import dataclass, field
 
-from pdf_utils import get_qr_zones
+from utils.pdf_utils import get_qr_zones
 
 # Scoring constants
 WHITE_RECT_SCORE_PER_REGION  = 25

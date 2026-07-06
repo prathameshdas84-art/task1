@@ -25,7 +25,7 @@ import numpy as np
 import pytesseract
 from PIL import Image
 
-from pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
+from utils.pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
 
 # Pixel profiling imports — graceful degradation if missing
 try:

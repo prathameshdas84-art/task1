@@ -41,7 +41,7 @@ from models import (
     FusedFindingModel, FusionStats, ContradictedFindingModel,
 )
 from fusion.signal_fusion import SignalFusion, FusedFinding
-from hidden_text_extractor import HiddenTextExtractor
+from utils.hidden_text_extractor import HiddenTextExtractor
 from ai_review.gemini_advisor import GeminiAdvisor, GeminiNotConfigured, GeminiRequestError
 
 # In-memory cache — stores last 100 analysis results + pdf paths so the
@@ -1062,7 +1062,7 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
         )
 
     try:
-        from location_highlighter import LocationHighlighter
+        from utils.location_highlighter import LocationHighlighter
 
         page_idx = page - 1  # convert to 0-indexed
 

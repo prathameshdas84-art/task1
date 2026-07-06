@@ -17,7 +17,7 @@ import fitz
 import numpy as np
 from PIL import Image
 
-from pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
+from utils.pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
 
 
 RENDER_DPI    = 150

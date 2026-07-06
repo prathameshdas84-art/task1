@@ -9,7 +9,7 @@ from analyzers.numeric_analyzer import NumericAnalyzer
 from analyzers.ela_analyzer import ELAAnalyzer
 from analyzers.pymupdf_analyzer import PyMuPDFAnalyzer
 from fusion.verdict_engine import combine
-from location_highlighter import LocationHighlighter, RENDER_DPI
+from utils.location_highlighter import LocationHighlighter, RENDER_DPI
 
 # Common LibreOffice install locations across platforms — "soffice" alone
 # (last entry) covers any install already on PATH, including most Linux
