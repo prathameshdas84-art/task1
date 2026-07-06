@@ -71,7 +71,7 @@ print("\n[TEST 5] Integration — Verdict engine and models with xref_score")
 try:
     # Verify verdict_engine can be imported
     import py_compile
-    py_compile.compile(r"d:\task1\document_forensics_v2\verdict_engine.py", doraise=True)
+    py_compile.compile(r"d:\task1\document_forensics_v2\fusion\verdict_engine.py", doraise=True)
     print("  ✓ Verdict engine syntax verified")
     
     py_compile.compile(r"d:\task1\document_forensics_v2\models.py", doraise=True)

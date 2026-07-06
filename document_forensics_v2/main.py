@@ -30,7 +30,7 @@ from analyzers.numeric_analyzer import NumericAnalyzer
 from analyzers.ela_analyzer import ELAAnalyzer
 from analyzers.pymupdf_analyzer import PyMuPDFAnalyzer
 from analyzers.xref_analyzer import XrefAnalyzer
-from verdict_engine import (
+from fusion.verdict_engine import (
     combine, WEIGHTS, UNCERTAIN_BAND,
     CONFIDENCE_BASE, CONFIDENCE_DISTANCE_MULTIPLIER, CONFIDENCE_CAP,
 )
@@ -40,7 +40,7 @@ from models import (
     FullMetadata, FontDetail, PageDetail,
     FusedFindingModel, FusionStats, ContradictedFindingModel,
 )
-from signal_fusion import SignalFusion, FusedFinding
+from fusion.signal_fusion import SignalFusion, FusedFinding
 from hidden_text_extractor import HiddenTextExtractor
 from gemini_advisor import GeminiAdvisor, GeminiNotConfigured, GeminiRequestError
 

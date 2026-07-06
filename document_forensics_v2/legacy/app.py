@@ -8,7 +8,7 @@ from analyzers.ocr_analyzer import OCRAnalyzer
 from analyzers.numeric_analyzer import NumericAnalyzer
 from analyzers.ela_analyzer import ELAAnalyzer
 from analyzers.pymupdf_analyzer import PyMuPDFAnalyzer
-from verdict_engine import combine
+from fusion.verdict_engine import combine
 from location_highlighter import LocationHighlighter, RENDER_DPI
 
 # Common LibreOffice install locations across platforms — "soffice" alone
