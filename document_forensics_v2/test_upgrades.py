@@ -84,7 +84,7 @@ try:
     print("  ✓ Integration test PASSED")
 except Exception as e:
     print(f"  ✗ Integration test FAILED: {e}")
-    sys.exit(1)2
+    sys.exit(1)
 
 print("\n" + "=" * 70)
 print("ALL UPGRADE TESTS PASSED ✓")

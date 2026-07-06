@@ -3,7 +3,6 @@ import axios from "axios";
 import jsPDF from "jspdf";
 import { applyPlugin } from "jspdf-autotable";
 import "./App.css";
-import ForensicCalculator from "./ForensicCalculator";
 
 // jspdf-autotable v5 dropped the auto-patched doc.autoTable() in favor of a
 // standalone autoTable(doc, opts) export; applyPlugin() restores the
@@ -48,14 +47,33 @@ export default function App() {
   const [zoom, setZoom]             = useState(100);
   const [reportGenerating, setReportGenerating] = useState(false);
   const [hiddenTextData, setHiddenTextData] = useState(null);
-  const [calculatorActive, setCalculatorActive] = useState(false);
+  const [aiReview, setAiReview]             = useState(null);
+  const [aiReviewLoading, setAiReviewLoading] = useState(false);
+  const [aiReviewError, setAiReviewError]   = useState(null);
 
   const onDrop = useCallback((e) => {
     e.preventDefault();
     setDragging(false);
     const f = e.dataTransfer.files[0];
-    if (f) { setFile(f); setResult(null); setError(null); setHiddenTextData(null); setCalculatorActive(false); }
+    if (f) {
+      setFile(f); setResult(null); setError(null); setHiddenTextData(null);
+      setAiReview(null); setAiReviewError(null);
+    }
   }, []);
+
+  const requestAiReview = async () => {
+    if (!result?.analysis_id || aiReviewLoading) return;
+    setAiReviewLoading(true);
+    setAiReviewError(null);
+    try {
+      const { data } = await axios.post(`${API}/api/analysis/${result.analysis_id}/ai-review`);
+      setAiReview(data);
+    } catch (err) {
+      setAiReviewError(err.response?.data?.detail || err.message || "AI review request failed");
+    } finally {
+      setAiReviewLoading(false);
+    }
+  };
 
   const analyze = async () => {
     if (!file) return;
@@ -63,6 +81,8 @@ export default function App() {
     setResult(null);
     setError(null);
     setActivePage(1);
+    setAiReview(null);
+    setAiReviewError(null);
     try {
       const form = new FormData();
       form.append("file", file);
@@ -302,7 +322,7 @@ export default function App() {
     const now = new Date();
     doc.text(`Report Generated: ${now.toLocaleString()}`, pageW / 2, 220, { align: "center" });
     doc.text("Document Forensics Engine v2.0 - 6-Layer Tamper Detection", pageW / 2, 227, { align: "center" });
-    doc.text("No AI/ML used - Pure statistical and structural analysis", pageW / 2, 234, { align: "center" });
+    doc.text("Core engine: no AI/ML - pure statistical and structural analysis", pageW / 2, 234, { align: "center" });
 
     // ══════════════════════════════════════════════════════════
     // PAGE 2 - EXECUTIVE SUMMARY
@@ -620,8 +640,14 @@ export default function App() {
       "  - Results should be verified by a qualified document examiner",
       "  - This report is for investigative purposes only",
       "",
-      "NO AI/ML: All detection uses statistical and structural analysis only.",
-      "No machine learning models or AI systems were used in this analysis.",
+      "CORE 6-LAYER ENGINE: deterministic, no AI/ML. All 6 layers above use",
+      "statistical and structural analysis only — no machine learning models",
+      "or AI systems participate in computing the verdict or combined_score.",
+      "",
+      "OPTIONAL AI REVIEW (LAYER 7): If \"Ask AI\" was used for this document,",
+      "Gemini contributes an ADDITIONAL, separate combined_score_with_ai —",
+      "shown only when explicitly requested below, and it never overwrites",
+      "or replaces the deterministic combined_score/verdict above.",
     ];
 
     disclaimer.forEach(line => {
@@ -641,7 +667,7 @@ export default function App() {
           <span className="logo">🔬</span>
           <div>
             <div className="title">Document Forensics Engine</div>
-            <div className="subtitle">6-Layer Tamper Detection · No AI Required</div>
+            <div className="subtitle">Core 6-Layer Engine: Deterministic, No AI/ML · Optional AI Review (Layer 7): Gemini, Separate AI-Adjusted Score</div>
           </div>
         </div>
         <div className="header-badge">v2.0</div>
@@ -662,7 +688,10 @@ export default function App() {
           style={{ display: "none" }}
           onChange={(e) => {
             const f = e.target.files[0];
-            if (f) { setFile(f); setResult(null); setError(null); setHiddenTextData(null); setCalculatorActive(false); }
+            if (f) {
+              setFile(f); setResult(null); setError(null); setHiddenTextData(null);
+              setAiReview(null); setAiReviewError(null);
+            }
           }}
         />
         {file ? (
@@ -1684,9 +1713,13 @@ export default function App() {
               </pre>
             </div>
           )}
-          {!calculatorActive && (
+
+          {/* ── AI Review (Gemini) — opt-in, supplementary, never part of the
+              core 6-layer engine. Never runs automatically; only fires on
+              click. Never touches result.verdict / result.combined_score. ── */}
+          {!aiReview && !aiReviewLoading && (
             <div
-              onClick={() => setCalculatorActive(true)}
+              onClick={requestAiReview}
               style={{
                 marginTop: 32,
                 border: "1px dashed #cbd5e1",
@@ -1704,40 +1737,276 @@ export default function App() {
             >
               <div>
                 <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>
-                  🧮 Forensic Calculator
+                  🤖 Ask AI — Get AI Explanation
                 </div>
                 <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
-                  Running-balance arithmetic verification — click to activate
+                  Optional, supplementary Gemini review — explains this result in plain
+                  English and computes a separate, clearly-labeled AI-adjusted score
+                  (Layer 7). Never overwrites the deterministic score/verdict above.
                 </div>
               </div>
               <button
-                onClick={(e) => { e.stopPropagation(); setCalculatorActive(true); }}
+                onClick={(e) => { e.stopPropagation(); requestAiReview(); }}
                 style={{
                   background: "#1e293b", color: "#fff", border: "none",
                   borderRadius: 8, padding: "10px 20px", fontWeight: 700,
                   fontSize: 13, cursor: "pointer", whiteSpace: "nowrap",
                 }}
               >
-                ▶ Activate
+                ▶ Ask AI
               </button>
             </div>
           )}
-          {calculatorActive && (
-            <div>
-              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 32, marginBottom: 8 }}>
-                <button
-                  onClick={() => setCalculatorActive(false)}
-                  style={{
-                    background: "#fff", color: "#475569",
-                    border: "1px solid #cbd5e1", borderRadius: 6,
-                    padding: "5px 12px", fontSize: 12, fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  ✕ Deactivate Calculator
-                </button>
+
+          {aiReviewLoading && (
+            <div style={{
+              marginTop: 32, border: "1px dashed #cbd5e1", borderRadius: 10,
+              padding: "18px 20px", textAlign: "center", color: "#64748b",
+              background: "#f8fafc", fontSize: 13,
+            }}>
+              ⏳ Asking Gemini for a plain-English explanation, region review, and independent page scan…
+            </div>
+          )}
+
+          {aiReviewError && !aiReviewLoading && (
+            <div style={{
+              marginTop: 32, border: "1px solid #fca5a5", borderRadius: 10,
+              padding: "16px 20px", background: "#fef2f2", color: "#991b1b", fontSize: 13,
+            }}>
+              ❌ AI review failed: {aiReviewError}
+              <button
+                onClick={requestAiReview}
+                style={{
+                  marginLeft: 12, background: "#fff", color: "#991b1b",
+                  border: "1px solid #fca5a5", borderRadius: 6,
+                  padding: "4px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                }}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
+          {aiReview && !aiReviewLoading && (
+            <div style={{
+              marginTop: 32,
+              border: "2px solid #6366f1",
+              borderRadius: 12,
+              overflow: "hidden",
+              boxShadow: "0 4px 12px rgba(99,102,241,0.15)",
+            }}>
+              <div style={{
+                background: "#312e81", color: "#fff", padding: "14px 20px",
+                display: "flex", alignItems: "center", gap: 10,
+              }}>
+                <span style={{ fontSize: 20 }}>🤖</span>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>AI REVIEW (Gemini) — Layer 7</div>
+                  <div style={{ fontSize: 11.5, opacity: 0.85 }}>
+                    AI-generated · contributes a separate, clearly-labeled AI-adjusted score ·
+                    never overwrites the deterministic score/verdict above
+                    {aiReview.from_cache && " · cached result (not a fresh Gemini call)"}
+                  </div>
+                </div>
               </div>
-              <ForensicCalculator fileId={result.analysis_id} result={result} />
+
+              <div style={{ padding: "18px 20px" }}>
+                {!aiReview.available ? (
+                  <div style={{ color: "#64748b", fontSize: 13 }}>
+                    ℹ️ {aiReview.reason || "AI Review is not available in this environment."}
+                  </div>
+                ) : (
+                  <>
+                    {aiReview.ai_disagreement_flag && (
+                      <div style={{
+                        border: "1px solid #fca5a5", background: "#fef2f2", color: "#991b1b",
+                        borderRadius: 8, padding: "12px 14px", marginBottom: 16, fontSize: 13, fontWeight: 600,
+                      }}>
+                        {aiReview.ai_disagreement_message}
+                      </div>
+                    )}
+
+                    {aiReview.combined_score_with_ai != null && (
+                      <div style={{
+                        display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap",
+                      }}>
+                        <div style={{
+                          flex: "1 1 160px", border: "1px solid #e5e7eb", borderRadius: 8,
+                          padding: "10px 14px", background: "#f8fafc",
+                        }}>
+                          <div style={{ fontSize: 11, color: "#64748b", fontWeight: 700 }}>
+                            DETERMINISTIC (6 layers)
+                          </div>
+                          <div style={{ fontSize: 22, fontWeight: 800, color: "#1e293b" }}>
+                            {aiReview.combined_score.toFixed(1)}
+                          </div>
+                        </div>
+                        <div style={{
+                          flex: "1 1 160px", border: "1px solid #c7d2fe", borderRadius: 8,
+                          padding: "10px 14px", background: "#eef2ff",
+                        }}>
+                          <div style={{ fontSize: 11, color: "#4338ca", fontWeight: 700 }}>
+                            WITH AI REVIEW (Layer 7, weight {aiReview.layer7_weight})
+                          </div>
+                          <div style={{ fontSize: 22, fontWeight: 800, color: "#312e81" }}>
+                            {aiReview.combined_score_with_ai.toFixed(1)}
+                          </div>
+                        </div>
+                        <div style={{
+                          flex: "1 1 160px", border: "1px solid #e5e7eb", borderRadius: 8,
+                          padding: "10px 14px", background: "#f8fafc",
+                        }}>
+                          <div style={{ fontSize: 11, color: "#64748b", fontWeight: 700 }}>
+                            LAYER 7 AI ANOMALY SCORE
+                          </div>
+                          <div style={{ fontSize: 22, fontWeight: 800, color: "#1e293b" }}>
+                            {aiReview.layer7_score}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div style={{ fontWeight: 700, fontSize: 13, color: "#312e81", marginBottom: 8 }}>
+                      Plain-English Explanation
+                    </div>
+                    {aiReview.explanation ? (
+                      <div style={{ fontSize: 13.5, color: "#334155", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                        {aiReview.explanation}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 13, color: "#991b1b" }}>
+                        ⚠️ {aiReview.explanation_error || "No explanation was returned."}
+                      </div>
+                    )}
+
+                    {aiReview.regions && aiReview.regions.length > 0 && (
+                      <>
+                        <div style={{ fontWeight: 700, fontSize: 13, color: "#312e81", marginTop: 20, marginBottom: 8 }}>
+                          Flagged-Region Visual Check ({aiReview.regions.length})
+                        </div>
+                        {aiReview.regions.map((r, i) => {
+                          const labelColor = r.label === "possible-edit" ? "#dc2626"
+                                           : r.label === "template-element" ? "#16a34a"
+                                           : r.label === "unavailable" ? "#b45309"
+                                           : r.label === "error" ? "#b45309"
+                                           : "#64748b";
+                          return (
+                            <div key={i} style={{
+                              border: "1px solid #e5e7eb", borderRadius: 8,
+                              padding: "10px 14px", marginBottom: 8, fontSize: 12.5,
+                            }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                                <span style={{ color: "#475569" }}>
+                                  Page {r.page} · engine layer: {r.source_layer}
+                                </span>
+                                <span style={{ color: labelColor, fontWeight: 700 }}>
+                                  {r.label}
+                                </span>
+                              </div>
+                              <div style={{ color: "#94a3b8", marginBottom: 4 }}>
+                                Engine finding: {r.engine_description}
+                              </div>
+                              <div style={{ color: "#334155" }}>
+                                Gemini: {r.reasoning}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+                    {aiReview.regions_error && (
+                      <div style={{ fontSize: 12, color: "#991b1b", marginTop: 10 }}>
+                        ⚠️ {aiReview.regions_error}
+                      </div>
+                    )}
+
+                    {/* ── Job C — cross-examination: per-finding verification of the
+                        engine's OWN findings, visually distinct from Job B's
+                        region-crop review above ── */}
+                    {aiReview.per_finding_verification && aiReview.per_finding_verification.length > 0 && (
+                      <>
+                        <div style={{
+                          fontWeight: 700, fontSize: 13, color: "#7c2d12",
+                          marginTop: 24, marginBottom: 8, paddingTop: 16,
+                          borderTop: "1px dashed #cbd5e1",
+                        }}>
+                          🔍 Cross-Examination — Verifying the Engine's Own Findings
+                          ({aiReview.per_finding_verification.length})
+                        </div>
+                        {aiReview.per_finding_verification.map((v, i) => {
+                          const verdictColor = v.gemini_verdict === "contradicted" ? "#16a34a"
+                                             : v.gemini_verdict === "supported" ? "#dc2626"
+                                             : "#64748b";
+                          return (
+                            <div key={i} style={{
+                              border: "1px solid #e5e7eb", borderRadius: 8,
+                              padding: "10px 14px", marginBottom: 8, fontSize: 12.5,
+                            }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                                <span style={{ color: "#475569" }}>layer: {v.layer}</span>
+                                <span style={{ color: verdictColor, fontWeight: 700 }}>
+                                  {v.gemini_verdict.toUpperCase()}
+                                </span>
+                              </div>
+                              <div style={{ color: "#94a3b8", marginBottom: 4 }}>
+                                Engine claimed: {v.engine_finding}
+                              </div>
+                              <div style={{ color: "#334155" }}>Gemini: {v.reasoning}</div>
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+
+                    {aiReview.additional_findings && aiReview.additional_findings.length > 0 && (
+                      <>
+                        <div style={{
+                          fontWeight: 700, fontSize: 13, color: "#7c2d12",
+                          marginTop: 20, marginBottom: 8,
+                        }}>
+                          ➕ Additional Findings — Not Flagged by the 6-Layer Engine
+                          ({aiReview.additional_findings.length})
+                        </div>
+                        {aiReview.additional_findings.map((f, i) => (
+                          <div key={i} style={{
+                            border: "1px solid #fdba74", background: "#fff7ed",
+                            borderRadius: 8, padding: "10px 14px", marginBottom: 8, fontSize: 12.5,
+                          }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                              <span style={{ color: "#475569" }}>Page {f.page} · confidence: {f.confidence}</span>
+                              <span style={{ color: "#c2410c", fontWeight: 700, fontSize: 11.5 }}>
+                                AI-ONLY
+                              </span>
+                            </div>
+                            <div style={{ color: "#334155" }}>{f.description}</div>
+                          </div>
+                        ))}
+                      </>
+                    )}
+
+                    {aiReview.overall_assessment && (
+                      <div style={{
+                        marginTop: 20, border: "1px solid #c7d2fe", borderRadius: 8,
+                        padding: "12px 14px", background: "#eef2ff", fontSize: 12.5,
+                      }}>
+                        <div style={{ fontWeight: 700, color: "#312e81", marginBottom: 4 }}>
+                          Overall AI Assessment: {
+                            aiReview.overall_assessment.agrees_with_engine_verdict === true ? "Agrees with verdict"
+                            : aiReview.overall_assessment.agrees_with_engine_verdict === false ? "Disagrees with verdict"
+                            : "Inconclusive"
+                          }
+                        </div>
+                        <div style={{ color: "#334155" }}>{aiReview.overall_assessment.reasoning}</div>
+                      </div>
+                    )}
+                    {aiReview.job_c_error && (
+                      <div style={{ fontSize: 12, color: "#991b1b", marginTop: 10 }}>
+                        ⚠️ {aiReview.job_c_error}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           )}
         </div>

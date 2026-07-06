@@ -46,6 +46,7 @@ class FontDetail(BaseModel):
     type: str
     encoding: str
     embedded: bool
+    tool_signature: Optional[dict] = None
 
 
 class PageDetail(BaseModel):
@@ -87,6 +88,7 @@ class FullMetadata(BaseModel):
     pdf_version: Optional[str] = None
     total_pages: int = 1
     document_id: Optional[str] = None
+    trapped: Optional[str] = None
 
     # Content flags
     has_javascript: bool = False
@@ -112,6 +114,7 @@ class FullMetadata(BaseModel):
     # ICC color profiles + page rotation consistency
     icc_profiles: list[str] = []
     has_icc_profiles: bool = False
+    icc_profile_details: list = []  # parsed profile description/creator/manufacturer
     page_rotation: dict = {}
 
     # Comprehensive forensic-report sections (commercial-tool parity)
@@ -121,6 +124,12 @@ class FullMetadata(BaseModel):
     dimensions: dict = {}           # page size + standard format
     dates: dict = {}                # enriched date analysis
     authenticity: dict = {}         # overall 0-100 authenticity score
+
+    # Phase 2 — completeness extensions
+    xmp_mm: dict = {}               # xmpMM:DocumentID/InstanceID/History
+    trailer_ids: dict = {}          # both trailer /ID entries + comparison
+    object_level_dates: list = []   # /ModDate,/CreationDate found on non-Info objects
+    revision_info: dict = {}        # %%EOF count / /Prev pointer (informational)
 
 
 class FusedFindingModel(BaseModel):
@@ -137,6 +146,16 @@ class FusionStats(BaseModel):
     high_confidence_findings: int = 0
     single_layer_suppressed: int = 0
     fusion_groups: int = 0
+
+
+class ContradictedFindingModel(BaseModel):
+    page: int
+    bbox: list[float]
+    layer: str                    # the layer whose finding is contradicted
+    original_description: str     # preserved — the original finding, never deleted
+    contradiction_rule: str       # "cross_page_repetition" | "numeric_vs_structural_context"
+    contradicting_evidence: str
+    weight_reduction_points: int
 
 
 class ForensicResponse(BaseModel):
@@ -174,6 +193,11 @@ class ForensicResponse(BaseModel):
     # independent layers, plus suppression statistics
     fused_findings: list[FusedFindingModel] = []
     fusion_stats: Optional[FusionStats] = None
+
+    # Contradiction-aware fusion (Phase 1, additive) — findings whose layer
+    # score was reduced (never deleted) because independent structural
+    # evidence from another layer undermined them.
+    contradicted_findings: list[ContradictedFindingModel] = []
 
     # Summary
     summary: str

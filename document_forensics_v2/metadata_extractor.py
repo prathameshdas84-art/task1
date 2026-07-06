@@ -6,6 +6,8 @@ Extracts all metadata from any PDF and identifies its origin.
 import json
 import os
 import re
+import struct
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -136,6 +138,14 @@ class MetadataReport:
     icc_profiles: list = field(default_factory=list)
     has_icc_profiles: bool = False
     page_rotation: dict = field(default_factory=dict)
+
+    # Phase 2 — completeness extensions
+    trapped: Optional[str] = None                                # /Trapped Info-dict entry
+    xmp_mm: dict = field(default_factory=dict)                   # xmpMM:DocumentID/InstanceID/History
+    trailer_ids: dict = field(default_factory=dict)               # both /ID entries + comparison
+    object_level_dates: list = field(default_factory=list)        # /ModDate,/CreationDate on non-Info objects
+    icc_profile_details: list = field(default_factory=list)       # parsed ICC profile description/creator
+    revision_info: dict = field(default_factory=dict)             # %%EOF count / /Prev pointer (informational)
 
     # Overall modification age (PDFs store only the LAST mod date, not a
     # per-edit history). Populated by _compute_edit_age() — see that method.
@@ -314,6 +324,11 @@ class MetadataExtractor:
             has_icc_profiles=pikepdf_extras["has_icc_profiles"],
         )
 
+        # /Trapped is a Name (e.g. /True, /False, /Unknown) or absent entirely —
+        # report the bare value, or None when genuinely not set (not a guess).
+        trapped_raw = (docinfo.get("trapped") or "").lstrip("/")
+        report.trapped = trapped_raw or None
+
         # Overall modification age (used for display + risk weighting)
         report.edit_age = self._compute_edit_age(modification_date)
 
@@ -329,6 +344,20 @@ class MetadataExtractor:
         report.dimensions_full    = self._extract_dimensions(pdf_path)
         report.dates_full         = self._enhance_dates(creation_date, modification_date)
         report.page_rotation      = self._check_page_rotation_consistency(pdf_path)
+        report.icc_profile_details = pikepdf_extras.get("icc_profile_details", [])
+
+        # Phase 2 completeness extensions — XMP Media Management, trailer ID
+        # pair, per-object dates, and revision/incremental-update facts.
+        report.xmp_mm = {
+            "document_id":          xmp_fields_full.get("xmpMM:DocumentID"),
+            "instance_id":          xmp_fields_full.get("xmpMM:InstanceID"),
+            "original_document_id": xmp_fields_full.get("xmpMM:OriginalDocumentID"),
+            "rendition_class":      xmp_fields_full.get("xmpMM:RenditionClass"),
+            "history":              self._extract_xmp_history(pdf_path),
+        }
+        report.trailer_ids        = self._extract_trailer_ids(pdf_path)
+        report.object_level_dates = self._extract_object_level_dates(pdf_path)
+        report.revision_info      = self._extract_revision_info(pdf_path)
 
         # Run anomaly detection
         self._detect_anomalies(report)
@@ -771,6 +800,7 @@ class MetadataExtractor:
                 result["keywords"]      = str(info.get("/Keywords", "")).strip()
                 result["creation_date"] = str(info.get("/CreationDate", "")).strip()
                 result["mod_date"]      = str(info.get("/ModDate", "")).strip()
+                result["trapped"]       = str(info.get("/Trapped", "")).strip()
         except Exception:
             pass
         return result
@@ -832,6 +862,7 @@ class MetadataExtractor:
             "document_id": None,
             "icc_profiles": [],
             "has_icc_profiles": False,
+            "icc_profile_details": [],
         }
         try:
             with pikepdf.open(pdf_path) as pdf:
@@ -866,11 +897,29 @@ class MetadataExtractor:
                     for font_name, font_ref in font_dict.items():
                         try:
                             font_obj = pdf.get_object(font_ref.objgen)
+                            subtype = str(font_obj.get("/Subtype", "Unknown"))
+
+                            # Composite (Type0/CID) fonts carry their
+                            # /FontDescriptor on the descendant font, not on
+                            # this dict directly — checking only font_obj
+                            # itself under-reports "embedded" as False for
+                            # every CID font even when it IS embedded.
+                            font_descriptor = font_obj.get("/FontDescriptor", None)
+                            if font_descriptor is None and subtype == "/Type0":
+                                try:
+                                    descendants = font_obj.get("/DescendantFonts", [])
+                                    if descendants:
+                                        desc_font = pdf.get_object(descendants[0].objgen)
+                                        font_descriptor = desc_font.get("/FontDescriptor", None)
+                                except Exception:
+                                    font_descriptor = None
+
                             fonts.append({
                                 "name": str(font_obj.get("/BaseFont", "Unknown")),
-                                "type": str(font_obj.get("/Subtype", "Unknown")),
+                                "type": subtype,
                                 "encoding": str(font_obj.get("/Encoding", "Unknown")),
-                                "embedded": "/FontDescriptor" in font_obj,
+                                "embedded": font_descriptor is not None,
+                                "tool_signature": self._extract_font_tool_signature(font_descriptor),
                             })
                         except Exception:
                             continue
@@ -896,18 +945,44 @@ class MetadataExtractor:
                 # so a mix of profiles across pages is a tamper signal.
                 try:
                     icc_profiles = []
+                    icc_profile_details = []
+                    seen_streams = set()
                     for page in pdf.pages:
                         resources = page.get("/Resources", {})
                         color_spaces = resources.get("/ColorSpace", {}) if resources else {}
                         for name, cs in color_spaces.items():
                             try:
-                                if (isinstance(cs, list) and len(cs) > 1 and
-                                        str(cs[0]) == "/ICCBased"):
+                                # pikepdf.Array (what cs actually is here for a
+                                # real /ColorSpace array read from a file) does
+                                # NOT subclass Python list, so an isinstance(cs,
+                                # list) check silently never matched a real
+                                # document — length/indexing still works on
+                                # it directly, so drop the type gate.
+                                if (len(cs) > 1 and str(cs[0]) == "/ICCBased"):
                                     icc_profiles.append(str(name))
+                                    stream_obj = cs[1]
+                                    stream_key = getattr(stream_obj, "objgen", None)
+                                    if stream_key in seen_streams:
+                                        continue
+                                    seen_streams.add(stream_key)
+                                    detail = {
+                                        "resource_name": str(name),
+                                        "n_components": int(stream_obj.get("/N", 0)) or None,
+                                        "alternate": str(stream_obj.get("/Alternate", "")) or None,
+                                    }
+                                    try:
+                                        profile_bytes = bytes(stream_obj.read_bytes())
+                                        detail.update(self._parse_icc_profile(profile_bytes))
+                                    except Exception:
+                                        pass
+                                    icc_profile_details.append(
+                                        {k: v for k, v in detail.items() if v is not None}
+                                    )
                             except Exception:
                                 continue
                     result["icc_profiles"] = icc_profiles
                     result["has_icc_profiles"] = bool(icc_profiles)
+                    result["icc_profile_details"] = icc_profile_details
                 except Exception:
                     pass
         except Exception:
@@ -963,6 +1038,25 @@ class MetadataExtractor:
                         except Exception:
                             pass
 
+                    # xmpMM: (Media Management) namespace — DocumentID/InstanceID
+                    # persist across incremental saves while identifying the
+                    # abstract "document" vs a specific saved rendition; a
+                    # mismatched InstanceID across what claims to be the same
+                    # DocumentID is a sign of a resave. History is extracted
+                    # separately below since it's a structured array, not a
+                    # simple string property.
+                    xmpmm_fields = [
+                        "xmpMM:DocumentID", "xmpMM:InstanceID",
+                        "xmpMM:OriginalDocumentID", "xmpMM:RenditionClass",
+                    ]
+                    for f in xmpmm_fields:
+                        try:
+                            val = xmp.get(f)
+                            if val:
+                                result[f] = str(val)
+                        except Exception:
+                            pass
+
                     xmp_meta_date = result.get("xmp:MetadataDate")
                     xmp_mod_date  = result.get("xmp:ModifyDate")
                     if xmp_meta_date and xmp_mod_date and xmp_meta_date != xmp_mod_date:
@@ -970,6 +1064,385 @@ class MetadataExtractor:
         except Exception:
             pass
         return result
+
+    # ── xmpMM:History (structured XMP array) ───────────────────────────────────
+
+    _XMP_NS = {
+        "rdf":   "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "xmpMM": "http://ns.adobe.com/xap/1.0/mm/",
+        "stEvt": "http://ns.adobe.com/xap/1.0/sType/ResourceEvent#",
+    }
+
+    def _extract_xmp_history(self, pdf_path: str) -> list:
+        """
+        xmpMM:History is a structured rdf:Seq of stEvt: event records (action,
+        when, softwareAgent, instanceID, changed) — not a simple string
+        property, so it can't be read the same way as xmp:CreateDate etc.
+        Parsed directly from the raw /Metadata XML via ElementTree (stdlib)
+        rather than through pikepdf's scalar-property XMP accessor, which
+        isn't built for structured/array values.
+        """
+        history = []
+        try:
+            with pikepdf.open(pdf_path) as pdf:
+                metadata_stream = pdf.Root.get("/Metadata", None)
+                if metadata_stream is None:
+                    return history
+                xml_bytes = bytes(metadata_stream.read_bytes())
+            root = ET.fromstring(xml_bytes)
+            ns = self._XMP_NS
+            for history_el in root.iter(f"{{{ns['xmpMM']}}}History"):
+                seq = history_el.find(f"{{{ns['rdf']}}}Seq")
+                if seq is None:
+                    continue
+                for li in seq.findall(f"{{{ns['rdf']}}}li"):
+                    entry = {}
+                    for child in li:
+                        tag = child.tag.split("}")[-1]
+                        if child.text and child.text.strip():
+                            entry[tag] = child.text.strip()
+                    for attr_key, attr_val in li.attrib.items():
+                        tag = attr_key.split("}")[-1]
+                        if tag == "parseType":
+                            continue  # RDF serialization detail, not event data
+                        if tag not in entry and attr_val:
+                            entry[tag] = attr_val
+                    if entry:
+                        history.append(entry)
+        except Exception:
+            pass
+        return history
+
+    # ── Trailer /ID pair ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _id_to_hex(value) -> str:
+        try:
+            return bytes(value).hex()
+        except Exception:
+            return str(value)
+
+    def _extract_trailer_ids(self, pdf_path: str) -> dict:
+        """
+        The trailer /ID entry is a pair [original, current]. Per spec the
+        first element is meant to stay constant across every save of a
+        document's lineage while the second is regenerated on each save —
+        so id[0] == id[1] means this is the only save that has ever
+        happened, and a mismatch confirms the file has been resaved at
+        least once since creation (expected for a normal edit, informational
+        either way — not itself evidence of tampering).
+        """
+        result = {"id_original": None, "id_current": None, "match": None}
+        try:
+            with pikepdf.open(pdf_path) as pdf:
+                file_id = pdf.trailer.get("/ID", None)
+                if file_id and len(file_id) >= 1:
+                    result["id_original"] = self._id_to_hex(file_id[0])
+                if file_id and len(file_id) >= 2:
+                    result["id_current"] = self._id_to_hex(file_id[1])
+                    result["match"] = result["id_original"] == result["id_current"]
+        except Exception:
+            pass
+        return result
+
+    # ── Object-level dates ──────────────────────────────────────────────────────
+
+    def _extract_object_level_dates(self, pdf_path: str) -> list:
+        """
+        Some tools stamp /ModDate or /CreationDate on individual indirect
+        objects (embedded file specs, form-field/annotation dicts, etc.), not
+        just the top-level /Info dictionary. Walk every indirect object and
+        surface any such dates found outside of /Info, which is already
+        reported separately — a per-object date that disagrees with the
+        document's overall metadata dates can pinpoint which part of the
+        file was touched.
+        """
+        results = []
+        try:
+            with pikepdf.open(pdf_path) as pdf:
+                info_ref = pdf.trailer.get("/Info", None)
+                info_objgen = None
+                if info_ref is not None:
+                    try:
+                        info_objgen = info_ref.objgen
+                    except Exception:
+                        pass
+
+                for obj in pdf.objects:
+                    try:
+                        if not hasattr(obj, "get"):
+                            continue
+                        objgen = getattr(obj, "objgen", None)
+                        if info_objgen is not None and objgen == info_objgen:
+                            continue  # already reported as top-level Info dates
+                        for key in ("/ModDate", "/CreationDate"):
+                            if key in obj:
+                                raw_value = str(obj[key])
+                                parsed = _parse_pdf_date(raw_value)
+                                results.append({
+                                    "object_id": objgen[0] if objgen else None,
+                                    "field": key.lstrip("/"),
+                                    "raw_value": raw_value,
+                                    "parsed_iso": parsed.isoformat() if parsed else None,
+                                })
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return results
+
+    # ── Revision / incremental-update info (informational, not scored) ────────
+
+    def _extract_revision_info(self, pdf_path: str) -> dict:
+        """
+        How many generations of the file exist, purely as descriptive
+        metadata. This mirrors the same %%EOF-count / /Prev-pointer signal
+        the ELA layer already scores separately (ela_analyzer._detect_
+        incremental_updates) — duplicated here, independently computed, so
+        the metadata report can show it as a fact alongside the rest of the
+        trailer/Info data without reaching into another layer's module.
+        Purely informational: does not feed metadata_extractor's own
+        anomaly_score.
+        """
+        result = {
+            "eof_marker_count": 0,
+            "incremental_update_count": 0,
+            "has_incremental_updates": False,
+            "has_prev_trailer_pointer": False,
+            "prev_trailer_offset": None,
+        }
+        try:
+            with open(pdf_path, "rb") as f:
+                raw = f.read()
+            eof_count = raw.count(b"%%EOF")
+            result["eof_marker_count"] = eof_count
+            result["incremental_update_count"] = max(0, eof_count - 1)
+            result["has_incremental_updates"] = eof_count > 1
+        except Exception:
+            pass
+        try:
+            with pikepdf.open(pdf_path) as pdf:
+                prev = pdf.trailer.get("/Prev")
+                if prev is not None:
+                    result["has_prev_trailer_pointer"] = True
+                    result["prev_trailer_offset"] = int(prev)
+                    result["has_incremental_updates"] = True
+        except Exception:
+            pass
+        return result
+
+    # ── ICC profile parsing (raw bytes -> description/creator, stdlib struct) ──
+
+    @staticmethod
+    def _parse_icc_text_tag(data: bytes, offset: int, size: int) -> Optional[str]:
+        """Decode an ICC 'desc'/'cprt'/plain-'text' tag's human-readable string."""
+        chunk = data[offset:offset + size]
+        if len(chunk) < 8:
+            return None
+        tag_type = chunk[0:4]
+        try:
+            if tag_type == b"desc" and len(chunk) >= 12:
+                # textDescriptionType (ICC v2): sig(4) + reserved(4) + ascii
+                # count(4, BE uint32) + that many ASCII bytes (NUL-terminated)
+                ascii_count = struct.unpack(">I", chunk[8:12])[0]
+                ascii_bytes = chunk[12:12 + ascii_count]
+                text = ascii_bytes.rstrip(b"\x00").decode("latin-1", errors="replace")
+                return text.strip() or None
+            if tag_type == b"mluc" and len(chunk) >= 16:
+                # multiLocalizedUnicodeType (ICC v4): take the first record
+                num_records = struct.unpack(">I", chunk[8:12])[0]
+                if num_records > 0:
+                    rec_off = 16
+                    length, str_offset = struct.unpack(">II", chunk[rec_off + 4:rec_off + 12])
+                    text_bytes = chunk[str_offset:str_offset + length]
+                    text = text_bytes.decode("utf-16-be", errors="replace")
+                    return text.strip("\x00").strip() or None
+            if tag_type == b"text":
+                text = chunk[8:].split(b"\x00")[0].decode("latin-1", errors="replace")
+                return text.strip() or None
+        except Exception:
+            return None
+        return None
+
+    def _parse_icc_profile(self, data: bytes) -> dict:
+        """
+        Parse an embedded ICC profile's header + tag table (pure stdlib
+        struct — no colormanagement library needed) to surface its actual
+        description/creator, not just the fact that a profile exists. A
+        document re-exported through different software typically embeds a
+        different ICC profile than the one it was originally produced with.
+        """
+        result = {}
+        try:
+            if len(data) < 132:
+                return result
+            version_bytes = data[8:12]
+            result["version"] = f"{version_bytes[0]}.{version_bytes[1] >> 4}.{version_bytes[1] & 0x0F}"
+            result["device_class"]     = data[12:16].decode("ascii", errors="replace").strip() or None
+            result["color_space"]      = data[16:20].decode("ascii", errors="replace").strip() or None
+            result["connection_space"] = data[20:24].decode("ascii", errors="replace").strip() or None
+            result["platform"]         = data[40:44].decode("ascii", errors="replace").strip("\x00 ") or None
+            result["manufacturer"]     = data[48:52].decode("ascii", errors="replace").strip("\x00 ") or None
+            result["model"]            = data[52:56].decode("ascii", errors="replace").strip("\x00 ") or None
+            result["creator_signature"] = data[80:84].decode("ascii", errors="replace").strip("\x00 ") or None
+
+            tag_count = struct.unpack(">I", data[128:132])[0]
+            for i in range(tag_count):
+                entry_offset = 132 + i * 12
+                if entry_offset + 12 > len(data):
+                    break
+                sig = data[entry_offset:entry_offset + 4]
+                off, size = struct.unpack(">II", data[entry_offset + 4:entry_offset + 12])
+                if sig == b"desc":
+                    desc = self._parse_icc_text_tag(data, off, size)
+                    if desc:
+                        result["description"] = desc
+                elif sig == b"cprt":
+                    cprt = self._parse_icc_text_tag(data, off, size)
+                    if cprt:
+                        result["copyright"] = cprt
+        except Exception:
+            pass
+        return {k: v for k, v in result.items() if v}
+
+    # ── Embedded font internal metadata (survives even when /Info is stripped) ─
+
+    _TT_NAME_IDS = {
+        1: "family", 2: "subfamily", 3: "unique_id", 4: "full_name",
+        5: "version", 6: "postscript_name", 8: "manufacturer",
+        9: "designer", 11: "vendor_url", 13: "license",
+    }
+
+    def _parse_sfnt_name_table(self, data: bytes, font_format: str) -> Optional[dict]:
+        """Parse a TrueType/OpenType 'name' table — the font program's own
+        embedded authoring-tool signature (family/version/manufacturer/
+        designer strings), independent of the PDF's own /Info dictionary."""
+        try:
+            if len(data) < 12:
+                return None
+            num_tables = struct.unpack(">H", data[4:6])[0]
+            name_table = None
+            for i in range(num_tables):
+                rec_off = 12 + i * 16
+                if rec_off + 16 > len(data):
+                    break
+                tag = data[rec_off:rec_off + 4]
+                offset, length = struct.unpack(">II", data[rec_off + 8:rec_off + 16])
+                if tag == b"name":
+                    name_table = data[offset:offset + length]
+                    break
+            if not name_table or len(name_table) < 6:
+                return {"font_format": font_format, "name_table_found": False}
+
+            count, string_offset = struct.unpack(">HH", name_table[2:6])
+            fields = {}
+            for i in range(count):
+                rec_off = 6 + i * 12
+                if rec_off + 12 > len(name_table):
+                    break
+                platform_id, _enc_id, _lang_id, name_id, length, offset = struct.unpack(
+                    ">HHHHHH", name_table[rec_off:rec_off + 12]
+                )
+                if name_id not in self._TT_NAME_IDS:
+                    continue
+                str_start = string_offset + offset
+                raw = name_table[str_start:str_start + length]
+                try:
+                    text = raw.decode("mac_roman" if platform_id == 1 else "utf-16-be",
+                                       errors="replace").strip()
+                except Exception:
+                    continue
+                key = self._TT_NAME_IDS[name_id]
+                if text and key not in fields:
+                    fields[key] = text
+            return {"font_format": font_format, "name_table_found": bool(fields), **fields}
+        except Exception:
+            return None
+
+    def _parse_type1_font_info(self, data: bytes) -> Optional[dict]:
+        """Type1 fonts carry a cleartext PostScript /FontInfo dict (Notice,
+        FullName, FamilyName, Weight, version) before the encrypted eexec
+        section — plain regex extraction, no PostScript interpreter needed."""
+        try:
+            eexec_idx = data.find(b"eexec")
+            cleartext = data[:eexec_idx] if eexec_idx != -1 else data[:4096]
+            text = cleartext.decode("latin-1", errors="replace")
+            patterns = {
+                "full_name": r"/FullName\s*\(([^)]*)\)",
+                "family":    r"/FamilyName\s*\(([^)]*)\)",
+                "weight":    r"/Weight\s*\(([^)]*)\)",
+                "version":   r"/version\s*\(([^)]*)\)",
+                "notice":    r"/Notice\s*\(([^)]*)\)",
+            }
+            fields = {}
+            for key, pat in patterns.items():
+                m = re.search(pat, text)
+                if m and m.group(1).strip():
+                    fields[key] = m.group(1).strip()
+            return {"font_format": "Type1", "name_table_found": bool(fields), **fields}
+        except Exception:
+            return None
+
+    def _parse_cff_font_info(self, data: bytes) -> Optional[dict]:
+        """Bare CFF (Type1C/CIDFontType0C) has no sfnt 'name' table — read
+        just its Name INDEX (first structure in the format) for the
+        font's internal name, per the CFF spec's fixed INDEX layout."""
+        try:
+            if len(data) < 4:
+                return None
+            hdr_size = data[2]
+            pos = hdr_size
+            count = struct.unpack(">H", data[pos:pos + 2])[0]
+            pos += 2
+            names = []
+            if count > 0:
+                off_size = data[pos]
+                pos += 1
+                offsets = []
+                for _ in range(count + 1):
+                    offsets.append(int.from_bytes(data[pos:pos + off_size], "big"))
+                    pos += off_size
+                data_start = pos - 1
+                for i in range(count):
+                    s = data_start + offsets[i]
+                    e = data_start + offsets[i + 1]
+                    names.append(data[s:e].decode("latin-1", errors="replace"))
+            return {
+                "font_format": "CFF (bare)",
+                "name_table_found": bool(names),
+                "family": names[0] if names else None,
+            }
+        except Exception:
+            return None
+
+    def _extract_font_tool_signature(self, font_descriptor) -> Optional[dict]:
+        """
+        Read the embedded font PROGRAM's own internal metadata (TrueType/OTF
+        'name' table, Type1 FontInfo, or bare-CFF Name INDEX). This can
+        reveal the actual authoring/subsetting tool even when the PDF's own
+        /Info dictionary has been stripped — a font subsetter's signature
+        (e.g. FontForge, a specific version string) doesn't get cleared by
+        stripping document-level metadata.
+        """
+        if font_descriptor is None:
+            return None
+        try:
+            if "/FontFile2" in font_descriptor:
+                data = bytes(font_descriptor["/FontFile2"].read_bytes())
+                return self._parse_sfnt_name_table(data, "TrueType")
+            if "/FontFile3" in font_descriptor:
+                ff3 = font_descriptor["/FontFile3"]
+                subtype = str(ff3.get("/Subtype", ""))
+                data = bytes(ff3.read_bytes())
+                if "OpenType" in subtype:
+                    return self._parse_sfnt_name_table(data, "OpenType (CFF)")
+                return self._parse_cff_font_info(data)
+            if "/FontFile" in font_descriptor:
+                data = bytes(font_descriptor["/FontFile"].read_bytes())
+                return self._parse_type1_font_info(data)
+        except Exception:
+            return None
+        return None
 
     def _check_page_rotation_consistency(self, pdf_path: str) -> dict:
         """
@@ -1032,10 +1505,25 @@ class MetadataExtractor:
             score += SUSPICION_SCORE["MEDIUM"]
 
         elif report.source.suspicion_level == "UNKNOWN":
-            anomalies.append(
-                "Document source is unrecognized — producer/creator fields "
-                "do not match any known tool"
-            )
+            # An unidentified source is neutral information on its own — it
+            # only means this layer can't fingerprint the tool, not that
+            # something is wrong. State plainly which case this is (nothing
+            # to fingerprint vs. a real-but-unrecognized value) instead of
+            # implying suspicion; let signal fusion with other layers do the
+            # actual suspicion-weighing.
+            if not report.producer and not report.creator:
+                anomalies.append(
+                    "Producer/creator absent — cannot fingerprint source. "
+                    "This is neutral information, not evidence of tampering "
+                    "on its own."
+                )
+            else:
+                anomalies.append(
+                    f"Producer/creator ('{report.producer or report.creator}') does "
+                    f"not match any tool in the recognized fingerprint database — "
+                    f"the source application is unidentified. This is neutral "
+                    f"information on its own, not evidence of tampering."
+                )
             score += SUSPICION_SCORE["UNKNOWN"]
 
         # 4. Metadata stripped completely

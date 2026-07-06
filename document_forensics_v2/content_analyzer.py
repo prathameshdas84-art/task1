@@ -294,6 +294,16 @@ class ContentReport:
     signals: list[str]           # human readable summary signals
     pdf_type: str                # native_text | scanned | mixed
 
+    # Every line THIS analyzer already classifies as structural/repeated
+    # page furniture via _is_structural_line() (headers, footers, labels,
+    # lines repeated on another page) — even though such lines never
+    # become a SuspiciousLine finding here. Exposed for cross-layer fusion
+    # (signal_fusion.py's contradiction detection) so OTHER layers' findings
+    # on the same kind of region can be recognized too, not just content's
+    # own font-mismatch pathway. Purely additive: no existing anomaly-
+    # detection call site's behavior changes.
+    structural_line_locations: list = field(default_factory=list)
+
 
 # ── Feature extraction ─────────────────────────────────────────────────────────
 
@@ -375,6 +385,18 @@ class ContentAnalyzer:
             ))
         suspicious_lines.sort(key=lambda x: x.score, reverse=True)
 
+        # Same _is_structural_line() classification the anomaly-detection
+        # gates above already call — just also collected here, once, for
+        # cross-layer fusion. Not a new heuristic, not a new logic path.
+        try:
+            structural_line_locations = [
+                {"page": l.page, "bbox": list(l.bbox), "text": l.text}
+                for l in lines
+                if self._is_structural_line(l, lines)
+            ]
+        except Exception:
+            structural_line_locations = []
+
         return ContentReport(
             total_lines=len(lines),
             suspicious_lines=suspicious_lines,  # return ALL suspicious lines, no cap
@@ -384,6 +406,7 @@ class ContentAnalyzer:
             anomaly_score=score,
             signals=signals,
             pdf_type=pdf_type,
+            structural_line_locations=structural_line_locations,
         )
 
     # ── PDF type detection ─────────────────────────────────────────────────────

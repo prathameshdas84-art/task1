@@ -22,6 +22,33 @@ engine actually runs and meets its stated goal):
     can only fuse if the text-layer findings have spatial coordinates to match
     against the visual layers. ``line_num`` is kept as well, so content/numeric
     still fuse with each other line-wise.
+
+Contradiction modeling (additive): agreement (above) isn't the only useful
+cross-layer signal — one layer's independent evidence can also UNDERMINE
+another layer's finding. ``detect_contradictions()`` runs AFTER ``fuse()``,
+never deletes a finding (weight reduction only, evidence stays visible), and
+currently implements:
+
+  * Rule 2/3 (generalized cross-page-repetition contradiction): a finding
+    from ANY layer whose bbox overlaps a location content_analyzer.py already
+    classified as structural/repeated page furniture (exposed via
+    ``ContentReport.structural_line_locations``) is self-contradicting as
+    "an edit" — edits are typically localized, not uniformly repeated. This
+    generalizes content_analyzer's own per-line suppression (which only
+    catches its OWN font-mismatch findings) to any layer's finding on the
+    same kind of region. Numeric findings get their own rule tag
+    ("numeric_vs_structural_context") since a numeric anomaly on page
+    furniture is specifically a disagreement about what the region even IS,
+    not just a repeated-edit pattern.
+
+  * Rule 1 (metadata vs. structural fingerprint) is NOT implemented — it
+    depends on a structural PDF fingerprinting system (font-subsetting
+    pattern, xref structure, trailer ordering, etc., with HIGH/MEDIUM
+    confidence levels) that does not exist anywhere in this codebase yet.
+    That work was proposed separately and never built. TODO once it exists:
+    reduce metadata's contribution when producer/creator is unrecognized AND
+    the fingerprint matches a known-legitimate pattern AND content has no
+    strong anomalies.
 """
 
 import math
@@ -55,6 +82,21 @@ class FusedFinding:
     ela_finding: dict = None
     ocr_finding: dict = None
     pymupdf_finding: dict = None
+
+
+@dataclass
+class ContradictedFinding:
+    """A finding from one layer that independent structural evidence from
+    another layer undermines. Weight is REDUCED, never zeroed — the original
+    finding stays fully described here so a human reviewer can see it existed
+    and judge the contradiction themselves."""
+    page: int
+    bbox: tuple
+    layer: str                     # the layer whose finding is being contradicted
+    original_description: str      # the original finding's own text/description, preserved
+    contradiction_rule: str        # "cross_page_repetition" | "numeric_vs_structural_context"
+    contradicting_evidence: str    # human-readable explanation of what undermines it
+    weight_reduction_points: int   # points subtracted from that layer's anomaly_score (0-100 scale)
 
 
 class SignalFusion:
@@ -353,3 +395,84 @@ class SignalFusion:
             ocr_finding=findings_by_layer.get("ocr"),
             pymupdf_finding=findings_by_layer.get("pymupdf"),
         )
+
+    # ── Contradiction detection (additive) — runs AFTER fuse(), before the
+    # caller recomputes combined_score ──────────────────────────────────────
+
+    # Points subtracted from a layer's anomaly_score per contradicted
+    # finding (0-100 scale) — same fixed-points-per-finding shape as the
+    # Gemini Layer 7 downweight in main.py, kept as its own separate,
+    # tunable constant since these are independent mechanisms.
+    CONTRADICTION_DOWNWEIGHT_POINTS = 10
+
+    def detect_contradictions(self,
+                               structural_line_locations: list = None,
+                               suspicious_lines: list = None,
+                               numeric_anomalies: list = None,
+                               ela_regions: list = None,
+                               ocr_regions: list = None,
+                               overlay_regions: list = None) -> Tuple[List[ContradictedFinding], dict]:
+        """
+        Detects when a finding from one layer is undermined by independent
+        structural evidence from another — currently, whether its bbox
+        overlaps a location content_analyzer.py already classified as
+        structural/repeated page furniture. Reuses the same overlap/
+        proximity heuristic as fuse() (_bbox_close) rather than a new
+        threshold. NEVER deletes the original finding.
+
+        structural_line_locations: list of {"page", "bbox", "text"} dicts —
+        ContentReport.structural_line_locations, i.e. every line
+        content_analyzer already classifies (via _is_structural_line) as a
+        header/footer/label/repeated line, whether or not it became a
+        SuspiciousLine finding.
+
+        Returns (contradicted_findings, stats).
+        """
+        locations = structural_line_locations or []
+        contradicted: List[ContradictedFinding] = []
+
+        def check(items, layer_name, rule_name):
+            for it in items or []:
+                bbox = _field(it, "bbox")
+                page = _field(it, "page", 0)
+                if not bbox:
+                    continue
+                bbox = tuple(bbox)
+                for loc in locations:
+                    if loc.get("page") != page or not loc.get("bbox"):
+                        continue
+                    if not self._bbox_close(bbox, tuple(loc["bbox"])):
+                        continue
+                    original_desc = (
+                        _field(it, "text", None) or _field(it, "reason", None)
+                        or _field(it, "word", None) or f"{layer_name} finding"
+                    )
+                    contradicted.append(ContradictedFinding(
+                        page=page,
+                        bbox=bbox,
+                        layer=layer_name,
+                        original_description=str(original_desc)[:200],
+                        contradiction_rule=rule_name,
+                        contradicting_evidence=(
+                            f"Overlaps a line content_analyzer classified as structural/"
+                            f"repeated page furniture (\"{str(loc.get('text', ''))[:60]}\") "
+                            f"— edits are typically localized, not uniformly repeated."
+                        ),
+                        weight_reduction_points=self.CONTRADICTION_DOWNWEIGHT_POINTS,
+                    ))
+                    break  # one match is enough to flag this finding once
+
+        check(suspicious_lines, "content", "cross_page_repetition")
+        check(ela_regions, "ela", "cross_page_repetition")
+        check(ocr_regions, "ocr", "cross_page_repetition")
+        check(overlay_regions, "pymupdf", "cross_page_repetition")
+        # Numeric gets its own rule tag: a numeric anomaly on page furniture
+        # is a disagreement about what the region IS, not just a repeated-
+        # edit pattern (see rule 3 in the module docstring).
+        check(numeric_anomalies, "numeric", "numeric_vs_structural_context")
+
+        stats = {
+            "contradictions_found": len(contradicted),
+            "layers_affected": sorted(set(c.layer for c in contradicted)),
+        }
+        return contradicted, stats
