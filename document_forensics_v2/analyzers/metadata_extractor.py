@@ -23,7 +23,10 @@ from pypdf import PdfReader
 # without touching this module. Categories map to the is_online_tool /
 # is_editor / is_generator / is_scanner flags below.
 
-_DB_PATH = os.path.join(os.path.dirname(__file__), "producer_database.json")
+# producer_database.json lives at the project root, not alongside this file
+# (this module is inside analyzers/ as of the Phase 2 folder reorg) — go up
+# one level from analyzers/ to reach it.
+_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "producer_database.json")
 
 _ONLINE_EDITOR_CATEGORY  = "online_editor"
 _DESKTOP_EDITOR_CATEGORY = "desktop_editor"
