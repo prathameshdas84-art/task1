@@ -1,8 +1,11 @@
 """
-AI Review (Gemini) route — opt-in, supplementary, never part of /analyze.
-Relocated verbatim out of main.py (Phase 2 folder reorganization) — no
-logic changes; only the @app.post decorator became an APIRouter route and
-imports were adjusted for the new package layout.
+AI Review route — opt-in, supplementary, never part of /analyze. Backed by
+one of two interchangeable providers, selected via the AI_REVIEW_PROVIDER
+env var ("gemini" | "nvidia", default "gemini" — unset/existing setups get
+byte-identical behavior to before NVIDIA support existed). Both providers
+implement the exact same explain/review_regions/independent_scan interface
+(see ai_review/gemini_advisor.py's module docstring), so nothing below this
+line needs to branch on which one is active except the one selection point.
 
 Every region Job B reviews is something the 6-layer engine ALREADY flagged
 (fused findings, suspicious lines, numeric outliers, ELA regions, OCR word
@@ -10,30 +13,53 @@ anomalies, PyMuPDF overlays). Job C (below) is the one exception — it scans
 full pages independently of what the 6 layers already found.
 """
 
+import os
 import time
 
 from fastapi import APIRouter, HTTPException
 
 from models import ForensicResponse
-from fusion.verdict_engine import WEIGHTS
-from ai_review.gemini_advisor import GeminiAdvisor, GeminiNotConfigured, GeminiRequestError
+from fusion.verdict_engine import WEIGHTS, UNCERTAIN_BAND, THRESHOLD
+from utils.ai_retry import AIProviderNotConfigured, AIProviderRequestError
+from ai_review.gemini_advisor import GeminiAdvisor
+from ai_review.nvidia_advisor import NvidiaAdvisor
 from api.analysis_cache import _analysis_cache
 
 router = APIRouter()
+
+# "gemini" | "nvidia" — Gemini is the default so unset/existing .env files
+# behave exactly as before NVIDIA support existed. Read once at import time
+# (not per-request) so it's obvious which provider is active for the whole
+# process's lifetime, matching how GEMINI_API_KEY/NVIDIA_API_KEY are also
+# read once at their own module's import time.
+AI_REVIEW_PROVIDER = os.environ.get("AI_REVIEW_PROVIDER", "gemini").strip().lower()
+
+
+def _make_advisor():
+    """Instantiates the configured provider's advisor. Raises
+    AIProviderNotConfigured (shared, provider-agnostic) if that provider's
+    API key is missing — same graceful-degradation path regardless of
+    which provider was selected."""
+    if AI_REVIEW_PROVIDER == "nvidia":
+        return NvidiaAdvisor(), "NVIDIA NIM"
+    return GeminiAdvisor(), "Gemini"
 
 MAX_AI_REVIEW_REGIONS     = 8   # cap regions sent to Gemini's vision endpoint per click — bounds latency/cost
 AI_REVIEW_CROP_PADDING_PT = 6   # PDF points of padding added around each flagged bbox when cropping
 
 MAX_AI_REVIEW_PAGES = 5           # cap pages sent to Job C's independent page scan per click
 JOB_C_RENDER_DPI     = 150        # matches the DPI Job B crops / /annotated-image already use
-GEMINI_INTER_CALL_DELAY_SECONDS = 1.5  # pause between the sequential Job A / B / C calls, on top of
-                                        # gemini_advisor's own per-call 429 retry/backoff, to further
-                                        # reduce rate-limit collisions across the 3 calls in one click
+AI_REVIEW_INTER_CALL_DELAY_SECONDS = 1.5  # pause between the sequential Job A / B / C calls, on top
+                                           # of the active provider's own per-call 429 retry/backoff,
+                                           # to further reduce rate-limit collisions across the 3 calls
+                                           # in one click — applies regardless of which provider is active
 
-# ── Layer 7 (Gemini) scoring — feeds a SEPARATE combined_score_with_ai; never
-# mutates the deterministic combined_score/layers computed in /analyze.
+# ── Layer 7 (AI Review) scoring — feeds a SEPARATE combined_score_with_ai;
+# never mutates the deterministic combined_score/layers computed in
+# /analyze. Provider-agnostic: the same scoring math applies whichever of
+# Gemini/NVIDIA NIM is active, since both produce the same result shapes.
 # Per-finding down-weights: each Job B region reclassified as a
-# template-element, OR each Job C per_finding_verification entry Gemini
+# template-element, OR each Job C per_finding_verification entry the model
 # marks "contradicted", subtracts its own downweight constant from THAT
 # finding's own source layer score (floored at 0) — a targeted correction
 # for a specific false positive, not a blanket layer override.
@@ -198,9 +224,9 @@ def _compute_layer7_score(additional_findings: list, job_c_verifications: list, 
         elif r["label"] == "template-element":
             score -= JOB_B_CONTRADICTION_PENALTY
     for v in job_c_verifications:
-        if v["gemini_verdict"] == "supported":
+        if v["verdict"] == "supported":
             score += JOB_C_SUPPORTED_BONUS
-        elif v["gemini_verdict"] == "contradicted":
+        elif v["verdict"] == "contradicted":
             score -= JOB_C_CONTRADICTED_PENALTY
     return int(max(0, min(100, round(score))))
 
@@ -233,7 +259,7 @@ def _compute_combined_score_with_ai(response: ForensicResponse, job_b_regions: l
             })
 
     for v in job_c_verifications:
-        if v["gemini_verdict"] != "contradicted":
+        if v["verdict"] != "contradicted":
             continue
         for layer_name in _extract_layer_names(v["layer"]):
             before = adjusted.get(layer_name, 0)
@@ -259,14 +285,77 @@ def _compute_combined_score_with_ai(response: ForensicResponse, job_b_regions: l
     }
 
 
+def _compute_ai_adjusted_verdict(combined_score_with_ai: float, effective_threshold: float) -> str:
+    """Same MODIFIED/ORIGINAL/UNCERTAIN threshold logic verdict_engine.combine()
+    uses for the deterministic verdict, applied to combined_score_with_ai
+    instead — so Job A can state a verdict label computed the same way the
+    rest of the app labels verdicts, rather than leaving it to Gemini's own
+    judgment of what counts as "modified"."""
+    distance = abs(combined_score_with_ai - effective_threshold)
+    if distance <= UNCERTAIN_BAND:
+        return "UNCERTAIN"
+    return "MODIFIED" if combined_score_with_ai >= effective_threshold else "ORIGINAL"
+
+
+_UNAVAILABLE_PREFIX = "AI review unavailable for this item — "
+
+
+def _extract_failure_reason(reasoning: str) -> str:
+    """label_results/reasoning for an 'unavailable' item is always
+    '<_UNAVAILABLE_PREFIX><the actual provider error>' — strip the prefix
+    so the top-level hard-failure message states the real reason (rate
+    limit, timeout, etc.) once, instead of the per-item wrapper text."""
+    if reasoning and reasoning.startswith(_UNAVAILABLE_PREFIX):
+        return reasoning[len(_UNAVAILABLE_PREFIX):]
+    return reasoning or "an unknown error"
+
+
+def _build_hard_failure_result(provider_label: str, response: ForensicResponse, reason: str) -> dict:
+    """The FAIL-FAST result: the first AI call attempted (Job B, or Job C
+    when Job B had nothing to review) failed outright after its own
+    retries — a strong signal every subsequent call would fail identically
+    too, so nothing further is attempted. Deliberately NOT cached (see the
+    caller) so clicking "Retry AI Review" re-attempts the whole pipeline
+    fresh via this same endpoint, rather than replaying a stale failure."""
+    message = (
+        f"⚠️ AI Review unavailable right now ({reason}). "
+        f"Try again in a minute. The deterministic 6-layer analysis above "
+        f"is complete and unaffected."
+    )
+    return {
+        "available": True,
+        "provider": provider_label,
+        "hard_failure": True,
+        "hard_failure_message": message,
+        "explanation": None,
+        "explanation_prompt": None,
+        "explanation_error": None,
+        "regions": [],
+        "regions_error": None,
+        "per_finding_verification": [],
+        "additional_findings": [],
+        "overall_assessment": None,
+        "ai_disagreement_flag": False,
+        "ai_disagreement_message": None,
+        "job_c_error": None,
+        "layer7_score": 0,
+        "layer7_weight": LAYER7_WEIGHT,
+        "job_b_template_downweight_points": JOB_B_TEMPLATE_DOWNWEIGHT_POINTS,
+        "job_c_contradiction_downweight_points": JOB_C_CONTRADICTION_DOWNWEIGHT_POINTS,
+        "downweight_applied": [],
+        "combined_score": response.combined_score,
+        "combined_score_with_ai": None,
+        "ai_adjusted_verdict": None,
+        "from_cache": False,
+    }
+
+
 @router.post("/api/analysis/{analysis_id}/ai-review", tags=["AI Review"])
 async def ai_review(analysis_id: str):
     """
     Opt-in supplementary AI review — ONLY invoked when the user clicks
     "Ask AI" in the UI. Never runs during /analyze, never mutates the cached
-    ForensicResponse/combined_score/verdict. Reads the already-cached
-    analysis result and runs:
-      Job A — plain-English explanation of the existing verdict.
+    ForensicResponse/combined_score/verdict. Runs, IN ORDER:
       Job B — template-vs-possible-edit labels for regions the engine
               already flagged (one batched Gemini call, not one per region).
       Job C — genuine cross-examination: Gemini gets BOTH the rendered page
@@ -276,10 +365,14 @@ async def ai_review(analysis_id: str):
               surfaces anything the engine missed, and gives its own
               overall assessment (never auto-applied to the verdict —
               surfaced as a flagged disagreement for human review instead).
-    Layer 7 (Gemini) score + a SEPARATE combined_score_with_ai are computed
-    from Job B/C output — combined_score itself is never touched. Fails
-    gracefully per-job (API key missing, network error, rate limit) without
-    ever raising past this endpoint or affecting the cached verdict.
+      [Layer 7 score + combined_score_with_ai computed from B+C's output]
+      Job A — plain-English explanation, run LAST so it can synthesize B
+              and C's own results (and the FINAL combined_score_with_ai)
+              instead of confidently restating the pre-AI-review narrative
+              while B/C are simultaneously contradicting it.
+    combined_score itself is never touched. Fails gracefully per-job (API
+    key missing, network error, rate limit) without ever raising past this
+    endpoint or affecting the cached verdict.
 
     Cached per analysis_id: a second call returns the exact same result
     instead of re-calling Gemini, so combined_score_with_ai stays
@@ -298,10 +391,12 @@ async def ai_review(analysis_id: str):
     response: ForensicResponse = cached["response"]
 
     try:
-        advisor = GeminiAdvisor()
-    except GeminiNotConfigured as e:
+        advisor, provider_label = _make_advisor()
+    except AIProviderNotConfigured as e:
         return {
             "available": False,
+            "provider": "NVIDIA NIM" if AI_REVIEW_PROVIDER == "nvidia" else "Gemini",
+            "hard_failure": False,
             "reason": str(e),
             "explanation": None,
             "explanation_prompt": None,
@@ -316,36 +411,24 @@ async def ai_review(analysis_id: str):
             "combined_score_with_ai": None,
         }
 
-    # Job A — narrow input: only the fields named in scope (layers, signals,
-    # fused_findings, suspicious_lines, numeric_anomalies, summary), not the
-    # full raw API response (metadata/ocr_stats/etc. aren't relevant to
-    # "explain the verdict" and would just bloat the prompt).
-    analysis_summary = {
-        "verdict": response.verdict,
-        "combined_score": response.combined_score,
-        "confidence": response.confidence.dict(),
-        "layers": response.layers.dict(),
-        "signals": response.signals,
-        "fused_findings": [f.dict() for f in response.fused_findings],
-        "suspicious_lines": [s.dict() for s in response.suspicious_lines],
-        "numeric_anomalies": [n.dict() for n in response.numeric_anomalies],
-        "summary": response.summary,
-    }
-
-    explanation, explanation_prompt, explanation_error = None, None, None
-    try:
-        explanation, explanation_prompt = advisor.explain_report(analysis_summary)
-    except GeminiRequestError as e:
-        explanation_error = str(e)
-    except Exception as e:
-        explanation_error = f"Unexpected error generating explanation: {e}"
-
-    time.sleep(GEMINI_INTER_CALL_DELAY_SECONDS)
-
     # Job B — crop every already-flagged region, then label them ALL in ONE
-    # batched Gemini call (instead of one HTTP call per region).
+    # batched Gemini call (instead of one HTTP call per region). Runs FIRST
+    # now so Job A (last) can reference what it found.
+    #
+    # FAIL FAST: a batch-level failure (rate limit surviving retries, etc.)
+    # makes review_regions() return "unavailable" for EVERY region rather
+    # than raising — that's a reliable signal the whole call failed as one
+    # unit, not that each region individually happened to be unavailable.
+    # When that happens, stop here: don't attempt Job C or Job A at all,
+    # since the same rate-limited key would almost certainly fail those
+    # identically too. A PARTIAL miss (some but not all regions came back
+    # unavailable — e.g. the model's reply was missing a couple of indices)
+    # is NOT a hard failure: the regions that succeeded are shown normally,
+    # and the ones that didn't are summarized in ONE line rather than
+    # repeated as one "unavailable" box per region.
     regions_out = []
     regions_error = None
+    job_b_attempted = False
     try:
         flagged_regions, crop_bytes_list = [], []
         for region in _gather_flagged_regions(cached):
@@ -356,8 +439,18 @@ async def ai_review(analysis_id: str):
             crop_bytes_list.append(crop_bytes)
 
         if crop_bytes_list:
-            label_results = advisor.label_regions_batch(crop_bytes_list)
+            job_b_attempted = True
+            label_results = advisor.review_regions(crop_bytes_list)
+            unavailable = [r for r in label_results if r["label"] == "unavailable"]
+
+            if len(unavailable) == len(label_results):
+                # Total batch failure — fail fast, skip Job C and Job A.
+                reason = _extract_failure_reason(unavailable[0]["reasoning"])
+                return _build_hard_failure_result(provider_label, response, reason)
+
             for region, label_result in zip(flagged_regions, label_results):
+                if label_result["label"] == "unavailable":
+                    continue
                 regions_out.append({
                     "page": region["page"] + 1,  # 1-indexed for display
                     "bbox": list(region["bbox"]),
@@ -366,10 +459,16 @@ async def ai_review(analysis_id: str):
                     "label": label_result["label"],
                     "reasoning": label_result["reasoning"],
                 })
+            if unavailable:
+                regions_error = (
+                    f"{len(unavailable)} of {len(label_results)} region(s) could not be "
+                    f"reviewed ({_extract_failure_reason(unavailable[0]['reasoning'])}) — "
+                    f"try again to review the rest."
+                )
     except Exception as e:
         regions_error = f"Unexpected error labeling regions: {e}"
 
-    time.sleep(GEMINI_INTER_CALL_DELAY_SECONDS)
+    time.sleep(AI_REVIEW_INTER_CALL_DELAY_SECONDS)
 
     # Job C — cross-examine the engine's OWN findings against the actual
     # rendered pages in ONE combined call (full engine JSON + page images
@@ -396,7 +495,7 @@ async def ai_review(analysis_id: str):
 
         if page_images:
             job_c_summary = _build_job_c_analysis_summary(response, cached)
-            cross_exam = advisor.cross_examine_findings(page_images, job_c_summary)
+            cross_exam = advisor.independent_scan(page_images, job_c_summary)
             per_finding_verification = cross_exam["per_finding_verification"]
             overall_assessment = cross_exam["overall_assessment"]
 
@@ -413,13 +512,23 @@ async def ai_review(analysis_id: str):
                     "confidence": f["confidence"],
                     "not_flagged_by_engine": True,
                 })
-    except GeminiRequestError as e:
+    except AIProviderRequestError as e:
+        # If Job B had nothing to review (no flagged regions), Job C is
+        # effectively the FIRST call made — same fail-fast logic applies:
+        # skip Job A too rather than let it also fail identically.
+        if not job_b_attempted:
+            return _build_hard_failure_result(provider_label, response, str(e))
         job_c_error = f"AI cross-examination unavailable — {e}"
     except Exception as e:
         job_c_error = f"Unexpected error during AI cross-examination: {e}"
 
+    # Layer 7 score + the FINAL combined_score_with_ai — computed BEFORE Job
+    # A runs so its prompt (and required lead sentence) can reference the
+    # actual final numbers, not an intermediate/partial one.
     layer7_score = _compute_layer7_score(additional_findings_out, per_finding_verification, regions_out)
     score_calc = _compute_combined_score_with_ai(response, regions_out, per_finding_verification, layer7_score)
+    effective_threshold = cached.get("effective_threshold", THRESHOLD)
+    ai_adjusted_verdict = _compute_ai_adjusted_verdict(score_calc["combined_score_with_ai"], effective_threshold)
 
     # overall_assessment is NEVER used to auto-resolve/flip the verdict —
     # an explicit disagreement is only surfaced as a flag for a human to
@@ -431,8 +540,43 @@ async def ai_review(analysis_id: str):
         if ai_disagreement_flag else None
     )
 
+    # Job A — narrow input: the fields named in scope (layers, signals,
+    # fused_findings, suspicious_lines, numeric_anomalies, summary) PLUS —
+    # since this runs LAST, after B and C — their own results and the FINAL
+    # AI-adjusted score/verdict, so the explanation synthesizes all three
+    # jobs instead of confidently restating the pre-AI-review narrative.
+    analysis_summary = {
+        "verdict": response.verdict,
+        "combined_score": response.combined_score,
+        "confidence": response.confidence.dict(),
+        "layers": response.layers.dict(),
+        "signals": response.signals,
+        "fused_findings": [f.dict() for f in response.fused_findings],
+        "suspicious_lines": [s.dict() for s in response.suspicious_lines],
+        "numeric_anomalies": [n.dict() for n in response.numeric_anomalies],
+        "summary": response.summary,
+        "job_b_region_verdicts": regions_out,
+        "job_c_per_finding_verification": per_finding_verification,
+        "job_c_additional_findings": additional_findings_out,
+        "job_c_overall_assessment": overall_assessment,
+        "downweight_applied": score_calc["downweight_applied"],
+        "layer7_score": layer7_score,
+        "combined_score_with_ai": score_calc["combined_score_with_ai"],
+        "ai_adjusted_verdict": ai_adjusted_verdict,
+    }
+
+    explanation, explanation_prompt, explanation_error = None, None, None
+    try:
+        explanation, explanation_prompt = advisor.explain(analysis_summary)
+    except AIProviderRequestError as e:
+        explanation_error = str(e)
+    except Exception as e:
+        explanation_error = f"Unexpected error generating explanation: {e}"
+
     result = {
         "available": True,
+        "provider": provider_label,
+        "hard_failure": False,
         "explanation": explanation,
         "explanation_prompt": explanation_prompt,
         "explanation_error": explanation_error,
@@ -451,6 +595,7 @@ async def ai_review(analysis_id: str):
         "downweight_applied": score_calc["downweight_applied"],
         "combined_score": response.combined_score,
         "combined_score_with_ai": score_calc["combined_score_with_ai"],
+        "ai_adjusted_verdict": ai_adjusted_verdict,
         "from_cache": False,
     }
 

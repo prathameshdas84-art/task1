@@ -429,6 +429,11 @@ async def analyze_document(file: UploadFile = File(...)):
             "ocr_word_anomalies": ocr_word_anomalies,
             "overlay_regions": overlay_regions,
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
+            # Exposed for Layer 7 (api/ai_review_routes.py) so its AI-adjusted
+            # verdict label uses the SAME effective threshold (including any
+            # dynamic backdating adjustment combine() applied), not a
+            # re-derived approximation.
+            "effective_threshold": verdict_obj.effective_threshold,
         }
         # This path is now owned by the cache — the finally block below
         # must not delete it (see cached_pdf_path tracking there).

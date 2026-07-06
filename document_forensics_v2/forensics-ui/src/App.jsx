@@ -36,6 +36,21 @@ const SIGNAL_COLORS = {
   "[PYMUPDF]":  "#00ffcc",
 };
 
+// Renders **bold** markdown as real <strong> emphasis instead of literal
+// asterisks — the AI Review panel's own Gemini-generated text is the only
+// place in this app that produces markdown-style formatting, so a small
+// inline parser here is enough (no need for a full markdown library/dep).
+function renderInlineMarkdown(text) {
+  if (!text) return null;
+  const parts = String(text).split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
+
 export default function App() {
   const [file, setFile]             = useState(null);
   const [dragging, setDragging]     = useState(false);
@@ -645,9 +660,10 @@ export default function App() {
       "or AI systems participate in computing the verdict or combined_score.",
       "",
       "OPTIONAL AI REVIEW (LAYER 7): If \"Ask AI\" was used for this document,",
-      "Gemini contributes an ADDITIONAL, separate combined_score_with_ai —",
-      "shown only when explicitly requested below, and it never overwrites",
-      "or replaces the deterministic combined_score/verdict above.",
+      "the configured AI provider (Gemini or NVIDIA NIM) contributes an",
+      "ADDITIONAL, separate combined_score_with_ai — shown only when",
+      "explicitly requested below, and it never overwrites or replaces the",
+      "deterministic combined_score/verdict above.",
     ];
 
     disclaimer.forEach(line => {
@@ -667,7 +683,7 @@ export default function App() {
           <span className="logo">🔬</span>
           <div>
             <div className="title">Document Forensics Engine</div>
-            <div className="subtitle">Core 6-Layer Engine: Deterministic, No AI/ML · Optional AI Review (Layer 7): Gemini, Separate AI-Adjusted Score</div>
+            <div className="subtitle">Core 6-Layer Engine: Deterministic, No AI/ML · Optional AI Review (Layer 7): Gemini or NVIDIA NIM, Separate AI-Adjusted Score</div>
           </div>
         </div>
         <div className="header-badge">v2.0</div>
@@ -1740,9 +1756,10 @@ export default function App() {
                   🤖 Ask AI — Get AI Explanation
                 </div>
                 <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
-                  Optional, supplementary Gemini review — explains this result in plain
-                  English and computes a separate, clearly-labeled AI-adjusted score
-                  (Layer 7). Never overwrites the deterministic score/verdict above.
+                  Optional, supplementary AI review (Gemini or NVIDIA NIM, depending on
+                  configuration) — explains this result in plain English and computes a
+                  separate, clearly-labeled AI-adjusted score (Layer 7). Never overwrites
+                  the deterministic score/verdict above.
                 </div>
               </div>
               <button
@@ -1764,7 +1781,7 @@ export default function App() {
               padding: "18px 20px", textAlign: "center", color: "#64748b",
               background: "#f8fafc", fontSize: 13,
             }}>
-              ⏳ Asking Gemini for a plain-English explanation, region review, and independent page scan…
+              ⏳ Asking the AI review provider for a plain-English explanation, region review, and independent page scan…
             </div>
           )}
 
@@ -1801,17 +1818,39 @@ export default function App() {
               }}>
                 <span style={{ fontSize: 20 }}>🤖</span>
                 <div>
-                  <div style={{ fontWeight: 700, fontSize: 15 }}>AI REVIEW (Gemini) — Layer 7</div>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>
+                    AI REVIEW ({aiReview.provider || "Gemini"}) — Layer 7
+                  </div>
                   <div style={{ fontSize: 11.5, opacity: 0.85 }}>
                     AI-generated · contributes a separate, clearly-labeled AI-adjusted score ·
                     never overwrites the deterministic score/verdict above
-                    {aiReview.from_cache && " · cached result (not a fresh Gemini call)"}
+                    {aiReview.from_cache && ` · cached result (not a fresh ${aiReview.provider || "AI"} call)`}
                   </div>
                 </div>
               </div>
 
               <div style={{ padding: "18px 20px" }}>
-                {!aiReview.available ? (
+                {aiReview.hard_failure ? (
+                  <div>
+                    <div style={{
+                      border: "1px solid #fca5a5", background: "#fef2f2", color: "#991b1b",
+                      borderRadius: 8, padding: "14px 16px", fontSize: 13.5, fontWeight: 600,
+                      lineHeight: 1.5,
+                    }}>
+                      {aiReview.hard_failure_message}
+                    </div>
+                    <button
+                      onClick={requestAiReview}
+                      style={{
+                        marginTop: 12, background: "#1e293b", color: "#fff", border: "none",
+                        borderRadius: 8, padding: "10px 20px", fontWeight: 700,
+                        fontSize: 13, cursor: "pointer",
+                      }}
+                    >
+                      ↻ Retry AI Review
+                    </button>
+                  </div>
+                ) : !aiReview.available ? (
                   <div style={{ color: "#64748b", fontSize: 13 }}>
                     ℹ️ {aiReview.reason || "AI Review is not available in this environment."}
                   </div>
@@ -1870,9 +1909,21 @@ export default function App() {
                       Plain-English Explanation
                     </div>
                     {aiReview.explanation ? (
-                      <div style={{ fontSize: 13.5, color: "#334155", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
-                        {aiReview.explanation}
-                      </div>
+                      <>
+                        {aiReview.explanation.lead_sentence && (
+                          <div style={{
+                            fontSize: 16.5, fontWeight: 800, color: "#1e1b4b",
+                            lineHeight: 1.4, marginBottom: 12,
+                            padding: "10px 12px", background: "#eef2ff",
+                            borderLeft: "4px solid #4338ca", borderRadius: 4,
+                          }}>
+                            {renderInlineMarkdown(aiReview.explanation.lead_sentence)}
+                          </div>
+                        )}
+                        <div style={{ fontSize: 13.5, color: "#334155", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                          {renderInlineMarkdown(aiReview.explanation.detail)}
+                        </div>
+                      </>
                     ) : (
                       <div style={{ fontSize: 13, color: "#991b1b" }}>
                         ⚠️ {aiReview.explanation_error || "No explanation was returned."}
@@ -1907,7 +1958,7 @@ export default function App() {
                                 Engine finding: {r.engine_description}
                               </div>
                               <div style={{ color: "#334155" }}>
-                                Gemini: {r.reasoning}
+                                {aiReview.provider || "AI"}: {r.reasoning}
                               </div>
                             </div>
                           );
@@ -1934,8 +1985,8 @@ export default function App() {
                           ({aiReview.per_finding_verification.length})
                         </div>
                         {aiReview.per_finding_verification.map((v, i) => {
-                          const verdictColor = v.gemini_verdict === "contradicted" ? "#16a34a"
-                                             : v.gemini_verdict === "supported" ? "#dc2626"
+                          const verdictColor = v.verdict === "contradicted" ? "#16a34a"
+                                             : v.verdict === "supported" ? "#dc2626"
                                              : "#64748b";
                           return (
                             <div key={i} style={{
@@ -1945,13 +1996,13 @@ export default function App() {
                               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                                 <span style={{ color: "#475569" }}>layer: {v.layer}</span>
                                 <span style={{ color: verdictColor, fontWeight: 700 }}>
-                                  {v.gemini_verdict.toUpperCase()}
+                                  {v.verdict.toUpperCase()}
                                 </span>
                               </div>
                               <div style={{ color: "#94a3b8", marginBottom: 4 }}>
                                 Engine claimed: {v.engine_finding}
                               </div>
-                              <div style={{ color: "#334155" }}>Gemini: {v.reasoning}</div>
+                              <div style={{ color: "#334155" }}>{aiReview.provider || "AI"}: {v.reasoning}</div>
                             </div>
                           );
                         })}

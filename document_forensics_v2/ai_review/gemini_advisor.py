@@ -1,24 +1,34 @@
 """
-Gemini Advisor — opt-in, supplementary AI review.
+Gemini Advisor — opt-in, supplementary AI review. One of two interchangeable
+AI Review providers (see ai_review/nvidia_advisor.py for the other) selected
+via AI_REVIEW_PROVIDER — Gemini is the default when unset.
+
+Every provider implements the SAME three-method shape so api/ai_review_
+routes.py never needs to know which one is active:
+  explain(analysis_summary) -> ({"lead_sentence": str, "detail": str}, prompt)
+  review_regions(images: list) -> list                    # Job B, batched
+  independent_scan(page_images, analysis_summary) -> dict  # Job C
 
 Scope is three jobs:
-  Job A — explain the EXISTING 6-layer verdict in plain English. Never asked
-          to form its own opinion on whether the document is fake.
-  Job B — for regions the deterministic engine ALREADY flagged, look at just
-          that cropped image and say whether it reads as a template element
-          (logo/letterhead/watermark) or a possible edit. Never shown the
-          whole page, never asked to hunt for new anomalies. Regions are
-          labeled in ONE batched Gemini call (label_regions_batch) rather
-          than one HTTP call per region, to bound total call count against
-          rate limits — the original one-region-at-a-time label_region()
-          is kept as a thin wrapper around the batch call.
-  Job C — genuine cross-examination (cross_examine_findings), NOT
-          descriptive captioning and NOT passive agreement. Gemini is given
-          BOTH the rendered page image(s) AND the engine's own full
-          analysis JSON (verdict, layer scores, signals, suspicious lines,
-          numeric anomalies, ELA findings, fused findings, metadata) in ONE
-          request, and must: (1) independently verify each of the engine's
-          own findings against what's actually visible in the document —
+  Job A (explain) — explain the EXISTING 6-layer verdict (and, since it now
+          runs LAST, this SAME AI review's own Job B/C results) in plain
+          English. Never asked to form its own opinion on whether the
+          document is fake beyond synthesizing what B/C already found.
+  Job B (review_regions) — for regions the deterministic engine ALREADY
+          flagged, look at just that cropped image and say whether it reads
+          as a template element (logo/letterhead/watermark) or a possible
+          edit. Never shown the whole page, never asked to hunt for new
+          anomalies. Regions are labeled in ONE batched call rather than one
+          HTTP call per region, to bound total call count against rate
+          limits — the original one-region-at-a-time label_region() is kept
+          as a thin wrapper around the batch call.
+  Job C (independent_scan) — genuine cross-examination, NOT descriptive
+          captioning and NOT passive agreement. The model is given BOTH the
+          rendered page image(s) AND the engine's own full analysis JSON
+          (verdict, layer scores, signals, suspicious lines, numeric
+          anomalies, ELA findings, fused findings, metadata) in ONE request,
+          and must: (1) independently verify each of the engine's own
+          findings against what's actually visible in the document —
           "supported" / "contradicted" / "unverifiable", with specific
           reasoning, not a default rubber-stamp; (2) independently surface
           anything the engine missed; (3) give one overall independent
@@ -41,18 +51,36 @@ of them write back into a MetadataReport/ContentReport/etc. This module
 never computes or returns a combined score itself; main.py is responsible
 for translating Job B/C output into the SEPARATE combined_score_with_ai
 number, which never overwrites the deterministic combined_score.
+
+Retry/backoff/timeout handling is SHARED with every other AI Review
+provider via utils/ai_retry.py — only the request/response shape below
+(Gemini's native REST format) is provider-specific. GeminiNotConfigured/
+GeminiRequestError are aliases of the shared, provider-agnostic exception
+classes (not Gemini-specific subclasses), so api/ai_review_routes.py can
+catch exactly one exception type regardless of which provider is active.
 """
 
 import json
 import logging
 import os
-import time
 
 try:
     import requests
     _REQUESTS_AVAILABLE = True
 except ImportError:
     _REQUESTS_AVAILABLE = False
+
+from utils.ai_retry import (
+    AIProviderNotConfigured as GeminiNotConfigured,
+    AIProviderRequestError as GeminiRequestError,
+    post_with_retry,
+)
+from ai_review.shared_parsing import (
+    REGION_LABELS,
+    parse_explanation,
+    parse_region_batch,
+    parse_cross_examination,
+)
 
 logger = logging.getLogger("document_forensics")
 
@@ -66,26 +94,6 @@ GEMINI_API_BASE  = "https://generativelanguage.googleapis.com/v1beta/models"
 # verification + independent scan + verdict), so it gets a longer timeout.
 REQUEST_TIMEOUT_SECONDS       = 30
 JOB_C_REQUEST_TIMEOUT_SECONDS = 90
-
-# Retry/backoff for transient failures only — a 429 rate limit OR a request
-# timeout/connection error. Other 4xx/5xx are not retried since waiting
-# won't fix a bad key or a malformed request.
-MAX_RETRY_ATTEMPTS         = 3   # total attempts, including the first
-RETRY_BACKOFF_BASE_SECONDS = 2   # attempt N (1-indexed) waits BASE * 2**(N-1)s: 2s, 4s
-
-REGION_LABELS = ("template-element", "possible-edit", "uncertain")
-EDIT_CONFIDENCE_LABELS = ("low", "medium", "high")
-CROSS_EXAM_VERDICTS = ("supported", "contradicted", "unverifiable")
-
-
-class GeminiNotConfigured(Exception):
-    """No GEMINI_API_KEY is set — the caller should treat this as an
-    unavailable feature, not an error to surface as a crash."""
-
-
-class GeminiRequestError(Exception):
-    """The Gemini API call failed (network error, non-2xx response, or an
-    unparseable reply). Carries a short human-readable reason."""
 
 
 class GeminiAdvisor:
@@ -103,35 +111,71 @@ class GeminiAdvisor:
             )
         self.model = GEMINI_MODEL
 
-    # ── Job A — plain-English explanation of the EXISTING verdict ──────────────
+    # ── Job A — plain-English explanation, run LAST so it can synthesize
+    # Job B/C's own results rather than confidently restating a pre-AI-review
+    # narrative while they simultaneously contradict it ─────────────────────
 
-    def explain_report(self, analysis_summary: dict) -> tuple[str, str]:
+    def explain(self, analysis_summary: dict) -> tuple[dict, str]:
         """
-        analysis_summary is a narrow, pre-built dict — just the fields named
-        in scope (layers, signals, fused_findings, suspicious_lines,
-        numeric_anomalies, summary) — not the full raw API response, so the
-        prompt stays focused on explaining, not re-analyzing.
+        analysis_summary is a narrow, pre-built dict — the deterministic
+        findings (layers, signals, fused_findings, suspicious_lines,
+        numeric_anomalies, summary) PLUS, since Job A now runs AFTER Job B
+        and Job C, that SAME AI review's own results if present:
+        job_b_region_verdicts, job_c_per_finding_verification,
+        job_c_additional_findings, job_c_overall_assessment, the FINAL
+        combined_score_with_ai, and ai_adjusted_verdict (the verdict label
+        already computed FROM combined_score_with_ai, using the same
+        threshold logic as the deterministic engine — Job A is told to
+        state this given value, not compute its own).
 
-        Returns (explanation_text, prompt_sent) — the prompt is returned so
-        callers can log/display it for auditability.
+        Returns ({"lead_sentence": str, "detail": str}, prompt_sent) — the
+        prompt is returned so callers can log/display it for auditability.
+        A malformed reply degrades to {"lead_sentence": None, "detail":
+        <raw text>} rather than losing the explanation outright.
         """
         prompt = (
-            "You are explaining an ALREADY-COMPUTED forensic analysis result "
-            "to a non-technical reader. Do not contradict or second-guess the "
-            "verdict below. Do not introduce new evidence or suspicions of "
-            "your own. Explain the reasoning behind it in plain English: "
-            "translate z-scores, layer names, and technical jargon into "
-            "language a normal person can follow. Keep it to 3-6 short "
-            "paragraphs.\n\n"
-            "EXISTING ANALYSIS RESULT (verdict + supporting signals, computed "
-            "by a separate deterministic statistical engine — you are only "
-            "explaining it):\n"
-            f"{json.dumps(analysis_summary, indent=2, default=str)}"
+            "You are explaining an ALREADY-COMPUTED forensic analysis to a "
+            "non-technical reader. The JSON below includes the original "
+            "deterministic findings AND — since this AI review's own "
+            "region-verification and cross-examination jobs already ran — "
+            "their results too: job_b_region_verdicts (per-region template-"
+            "element/possible-edit calls), job_c_per_finding_verification "
+            "(supported/contradicted/unverifiable per engine finding), "
+            "job_c_additional_findings (things the engine missed), and "
+            "job_c_overall_assessment. combined_score_with_ai and "
+            "ai_adjusted_verdict already account for ALL of this.\n\n"
+            "CRITICAL: your first sentence MUST plainly state whether this "
+            "document is MODIFIED, ORIGINAL, or UNCERTAIN using EXACTLY the "
+            "ai_adjusted_verdict value and the combined_score_with_ai "
+            "number below — NOT the pre-AI-review combined_score. Do not "
+            "compute your own verdict or use your own judgment about the "
+            "threshold; state the verdict/score already given to you, "
+            "as the very first thing you say.\n\n"
+            "After that first sentence, explain the reasoning in plain "
+            "English: translate z-scores, layer names, and jargon. If "
+            "job_b_region_verdicts or job_c_per_finding_verification "
+            "contain any 'template-element' or 'contradicted' entries, "
+            "you MUST explicitly say so by name — e.g. 'our AI visual "
+            "review found that several flagged header regions are "
+            "actually standard template elements, not edits, which is "
+            "why the adjusted score differs from the original score.' Do "
+            "NOT silently restate the original findings list as if "
+            "nothing challenged them. Do not re-litigate or second-guess "
+            "the final numbers themselves — only explain how they were "
+            "reached. Keep the detail section to 3-6 short paragraphs.\n\n"
+            "EXISTING ANALYSIS + THIS AI REVIEW'S OWN RESULTS:\n"
+            f"{json.dumps(analysis_summary, indent=2, default=str)}\n\n"
+            "Respond with ONLY a JSON object (no markdown fences, no "
+            "prose) in EXACTLY this shape:\n"
+            '{"lead_sentence": "<the one required first sentence, stating '
+            'the final verdict/score>", "detail": "<3-6 short paragraphs '
+            'of supporting explanation; **bold** is fine for emphasis, no '
+            'other markdown>"}'
         )
         logger.info("gemini_advisor: Job A prompt sent:\n%s", prompt)
 
-        text = self._generate_text(prompt)
-        return text, prompt
+        raw = self._generate_text(prompt)
+        return parse_explanation(raw, provider_label="Gemini"), prompt
 
     # ── Job B — label ONE already-flagged region crop ──────────────────────────
 
@@ -174,7 +218,7 @@ class GeminiAdvisor:
     # ── Job B (batched) — label MULTIPLE already-flagged region crops in ONE
     # Gemini call instead of one HTTP call per region ───────────────────────
 
-    def label_regions_batch(self, images: list) -> list:
+    def review_regions(self, images: list) -> list:
         """
         images: list of PNG crop bytes, each ONE already-flagged region.
         Returns a list (same length/order as `images`) of
@@ -217,27 +261,12 @@ class GeminiAdvisor:
                            "reasoning": f"AI review unavailable for this item — {e}"}
             return [dict(unavailable) for _ in images]
 
-        parsed = self._parse_batch_json(raw, n)
-        out = []
-        for i in range(1, n + 1):
-            item = parsed.get(i)
-            if not item:
-                out.append({
-                    "label": "unavailable",
-                    "reasoning": "AI review unavailable for this item — no response returned.",
-                })
-                continue
-            label = item.get("label", "uncertain")
-            if label not in REGION_LABELS:
-                label = "uncertain"
-            reasoning = (item.get("reasoning") or "").strip()[:280] or "No reasoning returned."
-            out.append({"label": label, "reasoning": reasoning})
-        return out
+        return parse_region_batch(raw, n, provider_label="Gemini")
 
     # ── Job C — genuine cross-examination: the engine's OWN findings AND the
     # actual rendered pages, reasoned over together in ONE call. ────────────
 
-    def cross_examine_findings(self, page_images: list, analysis_summary: dict) -> dict:
+    def independent_scan(self, page_images: list, analysis_summary: dict) -> dict:
         """
         page_images: list of (page_number_1_indexed, png_bytes) — FULL page
         renders (never crops, unlike Job B).
@@ -306,7 +335,7 @@ class GeminiAdvisor:
             "prose) in EXACTLY this shape:\n"
             '{"per_finding_verification": [{"engine_finding": "<restate '
             'the specific claim>", "layer": "<metadata|content|ocr|'
-            'numeric|ela|pymupdf|xref|fusion>", "gemini_verdict": '
+            'numeric|ela|pymupdf|xref|fusion>", "verdict": '
             '"supported|contradicted|unverifiable", "reasoning": '
             '"<specific visual/textual evidence from the actual pages>"}, '
             '...],\n'
@@ -327,7 +356,7 @@ class GeminiAdvisor:
             parts.append(self._image_part(img))
 
         raw = self._generate(parts, timeout=JOB_C_REQUEST_TIMEOUT_SECONDS)
-        return self._parse_cross_examination(raw)
+        return parse_cross_examination(raw, provider_label="Gemini")
 
     # ── shared helpers ───────────────────────────────────────────────────────
 
@@ -338,104 +367,6 @@ class GeminiAdvisor:
             "mime_type": mime_type,
             "data": base64.b64encode(image_bytes).decode("ascii"),
         }}
-
-    @staticmethod
-    def _strip_json_fences(text: str) -> str:
-        t = (text or "").strip()
-        if t.startswith("```"):
-            t = t.split("\n", 1)[1] if "\n" in t else t.lstrip("`")
-            t = t.strip()
-            if t.endswith("```"):
-                t = t[:-3]
-        return t.strip()
-
-    def _parse_batch_json(self, raw: str, expected_n: int) -> dict:
-        """Returns {index: {"label": ..., "reasoning": ...}}. Best-effort —
-        never raises; malformed/missing entries are simply absent so the
-        caller fills them in as 'unavailable'."""
-        result = {}
-        try:
-            data = json.loads(self._strip_json_fences(raw))
-        except (ValueError, TypeError):
-            logger.warning("gemini_advisor: could not parse Job B batch JSON reply:\n%s", raw)
-            return result
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                idx = item.get("index")
-                if isinstance(idx, int) and 1 <= idx <= expected_n:
-                    result[idx] = item
-        return result
-
-    def _parse_cross_examination(self, raw: str) -> dict:
-        """Parses Job C's structured reply. Individual malformed per_finding_
-        verification/additional_findings entries are dropped (best-effort —
-        one bad item shouldn't lose the rest), but a response missing
-        overall_assessment entirely, or that isn't valid JSON, raises
-        GeminiRequestError — there's no meaningful partial result for "no
-        verdict at all"."""
-        try:
-            data = json.loads(self._strip_json_fences(raw))
-        except (ValueError, TypeError) as e:
-            logger.warning("gemini_advisor: could not parse Job C JSON reply:\n%s", raw)
-            raise GeminiRequestError(f"Could not parse cross-examination response: {e}")
-        if not isinstance(data, dict) or "overall_assessment" not in data:
-            raise GeminiRequestError("Cross-examination response is missing overall_assessment.")
-
-        verifications = []
-        for item in data.get("per_finding_verification", []) or []:
-            if not isinstance(item, dict):
-                continue
-            verdict = item.get("gemini_verdict", "unverifiable")
-            if verdict not in CROSS_EXAM_VERDICTS:
-                verdict = "unverifiable"
-            verifications.append({
-                "engine_finding": (item.get("engine_finding") or "").strip()[:400],
-                "layer": (item.get("layer") or "unknown").strip().lower(),
-                "gemini_verdict": verdict,
-                "reasoning": (item.get("reasoning") or "").strip()[:400],
-            })
-
-        additional = []
-        for item in data.get("additional_findings", []) or []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                page = int(item.get("page"))
-            except (TypeError, ValueError):
-                continue
-            bbox_px = item.get("bbox_px")
-            try:
-                bbox_px = [float(v) for v in bbox_px] if bbox_px else None
-                if bbox_px is not None and len(bbox_px) != 4:
-                    bbox_px = None
-            except (TypeError, ValueError):
-                bbox_px = None
-            confidence = item.get("confidence", "low")
-            if confidence not in EDIT_CONFIDENCE_LABELS:
-                confidence = "low"
-            additional.append({
-                "page": page,
-                "bbox_px": bbox_px,
-                "description": (item.get("description") or "").strip()[:300],
-                "confidence": confidence,
-            })
-
-        overall_raw = data.get("overall_assessment") or {}
-        agrees = overall_raw.get("agrees_with_engine_verdict", "inconclusive")
-        if agrees not in (True, False, "inconclusive"):
-            agrees = "inconclusive"
-        overall = {
-            "agrees_with_engine_verdict": agrees,
-            "reasoning": (overall_raw.get("reasoning") or "").strip()[:500],
-        }
-
-        return {
-            "per_finding_verification": verifications,
-            "additional_findings": additional,
-            "overall_assessment": overall,
-        }
 
     # ── Gemini REST call (plain HTTP via `requests` — already an installed
     # transitive dependency in this project; avoids pulling in the full
@@ -450,85 +381,34 @@ class GeminiAdvisor:
         return self._generate(parts, timeout=timeout)
 
     def _generate(self, parts: list, timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
-        """Core call shared by every job. Retries (MAX_RETRY_ATTEMPTS total,
-        exponential backoff) on a 429 rate limit AND on a transient request
-        timeout/connection error — a slow response shouldn't fail on the
-        first hit any more than a rate limit should. Other error statuses
-        (bad key, malformed request) are not retried since waiting won't fix
-        them. `timeout` is per-call so Job C's much larger full-page-image
-        payloads can use a longer budget than Job A/B's smaller ones."""
+        """Core call shared by every job. Retry/backoff/timeout handling is
+        delegated to utils.ai_retry.post_with_retry (shared with every other
+        AI Review provider) — only the request/response shape below (native
+        Gemini REST, not OpenAI-compatible) is Gemini-specific. `timeout` is
+        per-call so Job C's much larger full-page-image payloads can use a
+        longer budget than Job A/B's smaller ones."""
         url = f"{GEMINI_API_BASE}/{self.model}:generateContent"
-        retryable_error = None
+        resp = post_with_retry(
+            url,
+            params={"key": GEMINI_API_KEY},
+            json_body={"contents": [{"parts": parts}]},
+            timeout=timeout,
+            provider_label="Gemini API",
+        )
 
-        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-            try:
-                resp = requests.post(
-                    url,
-                    params={"key": GEMINI_API_KEY},
-                    json={"contents": [{"parts": parts}]},
-                    timeout=timeout,
+        try:
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                block_reason = data.get("promptFeedback", {}).get("blockReason")
+                raise GeminiRequestError(
+                    f"Gemini API returned no candidates"
+                    + (f" (blocked: {block_reason})" if block_reason else "")
                 )
-            except requests.Timeout:
-                retryable_error = GeminiRequestError(
-                    f"Gemini API request timed out after {timeout}s."
-                )
-                if attempt < MAX_RETRY_ATTEMPTS:
-                    wait = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-                    logger.info(
-                        "gemini_advisor: request timed out (attempt %d/%d), retrying in %ds",
-                        attempt, MAX_RETRY_ATTEMPTS, wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise retryable_error
-            except requests.ConnectionError as e:
-                retryable_error = GeminiRequestError(f"Network error calling Gemini API: {e}")
-                if attempt < MAX_RETRY_ATTEMPTS:
-                    wait = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-                    logger.info(
-                        "gemini_advisor: connection error (attempt %d/%d), retrying in %ds",
-                        attempt, MAX_RETRY_ATTEMPTS, wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise retryable_error
-            except requests.RequestException as e:
-                raise GeminiRequestError(f"Network error calling Gemini API: {e}")
-
-            if resp.status_code == 429:
-                retryable_error = GeminiRequestError(
-                    "Gemini API rate limit reached — try again shortly."
-                )
-                if attempt < MAX_RETRY_ATTEMPTS:
-                    wait = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-                    logger.info(
-                        "gemini_advisor: rate limited (attempt %d/%d), retrying in %ds",
-                        attempt, MAX_RETRY_ATTEMPTS, wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise retryable_error
-
-            if resp.status_code == 401 or resp.status_code == 403:
-                raise GeminiRequestError("Gemini API rejected the configured API key.")
-            if resp.status_code >= 400:
-                raise GeminiRequestError(f"Gemini API returned HTTP {resp.status_code}: {resp.text[:300]}")
-
-            try:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    block_reason = data.get("promptFeedback", {}).get("blockReason")
-                    raise GeminiRequestError(
-                        f"Gemini API returned no candidates"
-                        + (f" (blocked: {block_reason})" if block_reason else "")
-                    )
-                text_parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in text_parts).strip()
-                if not text:
-                    raise GeminiRequestError("Gemini API returned an empty response")
-                return text
-            except (KeyError, ValueError, IndexError) as e:
-                raise GeminiRequestError(f"Could not parse Gemini API response: {e}")
-
-        raise retryable_error
+            text_parts = candidates[0].get("content", {}).get("parts", [])
+            text = "".join(p.get("text", "") for p in text_parts).strip()
+            if not text:
+                raise GeminiRequestError("Gemini API returned an empty response")
+            return text
+        except (KeyError, ValueError, IndexError) as e:
+            raise GeminiRequestError(f"Could not parse Gemini API response: {e}")
