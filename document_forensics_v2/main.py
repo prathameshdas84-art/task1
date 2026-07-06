@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import io
-import json
 import os
 import re
 import tempfile
@@ -22,7 +21,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from analyzers.metadata_extractor import MetadataExtractor, PRODUCER_DB, _DB_PATH as _PRODUCER_DB_PATH
+from analyzers.metadata_extractor import MetadataExtractor
 from analyzers.content_analyzer import ContentAnalyzer
 from analyzers.ocr_analyzer import OCRAnalyzer
 from analyzers.numeric_analyzer import NumericAnalyzer
@@ -34,7 +33,7 @@ from fusion.verdict_engine import (
     CONFIDENCE_BASE, CONFIDENCE_DISTANCE_MULTIPLIER, CONFIDENCE_CAP,
 )
 from models import (
-    ForensicResponse, HealthResponse,
+    ForensicResponse,
     LayerScores, SuspiciousLine, NumericAnomaly, ConfidenceDetail,
     FullMetadata, FontDetail, PageDetail,
     FusedFindingModel, FusionStats, ContradictedFindingModel,
@@ -49,19 +48,7 @@ from utils.report_builders import (
 )
 from api.analysis_cache import _analysis_cache, MAX_CACHED_ANALYSES
 from api.ai_review_routes import router as ai_review_router
-
-# Top-level metadata (version/description) from producer_database.json —
-# metadata_extractor.PRODUCER_DB only exposes the flat "producers" list
-# (that's the shape _identify_source() needs), so these are read separately
-# for the /producers endpoint.
-try:
-    with open(_PRODUCER_DB_PATH, "r", encoding="utf-8") as _f:
-        _producer_db_raw = json.load(_f)
-    PRODUCER_DB_VERSION     = _producer_db_raw.get("version", "unknown")
-    PRODUCER_DB_DESCRIPTION = _producer_db_raw.get("description", "")
-except Exception:
-    PRODUCER_DB_VERSION     = "unknown"
-    PRODUCER_DB_DESCRIPTION = ""
+from api.system_routes import router as system_router
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 
@@ -96,37 +83,13 @@ app.add_middleware(
 )
 
 app.include_router(ai_review_router)
+app.include_router(system_router)
 
 # ── Supported file types ───────────────────────────────────────────────────────
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"}
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
-
-@app.get("/health", response_model=HealthResponse, tags=["System"])
-async def health():
-    """Check if the API is running."""
-    return HealthResponse(
-        status="ok",
-        version="1.0.0",
-        layers=["metadata", "content", "ocr", "numeric", "ela", "pymupdf"],
-    )
-
-
-@app.get("/producers", tags=["System"])
-async def list_producers():
-    """
-    Return the full producer/creator fingerprint database (from
-    producer_database.json) so callers can see what sources are recognized
-    and at what suspicion level, without reading the JSON file directly.
-    """
-    return {
-        "version": PRODUCER_DB_VERSION,
-        "description": PRODUCER_DB_DESCRIPTION,
-        "count": len(PRODUCER_DB),
-        "producers": PRODUCER_DB,
-    }
-
 
 @app.post("/analyze", response_model=ForensicResponse, tags=["Forensics"])
 async def analyze_document(file: UploadFile = File(...)):
