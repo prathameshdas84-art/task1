@@ -51,6 +51,231 @@ function renderInlineMarkdown(text) {
   });
 }
 
+// ── Image-document pipeline report (POST /analyze-image) ──────────────────
+// Card accent colors match the backend's annotated-overlay box colors per
+// evidence check (api/image_analysis_routes.py _CHECK_COLORS, BGR → hex).
+const IMAGE_CHECK_STYLE = {
+  check1_local_variance: { color: "#ff4444", label: "Inpaint smoothing" },
+  check5_edge_sharpness: { color: "#ffa500", label: "Overlay text edges" },
+  check6_copy_move:      { color: "#ff00ff", label: "Copy-move clone" },
+  check8_stamp_texture:  { color: "#4488ff", label: "Flat ink fill" },
+  check9_stamp_boundary: { color: "#ffdd00", label: "Cutout boundary" },
+};
+
+// "not_applicable" is deliberately NOT rendered like a clean result: the
+// engine's honesty design distinguishes "checked and found nothing" from
+// "this technique had nothing it could check" (e.g. a PNG with no JPEG
+// history to examine).
+const COMPRESSION_STYLE = {
+  single_compression:           { text: "Single compression — no resave detected", color: "#00cc66", checked: true },
+  double_compression_suspected: { text: "Double compression suspected — image was re-saved", color: "#ff4444", checked: true },
+  uncertain:                    { text: "Uncertain — signal too weak to call", color: "#ffaa00", checked: true },
+  not_applicable:               { text: "Couldn't check — no JPEG compression history in this container", color: "#8890a0", checked: false },
+};
+
+function ImageEvidencePanel({ title, src, note }) {
+  const [failed, setFailed] = useState(false);
+  return (
+    <div style={{ flex: "1 1 340px", minWidth: 280 }}>
+      <div className="section-title" style={{ marginBottom: 8 }}>{title}</div>
+      {failed ? (
+        <div className="empty-state">Image not available for this analysis</div>
+      ) : (
+        <img
+          src={src}
+          alt={title}
+          onError={() => setFailed(true)}
+          style={{ width: "100%", borderRadius: 8, border: "1px solid #333" }}
+        />
+      )}
+      {note && !failed && (
+        <div style={{ fontSize: "0.72rem", color: "#8890a0", marginTop: 6 }}>{note}</div>
+      )}
+    </div>
+  );
+}
+
+function ImageReport({ data }) {
+  const forensics = data.image_forensics || {};
+  const anomalies = forensics.anomalies || [];
+  const notImplemented = forensics.not_implemented || [];
+  const fused = data.fused_findings || [];
+  const compression = COMPRESSION_STYLE[forensics.compression_history]
+    || { text: forensics.compression_history, color: "#888", checked: true };
+
+  const verdictColor = data.verdict === "MODIFIED" ? "#ff4444"
+                     : data.verdict === "ORIGINAL" ? "#00cc66"
+                     : "#ff9800";
+  const verdictIcon = data.verdict === "MODIFIED" ? "⚠️"
+                    : data.verdict === "ORIGINAL" ? "✅"
+                    : "❓";
+
+  const flagBadge = (on, onLabel, offLabel) => (
+    <span style={{
+      fontSize: "0.72rem", fontWeight: 700, padding: "3px 10px", borderRadius: 12,
+      border: `1px solid ${on ? "#4488ff" : "#333"}`,
+      color: on ? "#88bbff" : "#666", whiteSpace: "nowrap",
+    }}>
+      {on ? onLabel : offLabel}
+    </span>
+  );
+
+  return (
+    <div className="results">
+      {/* Verdict banner — same visual language as the PDF report, with an
+          explicit pipeline badge so the source is never ambiguous. */}
+      <div className="verdict-banner" style={{ borderColor: verdictColor }}>
+        <div className="verdict-main">
+          <span className="verdict-icon">{verdictIcon}</span>
+          <span className="verdict-text" style={{ color: verdictColor }}>{data.verdict}</span>
+          <span style={{
+            marginLeft: 10, fontSize: "0.7rem", fontWeight: 700,
+            color: "#7dd3fc", border: "1px solid #0369a1",
+            borderRadius: 12, padding: "2px 10px", whiteSpace: "nowrap",
+          }}>
+            🖼️ Image Forensics
+          </span>
+        </div>
+        <div className="verdict-stats">
+          <div className="stat-item">
+            <div className="stat-label">Combined Score</div>
+            <div className="stat-value">{Number(data.combined_score).toFixed(1)}/100</div>
+          </div>
+          <div className="stat-divider" />
+          <div className="stat-item">
+            <div className="stat-label">Certainty</div>
+            <div className="stat-value">{data.confidence}%</div>
+          </div>
+          <div className="stat-divider" />
+          <div className="stat-item">
+            <div className="stat-label">Threshold</div>
+            <div className="stat-value">{data.effective_threshold}</div>
+          </div>
+          <div className="stat-divider" />
+          <div className="stat-item">
+            <div className="stat-label">Class</div>
+            <div className="stat-value">image document</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Detection flags + compression-history info row */}
+      <div className="section" style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+        {flagBadge(forensics.stamp_detected, "🖃 Stamp detected", "🖃 No stamp found")}
+        {flagBadge(forensics.signature_detected, "✍️ Signature detected", "✍️ No signature found")}
+        {flagBadge(forensics.is_born_digital, "💻 Born-digital image", "📷 Camera/scan image")}
+        <span style={{
+          fontSize: "0.75rem", padding: "3px 10px", borderRadius: 12,
+          border: compression.checked ? `1px solid ${compression.color}` : "1px dashed #555",
+          color: compression.color, fontStyle: compression.checked ? "normal" : "italic",
+        }}>
+          🗜️ {compression.text}
+        </span>
+        <span style={{ fontSize: "0.72rem", color: "#8890a0" }}>
+          JPEG history: {forensics.jpeg_history_detected ? "detected" : "none found"}
+        </span>
+      </div>
+
+      {/* Cross-validated fused findings, when 2+ checks agree on a region */}
+      {fused.length > 0 && (
+        <div className="fusion-section">
+          <div className="fusion-title">
+            🎯 Cross-Validated Findings (2+ checks agree)
+            <span className="badge">{fused.length}</span>
+          </div>
+          {fused.map((f, i) => (
+            <div key={i} className="finding-card red">
+              <div className="finding-header">
+                {f.confidence} · score {f.score} · {f.confirming_layers.join(" + ")}
+              </div>
+              <div className="finding-reason">{f.description}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Anomaly cards */}
+      <div className="section">
+        <div className="section-title">
+          🔎 Detected Anomalies
+          <span className="badge">{anomalies.length}</span>
+        </div>
+        {anomalies.length === 0 ? (
+          <div className="empty-state">
+            ✅ No tampering anomalies detected by the implemented checks
+            (see “Not Checked” below for techniques this engine does not run)
+          </div>
+        ) : (
+          anomalies.map((a, i) => {
+            const style = IMAGE_CHECK_STYLE[a.evidence_check] || { color: "#ff4444", label: a.evidence_check };
+            return (
+              <div key={i} className="finding-card" style={{ borderLeft: `3px solid ${style.color}` }}>
+                <div className="finding-header">
+                  <span style={{ color: style.color }}>{style.label}</span>
+                  {" · "}{a.type}{" · "}
+                  confidence {(a.confidence * 100).toFixed(0)}%
+                </div>
+                <div className="finding-reason">
+                  → {a.detail}
+                </div>
+                <div style={{ fontSize: "0.7rem", color: "#8890a0", marginTop: 4 }}>
+                  {a.evidence_check} · region x={a.bbox[0]}, y={a.bbox[1]}, {a.bbox[2]}×{a.bbox[3]}px
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* Evidence images */}
+      <div className="section">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
+          <ImageEvidencePanel
+            title="📍 Annotated Image"
+            src={`${API}${data.annotated_url}`}
+            note="Colored boxes mark each check's flagged regions (red: inpaint · orange: overlay edges · magenta: clone · blue: flat ink · yellow: cutout boundary)."
+          />
+          <ImageEvidencePanel
+            title="🌡️ Near-White Heatmap"
+            src={`${API}${data.heatmap_url}`}
+            note="Display-only evidence for a human reviewer (Check 10) — never a scoring input."
+          />
+        </div>
+      </div>
+
+      {/* Engine signals */}
+      {(data.signals || []).length > 0 && (
+        <div className="section">
+          <div className="section-title">⚡ Signals</div>
+          {data.signals.map((s, i) => (
+            <div key={i} className="finding-reason" style={{ padding: "3px 0" }}>{s}</div>
+          ))}
+        </div>
+      )}
+
+      {/* Not Checked — collapsed by default. An empty anomalies list is NOT
+          a clean bill of health on these techniques: the engine explicitly
+          does not attempt them, and says why. */}
+      <details className="section" style={{ border: "1px dashed #555", borderRadius: 8, padding: "10px 14px" }}>
+        <summary style={{ cursor: "pointer", fontWeight: 700, color: "#c0a060" }}>
+          🚫 Not Checked — {notImplemented.length} technique{notImplemented.length === 1 ? "" : "s"} this
+          engine explicitly does NOT run (expand for reasons)
+        </summary>
+        <div style={{ marginTop: 10 }}>
+          {notImplemented.map((n, i) => (
+            <div key={i} style={{ marginBottom: 10 }}>
+              <div style={{ fontWeight: 600, fontSize: "0.8rem", color: "#d0d0d0" }}>
+                {String(n.technique || "").replace(/_/g, " ")}
+              </div>
+              <div style={{ fontSize: "0.75rem", color: "#8890a0" }}>{n.reason}</div>
+            </div>
+          ))}
+        </div>
+      </details>
+    </div>
+  );
+}
+
 export default function App() {
   const [file, setFile]             = useState(null);
   const [dragging, setDragging]     = useState(false);
@@ -66,15 +291,45 @@ export default function App() {
   const [aiReviewLoading, setAiReviewLoading] = useState(false);
   const [aiReviewError, setAiReviewError]   = useState(null);
 
+  // Image-document pipeline (POST /analyze-image) — a SEPARATE upload path,
+  // not a replacement for /analyze. Its response shape differs from the PDF
+  // pipeline's (confidence is a plain int, anomalies carry [x,y,w,h] boxes,
+  // etc.), so the result lives in its own state var and renders through
+  // ImageReport — never through the PDF report tree.
+  const [uploadMode, setUploadMode]   = useState("pdf");   // "pdf" | "image"
+  const [imageResult, setImageResult] = useState(null);
+
+  // Mirrors the backend's own 400 rejections on /analyze-image so the user
+  // reads the same message whether the check fires client- or server-side.
+  const validateImageFile = (f) => {
+    const ext = (f.name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
+    if (ext === ".pdf") {
+      return "PDFs (including scanned PDFs) are analyzed by the PDF Document tab — this path is only for direct JPG/PNG uploads.";
+    }
+    if (![".jpg", ".jpeg", ".png"].includes(ext)) {
+      return `Unsupported file type '${ext}'. Supported here: .jpg, .jpeg, .png`;
+    }
+    return null;
+  };
+
+  const acceptFile = useCallback((f, mode) => {
+    if (!f) return;
+    if (mode === "image") {
+      const problem = validateImageFile(f);
+      if (problem) {
+        setFile(null); setError(problem);
+        return;
+      }
+    }
+    setFile(f); setResult(null); setImageResult(null); setError(null);
+    setHiddenTextData(null); setAiReview(null); setAiReviewError(null);
+  }, []);
+
   const onDrop = useCallback((e) => {
     e.preventDefault();
     setDragging(false);
-    const f = e.dataTransfer.files[0];
-    if (f) {
-      setFile(f); setResult(null); setError(null); setHiddenTextData(null);
-      setAiReview(null); setAiReviewError(null);
-    }
-  }, []);
+    acceptFile(e.dataTransfer.files[0], uploadMode);
+  }, [acceptFile, uploadMode]);
 
   const requestAiReview = async () => {
     if (!result?.analysis_id || aiReviewLoading) return;
@@ -108,6 +363,27 @@ export default function App() {
       setActiveTab("overview");
     } catch (err) {
       setError(err.response?.data?.detail || err.message || "Analysis failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const analyzeImage = async () => {
+    if (!file) return;
+    const problem = validateImageFile(file);
+    if (problem) { setError(problem); return; }
+    setLoading(true);
+    setImageResult(null);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const { data } = await axios.post(`${API}/analyze-image`, form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setImageResult(data);
+    } catch (err) {
+      setError(err.response?.data?.detail || err.message || "Image analysis failed");
     } finally {
       setLoading(false);
     }
@@ -716,6 +992,26 @@ export default function App() {
         <div className="header-badge">v2.0</div>
       </div>
 
+      {/* ── Upload mode toggle — routes to /analyze vs /analyze-image ── */}
+      <div className="tab-bar" style={{ marginBottom: 12 }}>
+        {[["pdf", "📄 PDF Document"], ["image", "🖼️ Image (ID Card / Stamp / Signature)"]].map(([mode, label]) => (
+          <button
+            key={mode}
+            className={`tab-btn ${uploadMode === mode ? "active" : ""}`}
+            onClick={() => {
+              if (uploadMode === mode) return;
+              setUploadMode(mode);
+              // A file picked for one pipeline may be invalid for the other
+              // (the image path takes only JPG/PNG) — clear it and any error
+              // so the dropzone always reflects the active mode's rules.
+              setFile(null); setError(null);
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       {/* ── Upload zone ── */}
       <div
         className={`dropzone ${dragging ? "dragging" : ""} ${file ? "has-file" : ""}`}
@@ -727,23 +1023,26 @@ export default function App() {
         <input
           id="fileInput"
           type="file"
-          accept=".pdf,.jpg,.jpeg,.png,.docx,.doc"
+          accept={uploadMode === "image" ? ".jpg,.jpeg,.png" : ".pdf,.jpg,.jpeg,.png,.docx,.doc"}
           style={{ display: "none" }}
           onChange={(e) => {
-            const f = e.target.files[0];
-            if (f) {
-              setFile(f); setResult(null); setError(null); setHiddenTextData(null);
-              setAiReview(null); setAiReviewError(null);
-            }
+            acceptFile(e.target.files[0], uploadMode);
+            e.target.value = "";  // allow re-picking the same filename
           }}
         />
         {file ? (
           <div className="file-info">
-            <span className="file-icon">📄</span>
+            <span className="file-icon">{uploadMode === "image" ? "🖼️" : "📄"}</span>
             <div>
               <div className="file-name">{file.name}</div>
               <div className="file-size">{(file.size / 1024).toFixed(1)} KB</div>
             </div>
+          </div>
+        ) : uploadMode === "image" ? (
+          <div className="drop-prompt">
+            <div className="drop-icon">🖼️</div>
+            <div className="drop-text">Drop a photographed ID, certificate, or stamped/signed document here</div>
+            <div className="drop-sub">or click to browse · JPG, PNG only — PDFs go to the PDF Document tab</div>
           </div>
         ) : (
           <div className="drop-prompt">
@@ -757,10 +1056,11 @@ export default function App() {
       {/* ── Analyze button ── */}
       <button
         className={`analyze-btn ${loading ? "loading" : ""}`}
-        onClick={analyze}
+        onClick={uploadMode === "image" ? analyzeImage : analyze}
         disabled={!file || loading}
       >
-        {loading ? "🔍 Analyzing..." : "🔬 Analyze Document"}
+        {loading ? "🔍 Analyzing..."
+          : uploadMode === "image" ? "🖼️ Analyze Image" : "🔬 Analyze Document"}
       </button>
 
       {/* ── Error ── */}
@@ -770,8 +1070,13 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Results ── */}
-      {result && (
+      {/* ── Image-pipeline results — rendered ONLY through ImageReport; the
+          response shape differs from the PDF pipeline's, so it must never
+          fall into the PDF report tree below. ── */}
+      {uploadMode === "image" && imageResult && <ImageReport data={imageResult} />}
+
+      {/* ── Results (PDF pipeline) ── */}
+      {uploadMode === "pdf" && result && (
         <div className="results">
 
           {/* Verdict banner — updates IN PLACE once AI review completes:
