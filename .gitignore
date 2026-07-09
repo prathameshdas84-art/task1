@@ -4,3 +4,5 @@
 .CLAUDE.md
 .mcp.json
 .venv
+# Environment files
+document_forensics_v2/.env
