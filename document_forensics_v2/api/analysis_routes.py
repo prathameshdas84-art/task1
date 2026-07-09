@@ -49,6 +49,18 @@ router = APIRouter()
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"}
 
+# ── Fusion escalation ──────────────────────────────────────────────────────────
+# A region confirmed by 2+ independent layers is exactly the evidence the
+# weighted per-layer sum under-counts: each layer's contribution was diluted
+# by its weight even though they corroborate each other at the SAME location.
+# When the verdict would otherwise be ORIGINAL, cross-validated fused
+# findings add a capped post-hoc boost (same pattern as the timeline and
+# contradiction adjustments). Documents already MODIFIED/UNCERTAIN are left
+# numerically untouched — fusion is surfaced there as display evidence, and
+# boosting them would re-tune every already-flagged document's score.
+FUSION_ESCALATION_POINTS = {"HIGH": 10, "MEDIUM": 5}
+FUSION_ESCALATION_CAP = 15
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.post("/analyze", response_model=ForensicResponse, tags=["Forensics"])
@@ -234,16 +246,6 @@ async def analyze_document(file: UploadFile = File(...)):
                 new_verdict = "UNCERTAIN"
             verdict_obj.verdict = new_verdict
 
-        # Gatekeeper — an ORIGINAL verdict means no layer accumulated enough
-        # evidence to call this document modified. Surfacing per-region
-        # location arrays anyway (a borderline ELA block, a lone OCR word
-        # anomaly that didn't move the score) draws false highlight boxes on
-        # a document the engine itself just called clean. Every coordinate-
-        # bearing list below is zeroed at the source so it can't reach
-        # either the JSON response or the annotation cache that
-        # /annotated-image reads from.
-        is_clean = verdict_obj.verdict == "ORIGINAL"
-
         # Recompute authenticity now that the cross-layer verdict exists — the
         # metadata-only score produced inside extract() can't see content/OCR/
         # numeric/ELA/PyMuPDF findings. Fold the combined score and verdict in.
@@ -266,21 +268,24 @@ async def analyze_document(file: UploadFile = File(...)):
             "xref":     verdict_obj.xref_score,
         }
 
-        # Build confidence detail — all gated to [] when is_clean, so every
-        # consumer below (fusion, the response payload, and the annotation
-        # cache) sees the same suppressed state.
-        suspicious_lines = [] if is_clean else (content_report.suspicious_lines if content_report else [])
-        numeric_anomalies = [] if is_clean else (numeric_report.anomalies if numeric_report else [])
-        ela_regions = [] if is_clean else (ela_report.regions if ela_report else [])
-        ocr_word_anomalies = [] if is_clean else (ocr_report.word_anomalies if ocr_report else [])
-        overlay_regions = [] if is_clean else (pymupdf_report.overlay_regions if pymupdf_report else [])
+        # RAW per-layer findings — extracted BEFORE any verdict-based gate.
+        # Fusion's whole purpose is cross-validating layers that individually
+        # scored too low to flip the verdict; gating these lists on the
+        # verdict first (as this route used to) fed fusion empty lists for
+        # every ORIGINAL document, making it inert exactly where it matters.
+        # The clean-document suppression gate now runs AFTER fusion (below).
+        suspicious_lines = content_report.suspicious_lines if content_report else []
+        numeric_anomalies = numeric_report.anomalies if numeric_report else []
+        ela_regions = ela_report.regions if ela_report else []
+        ocr_word_anomalies = ocr_report.word_anomalies if ocr_report else []
+        overlay_regions = pymupdf_report.overlay_regions if pymupdf_report else []
 
         # Metadata is a document-level signal with no bbox, so on its own it can
         # never fuse spatially. Represent a flagged metadata report as a global
         # page-1 pseudo-finding so it can cross-validate any location-based
         # anomaly (a metadata edit trace + a visual/content anomaly is strong).
         metadata_findings = []
-        if not is_clean and meta_report and meta_report.anomaly_score >= 30:
+        if meta_report and meta_report.anomaly_score >= 30:
             metadata_findings.append({
                 "layer": "metadata",
                 "page": 0,  # 0-indexed; surfaces as page 1 in the response
@@ -292,7 +297,7 @@ async def analyze_document(file: UploadFile = File(...)):
         # pseudo-finding too, but only when the metadata layer independently
         # has anomalies of its own — a timeline mismatch alone (clean
         # metadata otherwise) isn't corroborated by anything to fuse with.
-        if not is_clean and timeline_score > 0 and meta_report and meta_report.anomaly_score > 0:
+        if timeline_score > 0 and meta_report and meta_report.anomaly_score > 0:
             metadata_findings.append({
                 "layer": "metadata",
                 "page": 0,
@@ -300,9 +305,28 @@ async def analyze_document(file: UploadFile = File(...)):
                 "text": "; ".join(timeline_signals[:3]),
             })
 
-        # Cross-layer signal fusion — surface regions confirmed by 2+ layers as
-        # an ADDITIONAL high-confidence view. This does not suppress the
-        # per-layer markings drawn on the annotated image.
+        # OCR pixel-profiling anomalies (Upgrade 1) are raw OCR-layer findings
+        # with page+bbox, but they were never handed to fusion — only word-level
+        # anomalies were, so e.g. a content-layer font mismatch and a pixel-level
+        # size/color anomaly on the SAME line could never corroborate each other.
+        # They enter as layer "ocr" (they ARE the OCR layer's findings) through
+        # fuse()'s pre-normalized extra_findings input.
+        def _pf(a, key, default=None):
+            return a.get(key, default) if isinstance(a, dict) else getattr(a, key, default)
+        ocr_pixel_findings = [
+            {
+                "layer": "ocr",
+                "page": _pf(a, "page", 0),
+                "bbox": tuple(_pf(a, "bbox")) if _pf(a, "bbox") else None,
+                "text": _pf(a, "word"),
+                "score": (_pf(a, "confidence", 0) or 0) / 100,
+            }
+            for a in ((ocr_report.pixel_anomalies if ocr_report else None) or [])
+        ]
+
+        # Cross-layer signal fusion — regions confirmed by 2+ layers. Besides
+        # being surfaced in the response, cross-validated findings can now
+        # escalate a borderline ORIGINAL verdict (see escalation block below).
         fusion_engine = SignalFusion()
         fused_findings, fusion_stats = fusion_engine.fuse(
             suspicious_lines=suspicious_lines,
@@ -311,6 +335,7 @@ async def analyze_document(file: UploadFile = File(...)):
             ocr_regions=ocr_word_anomalies,
             overlay_regions=overlay_regions,
             metadata_findings=metadata_findings,
+            extra_findings=ocr_pixel_findings,
         )
 
         # Contradiction-aware fusion (Phase 1, additive) — a finding from one
@@ -367,6 +392,52 @@ async def analyze_document(file: UploadFile = File(...)):
                 layer_scores["ela"]      = verdict_obj.ela_score
                 layer_scores["ocr"]      = verdict_obj.ocr_score
                 layer_scores["pymupdf"]  = verdict_obj.pymupdf_score
+
+        # Fusion escalation — runs LAST among the verdict adjustments, after
+        # contradictions have already knocked down anything structurally
+        # undermined, and ONLY for documents still scored ORIGINAL (see the
+        # constants' comment at the top of this module for why flagged
+        # documents are left numerically untouched).
+        if verdict_obj.verdict == "ORIGINAL" and fused_findings:
+            fusion_boost = min(
+                FUSION_ESCALATION_CAP,
+                sum(FUSION_ESCALATION_POINTS.get(f.confidence, 0) for f in fused_findings),
+            )
+            if fusion_boost > 0:
+                verdict_obj.combined_score = round(
+                    min(100, verdict_obj.combined_score + fusion_boost), 1
+                )
+                distance = abs(verdict_obj.combined_score - verdict_obj.effective_threshold)
+                verdict_obj.confidence = min(
+                    CONFIDENCE_CAP, CONFIDENCE_BASE + int(distance * CONFIDENCE_DISTANCE_MULTIPLIER)
+                )
+                new_verdict = "MODIFIED" if verdict_obj.combined_score >= verdict_obj.effective_threshold else "ORIGINAL"
+                if abs(verdict_obj.combined_score - verdict_obj.effective_threshold) <= UNCERTAIN_BAND:
+                    new_verdict = "UNCERTAIN"
+                verdict_obj.verdict = new_verdict
+                verdict_obj.all_signals = (verdict_obj.all_signals or []) + [
+                    f"[FUSION]   {len(fused_findings)} region(s) independently flagged by 2+ layers "
+                    f"— cross-validated agreement added +{fusion_boost} to the combined score"
+                ]
+
+        # Gatekeeper — a document whose FINAL verdict (after fusion had its
+        # chance to cross-validate and escalate) is still ORIGINAL means no
+        # accumulation of evidence called it modified. Surfacing per-region
+        # location arrays anyway (a borderline ELA block, a lone OCR word
+        # anomaly that didn't move the score) draws false highlight boxes on
+        # a document the engine itself just called clean. Every coordinate-
+        # bearing list below is zeroed so it can't reach the JSON response or
+        # the annotation cache that /annotated-image reads from.
+        # fusion_stats stays truthful (counts of what fusion actually saw).
+        is_clean = verdict_obj.verdict == "ORIGINAL"
+        if is_clean:
+            suspicious_lines = []
+            numeric_anomalies = []
+            ela_regions = []
+            ocr_word_anomalies = []
+            overlay_regions = []
+            fused_findings = []
+            contradicted_findings = []
 
         confidence = build_confidence_detail(
             verdict=verdict_obj.verdict,
