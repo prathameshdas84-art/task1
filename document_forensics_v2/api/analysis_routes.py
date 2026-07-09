@@ -86,14 +86,45 @@ async def analyze_document(file: UploadFile = File(...)):
         # original file) — that round-trip loses fine detail this layer
         # can otherwise use directly.
         direct_image_ocr = None
+        image_px_size = None  # (width, height) of the original upload, pixels
         if ext in (".jpg", ".jpeg", ".png"):
             try:
                 direct_image_ocr = OCRAnalyzer().analyze_image(tmp_path)
+                from PIL import Image as PILImage
+                with PILImage.open(tmp_path) as _im:
+                    image_px_size = _im.size
             except Exception:
                 direct_image_ocr = None
 
         # Convert to PDF if needed
         pdf_path = convert_to_pdf(tmp_path, file.filename)
+
+        # Direct-image OCR bboxes are in the ORIGINAL image's pixel space,
+        # but every downstream consumer (signal fusion's spatial matching,
+        # /annotated-image's box drawing, the response payload) works in
+        # the converted PDF's point space. Rescale here, at the source —
+        # unconverted pixel coords land outside the PDF page for any image
+        # wider than the page, which used to invert the drawn rectangle
+        # and 500 the /annotated-image endpoint.
+        if direct_image_ocr is not None and image_px_size:
+            try:
+                import fitz
+                _doc = fitz.open(pdf_path)
+                _rect = _doc[0].rect
+                _doc.close()
+                # insert_image keeps the aspect ratio (keep_proportion) and
+                # centers the image in the page rect — uniform scale plus a
+                # centering offset, NOT independent x/y stretch.
+                s = min(_rect.width / image_px_size[0],
+                        _rect.height / image_px_size[1])
+                ox = (_rect.width - image_px_size[0] * s) / 2
+                oy = (_rect.height - image_px_size[1] * s) / 2
+                for _a in direct_image_ocr.word_anomalies:
+                    x0, y0, x1, y1 = _a.bbox
+                    _a.bbox = (ox + x0 * s, oy + y0 * s,
+                               ox + x1 * s, oy + y1 * s)
+            except Exception:
+                pass
 
         # Run all 5 layers
         try:

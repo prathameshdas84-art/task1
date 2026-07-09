@@ -386,6 +386,13 @@ class LocationHighlighter:
         Converts PDF points (top-left origin) to pixels (top-left origin).
         """
         x0, y0, x1, y1 = bbox
+        # Normalize ordering — PIL's rectangle() raises on x1<x0 / y1<y0,
+        # and a single malformed bbox from any layer would 500 the whole
+        # annotated-image request.
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
 
         # PDF uses top-left origin (pdfplumber) — convert to pixels directly
         px0 = int(x0 * self.scale)
@@ -399,6 +406,9 @@ class LocationHighlighter:
         py0 = max(0, py0 - pad)
         px1 = min(img_size[0], px1 + pad)
         py1 = py1 + pad
+        # A bbox lying fully off the page's right edge inverts after the
+        # clamp above — collapse it to a zero-width box instead of crashing.
+        px0 = min(px0, px1)
 
         # Draw rectangle outline
         for i in range(thickness):
