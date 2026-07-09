@@ -128,7 +128,8 @@ class SignalFusion:
              ela_regions: list = None,
              ocr_regions: list = None,
              overlay_regions: list = None,
-             metadata_findings: list = None) -> Tuple[List[FusedFinding], dict]:
+             metadata_findings: list = None,
+             extra_findings: list = None) -> Tuple[List[FusedFinding], dict]:
         """
         Returns:
         - List of high-confidence FusedFinding objects
@@ -139,6 +140,14 @@ class SignalFusion:
         is treated as a GLOBAL page signal that can cross-validate ANY
         location-based finding (see _findings_match). This lets a metadata
         anomaly + one visual/content anomaly form a high-confidence pair.
+
+        extra_findings: optional list of ALREADY-normalized finding dicts
+        (each carrying its own "layer"/"page"/"bbox"/"score"/"text") appended
+        verbatim to the grouping pass. This is how the image-document pipeline
+        (analyzers/image_document_analyzer.py) participates: each of its
+        checks enters as its own layer, so two checks co-locating on the same
+        region cross-validate through the exact same 2+-layer agreement logic
+        as the PDF layers — no special-casing here.
         """
 
         # Step 1: Normalize all findings to a common format
@@ -203,6 +212,20 @@ class SignalFusion:
                 "text": None,
                 "score": 1.0,
                 "raw": ov,
+            })
+
+        # Pre-normalized findings from the image-document pipeline (or any
+        # future caller) — appended as-is; each dict already carries its
+        # own layer name.
+        for ef in (extra_findings or []):
+            all_findings.append({
+                "layer": ef.get("layer", "image"),
+                "page": ef.get("page", 0),
+                "bbox": tuple(ef["bbox"]) if ef.get("bbox") else None,
+                "line_num": ef.get("line_num"),
+                "text": ef.get("text"),
+                "score": ef.get("score", 0) or 0,
+                "raw": ef.get("raw", ef),
             })
 
         # Metadata findings: document-level, no bbox/line_num. Normalized to the

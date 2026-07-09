@@ -18,6 +18,14 @@ WEIGHTS = {
     "scanned":        {"metadata": 0.15, "content": 0.05, "ocr": 0.45, "numeric": 0.10, "ela": 0.15, "pymupdf": 0.10},
     "mixed":          {"metadata": 0.20, "content": 0.15, "ocr": 0.20, "numeric": 0.15, "ela": 0.20, "pymupdf": 0.10},
     "scanned_native": {"metadata": 0.15, "content": 0.05, "ocr": 0.40, "numeric": 0.15, "ela": 0.15, "pymupdf": 0.10},
+    # Direct image uploads (POST /analyze-image) — a single image has NO
+    # PDF structure, so every PDF layer's weight is 0 and the dedicated
+    # image_document_analyzer carries the whole score. Sums to 1.0 like
+    # every other row; the existing rows above are untouched. The
+    # per-CHECK weighting inside that single layer lives in
+    # analyzers/image_document_analyzer.CHECK_POINTS (edge sharpness and
+    # variance smoothing weighted highest — see the honesty note there).
+    "image_document": {"metadata": 0.00, "content": 0.00, "ocr": 0.00, "numeric": 0.00, "ela": 0.00, "pymupdf": 0.00, "image_forensics": 1.00},
 }
 
 THRESHOLD = 20   # combined score >= 20 → MODIFIED (default for most pdf_types)
@@ -41,6 +49,7 @@ THRESHOLDS = {
     "scanned":         SCANNED_THRESHOLD,
     "mixed":          THRESHOLD,
     "scanned_native": THRESHOLD,
+    "image_document": THRESHOLD,
 }
 
 

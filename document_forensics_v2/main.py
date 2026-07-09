@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.ai_review_routes import router as ai_review_router
 from api.system_routes import router as system_router
 from api.analysis_routes import router as analysis_router
+from api.image_analysis_routes import router as image_analysis_router
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 
@@ -51,3 +52,4 @@ app.add_middleware(
 app.include_router(ai_review_router)
 app.include_router(system_router)
 app.include_router(analysis_router)
+app.include_router(image_analysis_router)
