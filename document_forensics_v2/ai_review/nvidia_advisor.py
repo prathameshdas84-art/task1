@@ -4,10 +4,10 @@ Review provider to Gemini (ai_review/gemini_advisor.py), selected via
 AI_REVIEW_PROVIDER=nvidia (Gemini stays the default when AI_REVIEW_PROVIDER
 is unset — this file changes nothing about existing Gemini-only setups).
 
-Implements the SAME three-method shared interface as GeminiAdvisor so
+Implements the SAME two-method shared interface as GeminiAdvisor so
 api/ai_review_routes.py never needs to know which provider answered:
-  explain(analysis_summary) -> ({"lead_sentence": str, "detail": str}, prompt)
-  review_regions(images: list) -> list                    # Job B, batched
+  review_and_explain(images, analysis_summary)
+      -> (regions: list, {"lead_sentence": str, "detail": str}, prompt)
   independent_scan(page_images, analysis_summary) -> dict  # Job C
 
 Uses NVIDIA NIM's OpenAI-compatible endpoint (base_url
@@ -16,21 +16,23 @@ https://integrate.api.nvidia.com/v1, POST /chat/completions) via plain
 for a single POST. Two models, picked from NVIDIA's catalog at
 build.nvidia.com/models (current as of implementation; both overridable
 via env vars in case the catalog changes before you read this):
-  - NVIDIA_MODEL_TEXT (Job A, text-only reasoning): defaults to
+  - NVIDIA_MODEL_TEXT (text-only reasoning; used by the merged call only
+    when there are NO region crops to attach): defaults to
     "nvidia/nemotron-3-super-120b-a12b" — a Nemotron reasoning model, run
-    with enable_thinking=False for Job A so the response is a clean JSON
-    object rather than chain-of-thought preamble plus JSON.
-  - NVIDIA_MODEL_VISION (Job B/C, image understanding): defaults to
+    with enable_thinking=False so the response is a clean JSON object
+    rather than chain-of-thought preamble plus JSON.
+  - NVIDIA_MODEL_VISION (image understanding — the merged region-review +
+    explanation call with crops attached, and Job C): defaults to
     "nvidia/nemotron-nano-12b-v2-vl" — Nemotron Nano 12B v2 VL, explicitly
     documented in NVIDIA's catalog for multi-image reasoning and document
     intelligence (invoices, receipts, forms, visual Q&A), not a
     video-focused model.
 
-Retry/backoff/timeout handling and Job A/B/C JSON-contract parsing are
-SHARED with gemini_advisor.py via utils/ai_retry.py and
-ai_review/shared_parsing.py respectively — only the request/response
-transport shape below (OpenAI-compatible chat completions) is
-NVIDIA-specific. NvidiaNotConfigured/NvidiaRequestError are aliases of the
+Retry/backoff/timeout handling, JSON-contract parsing, AND the merged
+call's prompt text are SHARED with gemini_advisor.py via utils/ai_retry.py,
+ai_review/shared_parsing.py, and ai_review/shared_prompts.py respectively —
+only the request/response transport shape below (OpenAI-compatible chat
+completions) is NVIDIA-specific. NvidiaNotConfigured/NvidiaRequestError are aliases of the
 shared, provider-agnostic exception classes (not NVIDIA-specific
 subclasses), so api/ai_review_routes.py catches exactly one exception type
 regardless of which provider is active.
@@ -53,10 +55,10 @@ from utils.ai_retry import (
     post_with_retry,
 )
 from ai_review.shared_parsing import (
-    parse_explanation,
-    parse_region_batch,
+    parse_review_and_explanation,
     parse_cross_examination,
 )
+from ai_review.shared_prompts import build_review_and_explain_prompt as _build_review_and_explain_prompt
 
 logger = logging.getLogger("document_forensics")
 
@@ -65,17 +67,19 @@ NVIDIA_MODEL_TEXT   = os.environ.get("NVIDIA_MODEL_TEXT", "nvidia/nemotron-3-sup
 NVIDIA_MODEL_VISION = os.environ.get("NVIDIA_MODEL_VISION", "nvidia/nemotron-nano-12b-v2-vl").strip()
 NVIDIA_API_BASE     = "https://integrate.api.nvidia.com/v1"
 
-REQUEST_TIMEOUT_SECONDS       = 30
-JOB_C_REQUEST_TIMEOUT_SECONDS = 90
+REQUEST_TIMEOUT_SECONDS        = 30
+MERGED_REQUEST_TIMEOUT_SECONDS = 60
+JOB_C_REQUEST_TIMEOUT_SECONDS  = 90
 
-# Explicit per-job output budgets — the OpenAI chat completions spec
+# Explicit per-call output budgets — the OpenAI chat completions spec
 # doesn't guarantee a generous default if max_tokens is omitted, unlike
-# Gemini's REST API. Job C gets the most since cross-examining every
-# distinct engine finding across up to 5 pages can produce a large JSON
-# array.
-JOB_A_MAX_TOKENS = 2048
-JOB_B_MAX_TOKENS = 3072
-JOB_C_MAX_TOKENS = 8192
+# Gemini's REST API. The merged region-review + explanation call has to
+# fit region verdicts AND a multi-paragraph explanation in one reply
+# (roughly the former Job A + Job B budgets combined). Job C gets the
+# most since cross-examining every distinct engine finding across up to
+# 5 pages can produce a large JSON array.
+MERGED_MAX_TOKENS = 5120
+JOB_C_MAX_TOKENS  = 8192
 
 
 class NvidiaAdvisor:
@@ -92,103 +96,38 @@ class NvidiaAdvisor:
                 "unavailable until this environment variable is configured."
             )
 
-    # ── Job A — plain-English explanation, run LAST (by the caller) so it
-    # can synthesize Job B/C's own results — same contract as Gemini's ────
+    # ── Merged region-review + explanation — former Job A + Job B in ONE
+    # call, same contract as Gemini's review_and_explain ────────────────────
 
-    def explain(self, analysis_summary: dict) -> tuple:
-        """Same contract as GeminiAdvisor.explain(): analysis_summary may
-        include job_b_region_verdicts/job_c_per_finding_verification/
-        job_c_additional_findings/job_c_overall_assessment/
-        combined_score_with_ai/ai_adjusted_verdict if this AI review's Job
-        B/C already ran. Returns ({"lead_sentence": str, "detail": str},
-        prompt_sent)."""
-        prompt = (
-            "You are explaining an ALREADY-COMPUTED forensic analysis to a "
-            "non-technical reader. The JSON below includes the original "
-            "deterministic findings AND — since this AI review's own "
-            "region-verification and cross-examination jobs already ran — "
-            "their results too: job_b_region_verdicts (per-region template-"
-            "element/possible-edit calls), job_c_per_finding_verification "
-            "(supported/contradicted/unverifiable per engine finding), "
-            "job_c_additional_findings (things the engine missed), and "
-            "job_c_overall_assessment. combined_score_with_ai and "
-            "ai_adjusted_verdict already account for ALL of this.\n\n"
-            "CRITICAL: your first sentence MUST plainly state whether this "
-            "document is MODIFIED, ORIGINAL, or UNCERTAIN using EXACTLY the "
-            "ai_adjusted_verdict value and the combined_score_with_ai "
-            "number below — NOT the pre-AI-review combined_score. Do not "
-            "compute your own verdict or use your own judgment about the "
-            "threshold; state the verdict/score already given to you, "
-            "as the very first thing you say.\n\n"
-            "After that first sentence, explain the reasoning in plain "
-            "English: translate z-scores, layer names, and jargon. If "
-            "job_b_region_verdicts or job_c_per_finding_verification "
-            "contain any 'template-element' or 'contradicted' entries, "
-            "you MUST explicitly say so by name — e.g. 'our AI visual "
-            "review found that several flagged header regions are "
-            "actually standard template elements, not edits, which is "
-            "why the adjusted score differs from the original score.' Do "
-            "NOT silently restate the original findings list as if "
-            "nothing challenged them. Do not re-litigate or second-guess "
-            "the final numbers themselves — only explain how they were "
-            "reached. Keep the detail section to 3-6 short paragraphs.\n\n"
-            "EXISTING ANALYSIS + THIS AI REVIEW'S OWN RESULTS:\n"
-            f"{json.dumps(analysis_summary, indent=2, default=str)}\n\n"
-            "Respond with ONLY a JSON object (no markdown fences, no "
-            "prose) in EXACTLY this shape:\n"
-            '{"lead_sentence": "<the one required first sentence, stating '
-            'the final verdict/score>", "detail": "<3-6 short paragraphs '
-            'of supporting explanation; **bold** is fine for emphasis, no '
-            'other markdown>"}'
-        )
-        logger.info("nvidia_advisor: Job A prompt sent:\n%s", prompt)
+    def review_and_explain(self, images: list, analysis_summary: dict) -> tuple:
+        """Same contract as GeminiAdvisor.review_and_explain(): images is a
+        list of PNG crop bytes, each ONE already-flagged region (may be
+        empty — explanation-only); analysis_summary carries the
+        deterministic findings plus Job C's results when the caller ran
+        the independent scan first. Returns (regions, explanation,
+        prompt_sent). Raises NvidiaRequestError only if the call fails
+        outright — a malformed reply degrades per-half instead.
 
-        raw = self._chat_text(prompt, max_tokens=JOB_A_MAX_TOKENS, timeout=REQUEST_TIMEOUT_SECONDS)
-        return parse_explanation(raw, provider_label="NVIDIA NIM"), prompt
-
-    # ── Job B (batched) — label MULTIPLE already-flagged region crops in
-    # ONE call, same contract as Gemini's review_regions ────────────────────
-
-    def review_regions(self, images: list) -> list:
-        """Same contract as GeminiAdvisor.review_regions(): images is a
-        list of PNG crop bytes, each ONE already-flagged region. Returns a
-        list (same length/order) of {"label": ..., "reasoning": ...}. A
-        batch-level failure marks EVERY region "unavailable" rather than
-        raising past this call."""
-        if not images:
-            return []
+        Uses the vision model when crops are attached; falls back to the
+        text model for an explanation-only call (no images to reason
+        over, and the text model is the stronger pure-reasoner)."""
         n = len(images)
-        prompt = (
-            f"You will be shown {n} cropped regions from a document, each "
-            "already flagged by an automated forensic tool as unusual. Each "
-            "crop is preceded by a line reading 'REGION <n>:'. For EACH "
-            "region independently, decide: does it look like a repeating "
-            "template element (a logo, letterhead, watermark, or standard "
-            "printed header/footer) or does it look like inserted/edited "
-            "content (retyped text, a pasted-in block, an obvious visual "
-            "seam)? Judge each region using ONLY what is visible in that "
-            "region's own crop — do not guess about the rest of the "
-            "document, and do not let one region's verdict influence "
-            "another's.\n\n"
-            "Respond with ONLY a JSON array (no markdown fences, no prose), "
-            "one object per region, in this exact shape:\n"
-            '[{"index": 1, "label": "template-element|possible-edit|uncertain", '
-            '"reasoning": "one sentence"}, ...]\n'
-            f"Return exactly {n} objects, with \"index\" values 1 through {n}."
-        )
-        content = [{"type": "text", "text": prompt}]
-        for i, img in enumerate(images, start=1):
-            content.append({"type": "text", "text": f"REGION {i}:"})
-            content.append(self._image_content(img))
+        prompt = _build_review_and_explain_prompt(n, analysis_summary)
+        logger.info("nvidia_advisor: merged review+explanation prompt sent:\n%s", prompt)
 
-        try:
-            raw = self._chat_vision(content, max_tokens=JOB_B_MAX_TOKENS, timeout=REQUEST_TIMEOUT_SECONDS)
-        except NvidiaRequestError as e:
-            unavailable = {"label": "unavailable",
-                           "reasoning": f"AI review unavailable for this item — {e}"}
-            return [dict(unavailable) for _ in images]
+        if n:
+            content = [{"type": "text", "text": prompt}]
+            for i, img in enumerate(images, start=1):
+                content.append({"type": "text", "text": f"REGION {i}:"})
+                content.append(self._image_content(img))
+            raw = self._chat_vision(content, max_tokens=MERGED_MAX_TOKENS,
+                                    timeout=MERGED_REQUEST_TIMEOUT_SECONDS)
+        else:
+            raw = self._chat_text(prompt, max_tokens=MERGED_MAX_TOKENS,
+                                  timeout=MERGED_REQUEST_TIMEOUT_SECONDS)
 
-        return parse_region_batch(raw, n, provider_label="NVIDIA NIM")
+        regions, explanation = parse_review_and_explanation(raw, n, provider_label="NVIDIA NIM")
+        return regions, explanation, prompt
 
     # ── Job C — genuine cross-examination, same contract as Gemini's
     # independent_scan ──────────────────────────────────────────────────────
@@ -274,9 +213,9 @@ class NvidiaAdvisor:
         return {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
 
     def _chat_text(self, prompt: str, max_tokens: int, timeout: float) -> str:
-        # enable_thinking=False for Job A so the reasoning model returns a
-        # clean JSON object instead of chain-of-thought preamble + JSON —
-        # Job A needs a directly-parseable reply, not a reasoning trace.
+        # enable_thinking=False so the reasoning model returns a clean JSON
+        # object instead of chain-of-thought preamble + JSON — the merged
+        # call needs a directly-parseable reply, not a reasoning trace.
         return self._chat(
             NVIDIA_MODEL_TEXT,
             [{"role": "user", "content": prompt}],

@@ -3,25 +3,27 @@ Gemini Advisor — opt-in, supplementary AI review. One of two interchangeable
 AI Review providers (see ai_review/nvidia_advisor.py for the other) selected
 via AI_REVIEW_PROVIDER — Gemini is the default when unset.
 
-Every provider implements the SAME three-method shape so api/ai_review_
+Every provider implements the SAME two-method shape so api/ai_review_
 routes.py never needs to know which one is active:
-  explain(analysis_summary) -> ({"lead_sentence": str, "detail": str}, prompt)
-  review_regions(images: list) -> list                    # Job B, batched
+  review_and_explain(images, analysis_summary)
+      -> (regions: list, {"lead_sentence": str, "detail": str}, prompt)
   independent_scan(page_images, analysis_summary) -> dict  # Job C
 
-Scope is three jobs:
-  Job A (explain) — explain the EXISTING 6-layer verdict (and, since it now
-          runs LAST, this SAME AI review's own Job B/C results) in plain
-          English. Never asked to form its own opinion on whether the
-          document is fake beyond synthesizing what B/C already found.
-  Job B (review_regions) — for regions the deterministic engine ALREADY
-          flagged, look at just that cropped image and say whether it reads
-          as a template element (logo/letterhead/watermark) or a possible
-          edit. Never shown the whole page, never asked to hunt for new
-          anomalies. Regions are labeled in ONE batched call rather than one
-          HTTP call per region, to bound total call count against rate
-          limits — the original one-region-at-a-time label_region() is kept
-          as a thin wrapper around the batch call.
+Scope is two calls (formerly three — Job A and Job B are now ONE request):
+  Merged region-review + explanation (review_and_explain) — in a single
+          call: (1) for regions the deterministic engine ALREADY flagged,
+          look at just that cropped image and say whether it reads as a
+          template element (logo/letterhead/watermark) or a possible edit
+          — never shown the whole page, never asked to hunt for new
+          anomalies, all regions labeled in this one batched call; and
+          (2) explain the EXISTING 6-layer verdict in plain English,
+          synthesizing its OWN region verdicts from the same reply (and
+          Job C's results, already present in analysis_summary when the
+          caller ran the independent scan first). One request instead of
+          two because the explanation needs exactly the information this
+          call already has — no second round-trip required. Never asked
+          to form its own opinion on whether the document is fake beyond
+          the per-region verdicts and synthesizing what Job C found.
   Job C (independent_scan) — genuine cross-examination, NOT descriptive
           captioning and NOT passive agreement. The model is given BOTH the
           rendered page image(s) AND the engine's own full analysis JSON
@@ -76,11 +78,10 @@ from utils.ai_retry import (
     post_with_retry,
 )
 from ai_review.shared_parsing import (
-    REGION_LABELS,
-    parse_explanation,
-    parse_region_batch,
+    parse_review_and_explanation,
     parse_cross_examination,
 )
+from ai_review.shared_prompts import build_review_and_explain_prompt as _build_review_and_explain_prompt
 
 logger = logging.getLogger("document_forensics")
 
@@ -88,12 +89,16 @@ GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 GEMINI_API_BASE  = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# Job A (text explainer) / Job B (small region crops) default. Job C sends
-# full rendered page image(s) PLUS the engine's whole analysis JSON in one
-# request — a much larger payload, and a harder reasoning task (per-finding
-# verification + independent scan + verdict), so it gets a longer timeout.
-REQUEST_TIMEOUT_SECONDS       = 30
-JOB_C_REQUEST_TIMEOUT_SECONDS = 90
+# Default for small requests. The merged region-review + explanation call
+# carries the engine's analysis JSON + up to MAX_AI_REVIEW_REGIONS crops
+# and produces region verdicts AND a multi-paragraph explanation in one
+# reply, so it gets a middle budget. Job C sends full rendered page
+# image(s) PLUS the engine's whole analysis JSON in one request — the
+# largest payload and hardest reasoning task (per-finding verification +
+# independent scan + verdict), so it gets the longest timeout.
+REQUEST_TIMEOUT_SECONDS        = 30
+MERGED_REQUEST_TIMEOUT_SECONDS = 60
+JOB_C_REQUEST_TIMEOUT_SECONDS  = 90
 
 
 class GeminiAdvisor:
@@ -111,157 +116,47 @@ class GeminiAdvisor:
             )
         self.model = GEMINI_MODEL
 
-    # ── Job A — plain-English explanation, run LAST so it can synthesize
-    # Job B/C's own results rather than confidently restating a pre-AI-review
-    # narrative while they simultaneously contradict it ─────────────────────
+    # ── Merged region-review + explanation — former Job A + Job B in ONE
+    # call: the same request that labels the engine's flagged region crops
+    # also writes the plain-English explanation, since it already has every
+    # input the explanation needs (engine findings + its own region verdicts
+    # + Job C's results when the caller ran the scan first) ─────────────────
 
-    def explain(self, analysis_summary: dict) -> tuple[dict, str]:
+    def review_and_explain(self, images: list, analysis_summary: dict) -> tuple:
         """
-        analysis_summary is a narrow, pre-built dict — the deterministic
-        findings (layers, signals, fused_findings, suspicious_lines,
-        numeric_anomalies, summary) PLUS, since Job A now runs AFTER Job B
-        and Job C, that SAME AI review's own results if present:
-        job_b_region_verdicts, job_c_per_finding_verification,
-        job_c_additional_findings, job_c_overall_assessment, the FINAL
-        combined_score_with_ai, and ai_adjusted_verdict (the verdict label
-        already computed FROM combined_score_with_ai, using the same
-        threshold logic as the deterministic engine — Job A is told to
-        state this given value, not compute its own).
+        images: list of PNG crop bytes, each ONE already-flagged region
+        (may be empty — the call is then explanation-only).
+        analysis_summary: the deterministic findings (verdict, layers,
+        signals, fused_findings, suspicious_lines, numeric_anomalies,
+        summary) PLUS, when the caller ran the independent scan (Job C)
+        FIRST, that scan's results (independent_scan_ran=True and the
+        job_c_* fields) — so the ONE explanation synthesizes engine
+        findings + this reply's own region verdicts + any newly-found
+        locations, instead of a separate paragraph bolted on later.
 
-        Returns ({"lead_sentence": str, "detail": str}, prompt_sent) — the
-        prompt is returned so callers can log/display it for auditability.
-        A malformed reply degrades to {"lead_sentence": None, "detail":
-        <raw text>} rather than losing the explanation outright.
+        Returns (regions, explanation, prompt_sent):
+          regions — same length/order as `images`, each {"label": one of
+                    REGION_LABELS or "unavailable", "reasoning": str}
+          explanation — {"lead_sentence": str|None, "detail": str}; a
+                    malformed reply degrades per-half (regions
+                    "unavailable", raw text as detail) rather than losing
+                    everything.
+        Raises GeminiRequestError only if the call fails outright
+        (network/timeout/rate-limit after retries) — the caller treats
+        that as the hard-failure fail-fast case.
         """
-        prompt = (
-            "You are explaining an ALREADY-COMPUTED forensic analysis to a "
-            "non-technical reader. The JSON below includes the original "
-            "deterministic findings AND — since this AI review's own "
-            "region-verification and cross-examination jobs already ran — "
-            "their results too: job_b_region_verdicts (per-region template-"
-            "element/possible-edit calls), job_c_per_finding_verification "
-            "(supported/contradicted/unverifiable per engine finding), "
-            "job_c_additional_findings (things the engine missed), and "
-            "job_c_overall_assessment. combined_score_with_ai and "
-            "ai_adjusted_verdict already account for ALL of this.\n\n"
-            "CRITICAL: your first sentence MUST plainly state whether this "
-            "document is MODIFIED, ORIGINAL, or UNCERTAIN using EXACTLY the "
-            "ai_adjusted_verdict value and the combined_score_with_ai "
-            "number below — NOT the pre-AI-review combined_score. Do not "
-            "compute your own verdict or use your own judgment about the "
-            "threshold; state the verdict/score already given to you, "
-            "as the very first thing you say.\n\n"
-            "After that first sentence, explain the reasoning in plain "
-            "English: translate z-scores, layer names, and jargon. If "
-            "job_b_region_verdicts or job_c_per_finding_verification "
-            "contain any 'template-element' or 'contradicted' entries, "
-            "you MUST explicitly say so by name — e.g. 'our AI visual "
-            "review found that several flagged header regions are "
-            "actually standard template elements, not edits, which is "
-            "why the adjusted score differs from the original score.' Do "
-            "NOT silently restate the original findings list as if "
-            "nothing challenged them. Do not re-litigate or second-guess "
-            "the final numbers themselves — only explain how they were "
-            "reached. Keep the detail section to 3-6 short paragraphs.\n\n"
-            "EXISTING ANALYSIS + THIS AI REVIEW'S OWN RESULTS:\n"
-            f"{json.dumps(analysis_summary, indent=2, default=str)}\n\n"
-            "Respond with ONLY a JSON object (no markdown fences, no "
-            "prose) in EXACTLY this shape:\n"
-            '{"lead_sentence": "<the one required first sentence, stating '
-            'the final verdict/score>", "detail": "<3-6 short paragraphs '
-            'of supporting explanation; **bold** is fine for emphasis, no '
-            'other markdown>"}'
-        )
-        logger.info("gemini_advisor: Job A prompt sent:\n%s", prompt)
-
-        raw = self._generate_text(prompt)
-        return parse_explanation(raw, provider_label="Gemini"), prompt
-
-    # ── Job B — label ONE already-flagged region crop ──────────────────────────
-
-    def label_region(self, image_bytes: bytes, mime_type: str = "image/png") -> dict:
-        """
-        image_bytes is a crop of ONLY the already-flagged bounding box (never
-        the whole page) — the caller (main.py) is responsible for cropping.
-        Returns {"label": one of REGION_LABELS, "reasoning": str}.
-        """
-        prompt = (
-            "This image is a small cropped region from a document page that "
-            "an automated forensic tool already flagged as unusual. Does this "
-            "cropped region look like a repeating template element (a logo, "
-            "letterhead, watermark, or standard printed header/footer) or "
-            "does it look like an inserted/edited piece of content (retyped "
-            "text, a pasted-in block, an obvious visual seam)? Answer only "
-            "from what is visible in this crop — do not guess about the rest "
-            "of the document.\n\n"
-            "Respond in EXACTLY this format, two lines:\n"
-            "LABEL: <template-element|possible-edit|uncertain>\n"
-            "REASON: <one sentence>"
-        )
-        raw = self._generate_text(prompt, image_bytes=image_bytes, mime_type=mime_type)
-        return self._parse_region_reply(raw)
-
-    @staticmethod
-    def _parse_region_reply(raw: str) -> dict:
-        label = "uncertain"
-        reason = raw.strip()[:280] if raw else "No usable response from the model."
-        for line in (raw or "").splitlines():
-            line = line.strip()
-            if line.upper().startswith("LABEL:"):
-                candidate = line.split(":", 1)[1].strip().lower()
-                if candidate in REGION_LABELS:
-                    label = candidate
-            elif line.upper().startswith("REASON:"):
-                reason = line.split(":", 1)[1].strip() or reason
-        return {"label": label, "reasoning": reason}
-
-    # ── Job B (batched) — label MULTIPLE already-flagged region crops in ONE
-    # Gemini call instead of one HTTP call per region ───────────────────────
-
-    def review_regions(self, images: list) -> list:
-        """
-        images: list of PNG crop bytes, each ONE already-flagged region.
-        Returns a list (same length/order as `images`) of
-        {"label": one of REGION_LABELS or "unavailable", "reasoning": str}.
-        A batch-level failure (rate limit surviving retries, network error,
-        etc.) marks EVERY region "unavailable" rather than raising past this
-        call — the caller shouldn't have to handle a total-failure exception
-        differently from a partial one.
-        """
-        if not images:
-            return []
         n = len(images)
-        prompt = (
-            f"You will be shown {n} cropped regions from a document, each "
-            "already flagged by an automated forensic tool as unusual. Each "
-            "crop is preceded by a line reading 'REGION <n>:'. For EACH "
-            "region independently, decide: does it look like a repeating "
-            "template element (a logo, letterhead, watermark, or standard "
-            "printed header/footer) or does it look like inserted/edited "
-            "content (retyped text, a pasted-in block, an obvious visual "
-            "seam)? Judge each region using ONLY what is visible in that "
-            "region's own crop — do not guess about the rest of the "
-            "document, and do not let one region's verdict influence "
-            "another's.\n\n"
-            "Respond with ONLY a JSON array (no markdown fences, no prose), "
-            "one object per region, in this exact shape:\n"
-            '[{"index": 1, "label": "template-element|possible-edit|uncertain", '
-            '"reasoning": "one sentence"}, ...]\n'
-            f"Return exactly {n} objects, with \"index\" values 1 through {n}."
-        )
+        prompt = _build_review_and_explain_prompt(n, analysis_summary)
+        logger.info("gemini_advisor: merged review+explanation prompt sent:\n%s", prompt)
+
         parts = [{"text": prompt}]
         for i, img in enumerate(images, start=1):
             parts.append({"text": f"REGION {i}:"})
             parts.append(self._image_part(img))
 
-        try:
-            raw = self._generate(parts)
-        except GeminiRequestError as e:
-            unavailable = {"label": "unavailable",
-                           "reasoning": f"AI review unavailable for this item — {e}"}
-            return [dict(unavailable) for _ in images]
-
-        return parse_region_batch(raw, n, provider_label="Gemini")
+        raw = self._generate(parts, timeout=MERGED_REQUEST_TIMEOUT_SECONDS)
+        regions, explanation = parse_review_and_explanation(raw, n, provider_label="Gemini")
+        return regions, explanation, prompt
 
     # ── Job C — genuine cross-examination: the engine's OWN findings AND the
     # actual rendered pages, reasoned over together in ONE call. ────────────
@@ -372,21 +267,13 @@ class GeminiAdvisor:
     # transitive dependency in this project; avoids pulling in the full
     # google-generativeai SDK) ──────────────────────────────────────────────
 
-    def _generate_text(self, prompt: str, image_bytes: bytes = None,
-                        mime_type: str = "image/png",
-                        timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
-        parts = [{"text": prompt}]
-        if image_bytes is not None:
-            parts.append(self._image_part(image_bytes, mime_type))
-        return self._generate(parts, timeout=timeout)
-
     def _generate(self, parts: list, timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
-        """Core call shared by every job. Retry/backoff/timeout handling is
+        """Core call shared by both calls. Retry/backoff/timeout handling is
         delegated to utils.ai_retry.post_with_retry (shared with every other
         AI Review provider) — only the request/response shape below (native
         Gemini REST, not OpenAI-compatible) is Gemini-specific. `timeout` is
         per-call so Job C's much larger full-page-image payloads can use a
-        longer budget than Job A/B's smaller ones."""
+        longer budget than the merged call's smaller one."""
         url = f"{GEMINI_API_BASE}/{self.model}:generateContent"
         resp = post_with_retry(
             url,

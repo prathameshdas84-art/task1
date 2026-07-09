@@ -164,12 +164,38 @@ export default function App() {
     },
   };
 
-  const verdictColor = result?.verdict === "MODIFIED" ? "#ff4444"
-                     : result?.verdict === "ORIGINAL" ? "#00cc66"
+  // ── Post-AI-review the MAIN report re-renders in place: the verdict
+  // badge, score, and findings lists below all switch to the AI-merged
+  // values once the review completes. There is no separate AI panel — the
+  // deterministic score stays available as a small audit affordance only.
+  const aiApplied = !!(aiReview && aiReview.available && !aiReview.hard_failure
+                       && aiReview.combined_score_with_ai != null);
+  const displayVerdict = (aiApplied && aiReview.ai_adjusted_verdict) || result?.verdict;
+  const displayScore   = aiApplied ? aiReview.combined_score_with_ai : result?.combined_score;
+  const mergedFindings = aiApplied ? aiReview.merged_findings : null;
+  const fusedList      = mergedFindings?.fused_findings      ?? result?.fused_findings;
+  const suspiciousList = mergedFindings?.suspicious_lines    ?? result?.suspicious_lines;
+  const numericList    = mergedFindings?.numeric_anomalies   ?? result?.numeric_anomalies;
+  const ocrList        = mergedFindings?.ocr_word_anomalies  ?? result?.ocr_word_anomalies;
+
+  // Inline decorations for a finding the AI review contradicted — applied
+  // on the SAME card, in place, instead of in a separate AI panel.
+  const isContradicted = (f) => f.ai_status === "contradicted";
+  const contradictedCardStyle = (f) => isContradicted(f) ? { opacity: 0.55 } : undefined;
+  const contradictedTextStyle = (f) => isContradicted(f)
+    ? { textDecoration: "line-through", color: "#8890a0" } : undefined;
+  const aiContradictedNote = (f) => isContradicted(f) ? (
+    <div style={{ fontSize: "0.75rem", color: "#4ade80", marginTop: 4 }}>
+      AI: template element, not an edit{f.ai_note ? ` — ${f.ai_note}` : ""}
+    </div>
+  ) : null;
+
+  const verdictColor = displayVerdict === "MODIFIED" ? "#ff4444"
+                     : displayVerdict === "ORIGINAL" ? "#00cc66"
                      : "#ff9800";  // orange for UNCERTAIN
 
-  const verdictIcon = result?.verdict === "MODIFIED" ? "⚠️"
-                    : result?.verdict === "ORIGINAL" ? "✅"
+  const verdictIcon = displayVerdict === "MODIFIED" ? "⚠️"
+                    : displayVerdict === "ORIGINAL" ? "✅"
                     : "❓";  // question mark for UNCERTAIN
 
   const confidenceColor = {
@@ -659,11 +685,12 @@ export default function App() {
       "statistical and structural analysis only — no machine learning models",
       "or AI systems participate in computing the verdict or combined_score.",
       "",
-      "OPTIONAL AI REVIEW (LAYER 7): If \"Ask AI\" was used for this document,",
-      "the configured AI provider (Gemini or NVIDIA NIM) contributes an",
-      "ADDITIONAL, separate combined_score_with_ai — shown only when",
-      "explicitly requested below, and it never overwrites or replaces the",
-      "deterministic combined_score/verdict above.",
+      "OPTIONAL AI REVIEW (LAYER 7): If \"Verify with AI\" was used for this",
+      "document, the configured AI provider (Gemini or NVIDIA NIM) refined",
+      "the on-screen report in place with an AI-adjusted score",
+      "(combined_score_with_ai). This PDF report always shows the",
+      "deterministic combined_score/verdict, which the AI review never",
+      "overwrites — both values remain in the analysis JSON for audit.",
     ];
 
     disclaimer.forEach(line => {
@@ -683,7 +710,7 @@ export default function App() {
           <span className="logo">🔬</span>
           <div>
             <div className="title">Document Forensics Engine</div>
-            <div className="subtitle">Core 6-Layer Engine: Deterministic, No AI/ML · Optional AI Review (Layer 7): Gemini or NVIDIA NIM, Separate AI-Adjusted Score</div>
+            <div className="subtitle">Core 6-Layer Engine: Deterministic, No AI/ML · Optional AI Review (Layer 7): Gemini or NVIDIA NIM, refines the same report on demand</div>
           </div>
         </div>
         <div className="header-badge">v2.0</div>
@@ -747,18 +774,42 @@ export default function App() {
       {result && (
         <div className="results">
 
-          {/* Verdict banner */}
+          {/* Verdict banner — updates IN PLACE once AI review completes:
+              the same badge/score flips to the AI-adjusted values, with the
+              original deterministic score kept as a small audit affordance
+              (tooltip + inline note), never a second side-by-side score. */}
           <div className="verdict-banner" style={{ borderColor: verdictColor }}>
             <div className="verdict-main">
               <span className="verdict-icon">{verdictIcon}</span>
               <span className="verdict-text" style={{ color: verdictColor }}>
-                {result.verdict}
+                {displayVerdict}
               </span>
+              {aiApplied && (
+                <span
+                  title={`AI-verified (${aiReview.provider}). Original deterministic verdict: ${result.verdict}, score ${result.combined_score.toFixed(1)}/100 — preserved unchanged in the response JSON for audit.`}
+                  style={{
+                    marginLeft: 10, fontSize: "0.7rem", fontWeight: 700,
+                    color: "#a5b4fc", border: "1px solid #4338ca",
+                    borderRadius: 12, padding: "2px 10px", cursor: "help",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  🤖 AI-verified
+                </span>
+              )}
             </div>
             <div className="verdict-stats">
               <div className="stat-item">
                 <div className="stat-label">Combined Score</div>
-                <div className="stat-value">{result.combined_score.toFixed(1)}/100</div>
+                <div className="stat-value">{displayScore.toFixed(1)}/100</div>
+                {aiApplied && (
+                  <div
+                    title="The deterministic 6-layer score computed before AI review — kept for audit."
+                    style={{ fontSize: "0.65rem", color: "#8890a0", marginTop: 2, cursor: "help" }}
+                  >
+                    original: {result.combined_score.toFixed(1)}
+                  </div>
+                )}
               </div>
               <div className="stat-divider" />
               <div className="stat-item">
@@ -1094,41 +1145,69 @@ export default function App() {
           {/* ── Tab: Overview ── */}
           {activeTab === "overview" && (
             <div className="tab-content">
-              {result.fused_findings && result.fused_findings.length > 0 && (
+              {fusedList && fusedList.length > 0 && (
                 <div className="fusion-section">
                   <div className="fusion-title">
                     🎯 Cross-Validated Findings (High Confidence)
-                    <span className="badge">{result.fused_findings.length}</span>
+                    <span className="badge">{fusedList.length}</span>
                   </div>
                   <div className="fusion-subtitle">
                     These regions were flagged by MULTIPLE independent layers —
                     most likely real tampering, not false positives.
                   </div>
-                  {result.fused_findings.map((f, i) => (
+                  {/* Post-AI-review this is the SAME list, re-rendered from the
+                      merged structure: contradicted findings greyed/struck-
+                      through with an inline AI note, AI-discovered locations
+                      appended with a badge — never a separate section. */}
+                  {fusedList.map((f, i) => {
+                    const contradicted = f.ai_status === "contradicted";
+                    return (
                     <div key={i} className="fusion-card" style={{
                       borderLeft: `4px solid ${
+                        f.ai_discovered ? "#6366f1" :
+                        contradicted ? "#475569" :
                         f.confidence === "HIGH" ? "#ff4444" :
                         f.confidence === "MEDIUM" ? "#ff9800" : "#ffdd44"
-                      }`
+                      }`,
+                      opacity: contradicted ? 0.55 : 1,
                     }}>
                       <div className="fusion-header">
                         <span className="fusion-page">Page {f.page}</span>
-                        <span className="fusion-conf" style={{color:
-                          f.confidence === "HIGH" ? "#ff4444" :
-                          f.confidence === "MEDIUM" ? "#ff9800" : "#ffdd44"
-                        }}>
-                          {f.confidence} CONFIDENCE
-                        </span>
-                        <span className="fusion-score">{f.score}/100</span>
+                        {f.ai_discovered ? (
+                          <span style={{
+                            color: "#a5b4fc", fontWeight: 700, fontSize: "0.72rem",
+                            border: "1px solid #4338ca", borderRadius: 10, padding: "1px 8px",
+                          }}>
+                            🤖 found by AI · {f.confidence} confidence
+                          </span>
+                        ) : (
+                          <span className="fusion-conf" style={{color:
+                            f.confidence === "HIGH" ? "#ff4444" :
+                            f.confidence === "MEDIUM" ? "#ff9800" : "#ffdd44"
+                          }}>
+                            {f.confidence} CONFIDENCE
+                          </span>
+                        )}
+                        {f.score != null && <span className="fusion-score">{f.score}/100</span>}
                       </div>
                       <div className="fusion-layers">
-                        Confirmed by: {f.confirming_layers.map(l => (
-                          <span key={l} className="layer-badge">{l}</span>
+                        {f.ai_discovered ? "Found by: " : "Confirmed by: "}
+                        {f.confirming_layers.map(l => (
+                          <span key={l} className="layer-badge">{l === "ai_review" ? "AI review" : l}</span>
                         ))}
                       </div>
-                      <div className="fusion-desc">{f.description}</div>
+                      <div className="fusion-desc" style={contradicted
+                        ? { textDecoration: "line-through", color: "#8890a0" } : undefined}>
+                        {f.description}
+                      </div>
+                      {contradicted && (
+                        <div style={{ fontSize: "0.75rem", color: "#4ade80", marginTop: 4 }}>
+                          AI: template element, not an edit{f.ai_note ? ` — ${f.ai_note}` : ""}
+                        </div>
+                      )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
 
@@ -1240,6 +1319,30 @@ export default function App() {
               <div className="summary-box">
                 <div className="summary-title">📝 Summary</div>
                 <div className="summary-text">{result.summary}</div>
+                {/* The AI explanation merges into this SAME summary box once
+                    the review runs — one unified narrative, not a panel. */}
+                {aiApplied && aiReview.explanation && (
+                  <div style={{
+                    marginTop: 12, paddingTop: 12, borderTop: "1px solid #333",
+                  }}>
+                    <div style={{ fontSize: "0.75rem", fontWeight: 700, color: "#a5b4fc", marginBottom: 6 }}>
+                      🤖 AI REVIEW ({aiReview.provider}) — plain-English explanation
+                    </div>
+                    {aiReview.explanation.lead_sentence && (
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>
+                        {renderInlineMarkdown(aiReview.explanation.lead_sentence)}
+                      </div>
+                    )}
+                    <div className="summary-text" style={{ whiteSpace: "pre-wrap" }}>
+                      {renderInlineMarkdown(aiReview.explanation.detail)}
+                    </div>
+                  </div>
+                )}
+                {aiApplied && !aiReview.explanation && aiReview.explanation_error && (
+                  <div style={{ marginTop: 10, fontSize: "0.8rem", color: "#ff8888" }}>
+                    ⚠️ AI explanation unavailable: {aiReview.explanation_error}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1248,86 +1351,89 @@ export default function App() {
           {activeTab === "layers" && (
             <div className="tab-content">
               {/* Suspicious lines */}
-              {result.suspicious_lines?.length > 0 && (
+              {suspiciousList?.length > 0 && (
                 <div className="section">
                   <div className="section-title">
                     🔴 Suspicious Lines — Content Layer
-                    <span className="badge">{result.suspicious_lines.length}</span>
+                    <span className="badge">{suspiciousList.length}</span>
                   </div>
-                  {result.suspicious_lines.map((sl, i) => (
-                    <div key={i} className="finding-card red">
+                  {suspiciousList.map((sl, i) => (
+                    <div key={i} className="finding-card red" style={contradictedCardStyle(sl)}>
                       <div className="finding-header">
                         Page {sl.page} · Line {sl.line_num} ·{" "}
                         <span style={{ color: "#ff4444" }}>
                           {sl.anomaly_score_pct}% anomaly
                         </span>
                       </div>
-                      <div className="finding-text">"{sl.text}"</div>
+                      <div className="finding-text" style={contradictedTextStyle(sl)}>"{sl.text}"</div>
                       {sl.reasons.map((r, j) => (
                         <div key={j} className="finding-reason">→ {r}</div>
                       ))}
+                      {aiContradictedNote(sl)}
                     </div>
                   ))}
                 </div>
               )}
 
               {/* Numeric anomalies */}
-              {result.numeric_anomalies?.length > 0 && (
+              {numericList?.length > 0 && (
                 <div className="section">
                   <div className="section-title">
                     🟡 Numeric Anomalies — Numeric Layer
-                    <span className="badge">{result.numeric_anomalies.length}</span>
+                    <span className="badge">{numericList.length}</span>
                   </div>
-                  {result.numeric_anomalies.map((na, i) => (
-                    <div key={i} className="finding-card yellow">
+                  {numericList.map((na, i) => (
+                    <div key={i} className="finding-card yellow" style={contradictedCardStyle(na)}>
                       <div className="finding-header">
                         Page {na.page} · Line {na.line_num} ·{" "}
                         <span style={{ color: "#ffdd00" }}>
                           z-score: {na.z_score}
                         </span>
                       </div>
-                      <div className="finding-text">"{na.text}"</div>
+                      <div className="finding-text" style={contradictedTextStyle(na)}>"{na.text}"</div>
                       <div className="finding-reason">
                         Value: {na.value.toLocaleString()} · {na.reason}
                       </div>
+                      {aiContradictedNote(na)}
                     </div>
                   ))}
                 </div>
               )}
 
               {/* OCR word anomalies */}
-              {result.ocr_word_anomalies?.length > 0 && (
+              {ocrList?.length > 0 && (
                 <div className="section">
                   <div className="section-title">
                     🔤 OCR Word Anomalies
-                    <span className="badge">{result.ocr_word_anomalies.length}</span>
+                    <span className="badge">{ocrList.length}</span>
                   </div>
                   <div className="ocr-stats">
                     Avg font size: {result.ocr_stats?.avg_font_size}pt |{" "}
                     Avg brightness: {result.ocr_stats?.avg_color_brightness?.toFixed(0)} |{" "}
                     Words analyzed: {result.ocr_stats?.word_count}
                   </div>
-                  {result.ocr_word_anomalies.map((wa, i) => (
+                  {ocrList.map((wa, i) => (
                     <div key={i} className="finding-card"
                       style={{borderLeft: `3px solid ${
                         wa.anomaly_types.includes("color") ? "#ff00cc" : "#ff6400"
-                      }`}}>
+                      }`, ...contradictedCardStyle(wa)}}>
                       <div className="finding-header">
                         Page {wa.page} |
                         {wa.anomaly_types.includes("size") && " 📏 Size anomaly"}
                         {wa.anomaly_types.includes("color") && " 🎨 Color anomaly"}
                         {wa.anomaly_types.includes("confidence") && " ❓ Low confidence"}
                       </div>
-                      <div className="finding-text">"{wa.word}"</div>
+                      <div className="finding-text" style={contradictedTextStyle(wa)}>"{wa.word}"</div>
                       <div className="finding-reason">{wa.reason}</div>
+                      {aiContradictedNote(wa)}
                     </div>
                   ))}
                 </div>
               )}
 
-              {result.suspicious_lines?.length === 0 &&
-               result.numeric_anomalies?.length === 0 &&
-               result.ocr_word_anomalies?.length === 0 && (
+              {suspiciousList?.length === 0 &&
+               numericList?.length === 0 &&
+               ocrList?.length === 0 && (
                 <div className="empty-state">
                   ✅ No specific line-level anomalies detected
                 </div>
@@ -1730,9 +1836,12 @@ export default function App() {
             </div>
           )}
 
-          {/* ── AI Review (Gemini) — opt-in, supplementary, never part of the
+          {/* ── Verify with AI — opt-in, supplementary, never part of the
               core 6-layer engine. Never runs automatically; only fires on
-              click. Never touches result.verdict / result.combined_score. ── */}
+              click, and it refines the SAME report above in place (verdict
+              badge, score, findings lists). No separate AI panel exists.
+              The deterministic verdict/score are never mutated — they stay
+              in the response JSON (and the small audit note below). ── */}
           {!aiReview && !aiReviewLoading && (
             <div
               onClick={requestAiReview}
@@ -1753,13 +1862,13 @@ export default function App() {
             >
               <div>
                 <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>
-                  🤖 Ask AI — Get AI Explanation
+                  🔎 Verify with AI — refine this report
                 </div>
                 <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
-                  Optional, supplementary AI review (Gemini or NVIDIA NIM, depending on
-                  configuration) — explains this result in plain English and computes a
-                  separate, clearly-labeled AI-adjusted score (Layer 7). Never overwrites
-                  the deterministic score/verdict above.
+                  Has the configured AI provider (Gemini or NVIDIA NIM) visually re-check
+                  the flagged regions — plus a full-page scan for missed locations ONLY
+                  when the engine lacks a confident one — then updates this same report's
+                  score and findings in place. The deterministic score is preserved for audit.
                 </div>
               </div>
               <button
@@ -1770,7 +1879,7 @@ export default function App() {
                   fontSize: 13, cursor: "pointer", whiteSpace: "nowrap",
                 }}
               >
-                ▶ Ask AI
+                ▶ Verify with AI
               </button>
             </div>
           )}
@@ -1781,7 +1890,7 @@ export default function App() {
               padding: "18px 20px", textAlign: "center", color: "#64748b",
               background: "#f8fafc", fontSize: 13,
             }}>
-              ⏳ Asking the AI review provider for a plain-English explanation, region review, and independent page scan…
+              ⏳ Verifying with AI — re-checking the flagged regions and refining this report in place…
             </div>
           )}
 
@@ -1804,261 +1913,74 @@ export default function App() {
             </div>
           )}
 
-          {aiReview && !aiReviewLoading && (
+          {/* Hard failure / not-configured — small notices, not a panel. */}
+          {aiReview && !aiReviewLoading && aiReview.hard_failure && (
             <div style={{
-              marginTop: 32,
-              border: "2px solid #6366f1",
-              borderRadius: 12,
-              overflow: "hidden",
-              boxShadow: "0 4px 12px rgba(99,102,241,0.15)",
+              marginTop: 24, border: "1px solid #fca5a5", borderRadius: 10,
+              padding: "14px 16px", background: "#fef2f2", color: "#991b1b",
+              fontSize: 13, fontWeight: 600, lineHeight: 1.5,
             }}>
-              <div style={{
-                background: "#312e81", color: "#fff", padding: "14px 20px",
-                display: "flex", alignItems: "center", gap: 10,
-              }}>
-                <span style={{ fontSize: 20 }}>🤖</span>
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: 15 }}>
-                    AI REVIEW ({aiReview.provider || "Gemini"}) — Layer 7
-                  </div>
-                  <div style={{ fontSize: 11.5, opacity: 0.85 }}>
-                    AI-generated · contributes a separate, clearly-labeled AI-adjusted score ·
-                    never overwrites the deterministic score/verdict above
-                    {aiReview.from_cache && ` · cached result (not a fresh ${aiReview.provider || "AI"} call)`}
-                  </div>
+              {aiReview.hard_failure_message}
+              <button
+                onClick={() => { setAiReview(null); requestAiReview(); }}
+                style={{
+                  marginLeft: 12, background: "#fff", color: "#991b1b",
+                  border: "1px solid #fca5a5", borderRadius: 6,
+                  padding: "4px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                }}
+              >
+                ↻ Retry
+              </button>
+            </div>
+          )}
+          {aiReview && !aiReviewLoading && !aiReview.hard_failure && !aiReview.available && (
+            <div style={{
+              marginTop: 24, border: "1px dashed #cbd5e1", borderRadius: 10,
+              padding: "12px 16px", background: "#f8fafc", color: "#64748b", fontSize: 13,
+            }}>
+              ℹ️ {aiReview.reason || "AI Review is not available in this environment."}
+            </div>
+          )}
+
+          {/* Post-review: the report above already updated in place; all
+              that renders down here is a one-line audit strip (which path
+              ran, how many AI calls, original → adjusted score) and the
+              disagreement warning when the AI challenges the verdict. */}
+          {aiApplied && (
+            <>
+              {aiReview.ai_disagreement_flag && (
+                <div style={{
+                  marginTop: 24, border: "1px solid #fca5a5", borderRadius: 10,
+                  padding: "12px 14px", background: "#fef2f2", color: "#991b1b",
+                  fontSize: 13, fontWeight: 600,
+                }}>
+                  {aiReview.ai_disagreement_message}
                 </div>
-              </div>
-
-              <div style={{ padding: "18px 20px" }}>
-                {aiReview.hard_failure ? (
-                  <div>
-                    <div style={{
-                      border: "1px solid #fca5a5", background: "#fef2f2", color: "#991b1b",
-                      borderRadius: 8, padding: "14px 16px", fontSize: 13.5, fontWeight: 600,
-                      lineHeight: 1.5,
-                    }}>
-                      {aiReview.hard_failure_message}
-                    </div>
-                    <button
-                      onClick={requestAiReview}
-                      style={{
-                        marginTop: 12, background: "#1e293b", color: "#fff", border: "none",
-                        borderRadius: 8, padding: "10px 20px", fontWeight: 700,
-                        fontSize: 13, cursor: "pointer",
-                      }}
-                    >
-                      ↻ Retry AI Review
-                    </button>
-                  </div>
-                ) : !aiReview.available ? (
-                  <div style={{ color: "#64748b", fontSize: 13 }}>
-                    ℹ️ {aiReview.reason || "AI Review is not available in this environment."}
-                  </div>
-                ) : (
-                  <>
-                    {aiReview.ai_disagreement_flag && (
-                      <div style={{
-                        border: "1px solid #fca5a5", background: "#fef2f2", color: "#991b1b",
-                        borderRadius: 8, padding: "12px 14px", marginBottom: 16, fontSize: 13, fontWeight: 600,
-                      }}>
-                        {aiReview.ai_disagreement_message}
-                      </div>
-                    )}
-
-                    {aiReview.combined_score_with_ai != null && (
-                      <div style={{
-                        display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap",
-                      }}>
-                        <div style={{
-                          flex: "1 1 160px", border: "1px solid #e5e7eb", borderRadius: 8,
-                          padding: "10px 14px", background: "#f8fafc",
-                        }}>
-                          <div style={{ fontSize: 11, color: "#64748b", fontWeight: 700 }}>
-                            DETERMINISTIC (6 layers)
-                          </div>
-                          <div style={{ fontSize: 22, fontWeight: 800, color: "#1e293b" }}>
-                            {aiReview.combined_score.toFixed(1)}
-                          </div>
-                        </div>
-                        <div style={{
-                          flex: "1 1 160px", border: "1px solid #c7d2fe", borderRadius: 8,
-                          padding: "10px 14px", background: "#eef2ff",
-                        }}>
-                          <div style={{ fontSize: 11, color: "#4338ca", fontWeight: 700 }}>
-                            WITH AI REVIEW (Layer 7, weight {aiReview.layer7_weight})
-                          </div>
-                          <div style={{ fontSize: 22, fontWeight: 800, color: "#312e81" }}>
-                            {aiReview.combined_score_with_ai.toFixed(1)}
-                          </div>
-                        </div>
-                        <div style={{
-                          flex: "1 1 160px", border: "1px solid #e5e7eb", borderRadius: 8,
-                          padding: "10px 14px", background: "#f8fafc",
-                        }}>
-                          <div style={{ fontSize: 11, color: "#64748b", fontWeight: 700 }}>
-                            LAYER 7 AI ANOMALY SCORE
-                          </div>
-                          <div style={{ fontSize: 22, fontWeight: 800, color: "#1e293b" }}>
-                            {aiReview.layer7_score}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    <div style={{ fontWeight: 700, fontSize: 13, color: "#312e81", marginBottom: 8 }}>
-                      Plain-English Explanation
-                    </div>
-                    {aiReview.explanation ? (
-                      <>
-                        {aiReview.explanation.lead_sentence && (
-                          <div style={{
-                            fontSize: 16.5, fontWeight: 800, color: "#1e1b4b",
-                            lineHeight: 1.4, marginBottom: 12,
-                            padding: "10px 12px", background: "#eef2ff",
-                            borderLeft: "4px solid #4338ca", borderRadius: 4,
-                          }}>
-                            {renderInlineMarkdown(aiReview.explanation.lead_sentence)}
-                          </div>
-                        )}
-                        <div style={{ fontSize: 13.5, color: "#334155", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
-                          {renderInlineMarkdown(aiReview.explanation.detail)}
-                        </div>
-                      </>
-                    ) : (
-                      <div style={{ fontSize: 13, color: "#991b1b" }}>
-                        ⚠️ {aiReview.explanation_error || "No explanation was returned."}
-                      </div>
-                    )}
-
-                    {aiReview.regions && aiReview.regions.length > 0 && (
-                      <>
-                        <div style={{ fontWeight: 700, fontSize: 13, color: "#312e81", marginTop: 20, marginBottom: 8 }}>
-                          Flagged-Region Visual Check ({aiReview.regions.length})
-                        </div>
-                        {aiReview.regions.map((r, i) => {
-                          const labelColor = r.label === "possible-edit" ? "#dc2626"
-                                           : r.label === "template-element" ? "#16a34a"
-                                           : r.label === "unavailable" ? "#b45309"
-                                           : r.label === "error" ? "#b45309"
-                                           : "#64748b";
-                          return (
-                            <div key={i} style={{
-                              border: "1px solid #e5e7eb", borderRadius: 8,
-                              padding: "10px 14px", marginBottom: 8, fontSize: 12.5,
-                            }}>
-                              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                                <span style={{ color: "#475569" }}>
-                                  Page {r.page} · engine layer: {r.source_layer}
-                                </span>
-                                <span style={{ color: labelColor, fontWeight: 700 }}>
-                                  {r.label}
-                                </span>
-                              </div>
-                              <div style={{ color: "#94a3b8", marginBottom: 4 }}>
-                                Engine finding: {r.engine_description}
-                              </div>
-                              <div style={{ color: "#334155" }}>
-                                {aiReview.provider || "AI"}: {r.reasoning}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </>
-                    )}
-                    {aiReview.regions_error && (
-                      <div style={{ fontSize: 12, color: "#991b1b", marginTop: 10 }}>
-                        ⚠️ {aiReview.regions_error}
-                      </div>
-                    )}
-
-                    {/* ── Job C — cross-examination: per-finding verification of the
-                        engine's OWN findings, visually distinct from Job B's
-                        region-crop review above ── */}
-                    {aiReview.per_finding_verification && aiReview.per_finding_verification.length > 0 && (
-                      <>
-                        <div style={{
-                          fontWeight: 700, fontSize: 13, color: "#7c2d12",
-                          marginTop: 24, marginBottom: 8, paddingTop: 16,
-                          borderTop: "1px dashed #cbd5e1",
-                        }}>
-                          🔍 Cross-Examination — Verifying the Engine's Own Findings
-                          ({aiReview.per_finding_verification.length})
-                        </div>
-                        {aiReview.per_finding_verification.map((v, i) => {
-                          const verdictColor = v.verdict === "contradicted" ? "#16a34a"
-                                             : v.verdict === "supported" ? "#dc2626"
-                                             : "#64748b";
-                          return (
-                            <div key={i} style={{
-                              border: "1px solid #e5e7eb", borderRadius: 8,
-                              padding: "10px 14px", marginBottom: 8, fontSize: 12.5,
-                            }}>
-                              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                                <span style={{ color: "#475569" }}>layer: {v.layer}</span>
-                                <span style={{ color: verdictColor, fontWeight: 700 }}>
-                                  {v.verdict.toUpperCase()}
-                                </span>
-                              </div>
-                              <div style={{ color: "#94a3b8", marginBottom: 4 }}>
-                                Engine claimed: {v.engine_finding}
-                              </div>
-                              <div style={{ color: "#334155" }}>{aiReview.provider || "AI"}: {v.reasoning}</div>
-                            </div>
-                          );
-                        })}
-                      </>
-                    )}
-
-                    {aiReview.additional_findings && aiReview.additional_findings.length > 0 && (
-                      <>
-                        <div style={{
-                          fontWeight: 700, fontSize: 13, color: "#7c2d12",
-                          marginTop: 20, marginBottom: 8,
-                        }}>
-                          ➕ Additional Findings — Not Flagged by the 6-Layer Engine
-                          ({aiReview.additional_findings.length})
-                        </div>
-                        {aiReview.additional_findings.map((f, i) => (
-                          <div key={i} style={{
-                            border: "1px solid #fdba74", background: "#fff7ed",
-                            borderRadius: 8, padding: "10px 14px", marginBottom: 8, fontSize: 12.5,
-                          }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                              <span style={{ color: "#475569" }}>Page {f.page} · confidence: {f.confidence}</span>
-                              <span style={{ color: "#c2410c", fontWeight: 700, fontSize: 11.5 }}>
-                                AI-ONLY
-                              </span>
-                            </div>
-                            <div style={{ color: "#334155" }}>{f.description}</div>
-                          </div>
-                        ))}
-                      </>
-                    )}
-
-                    {aiReview.overall_assessment && (
-                      <div style={{
-                        marginTop: 20, border: "1px solid #c7d2fe", borderRadius: 8,
-                        padding: "12px 14px", background: "#eef2ff", fontSize: 12.5,
-                      }}>
-                        <div style={{ fontWeight: 700, color: "#312e81", marginBottom: 4 }}>
-                          Overall AI Assessment: {
-                            aiReview.overall_assessment.agrees_with_engine_verdict === true ? "Agrees with verdict"
-                            : aiReview.overall_assessment.agrees_with_engine_verdict === false ? "Disagrees with verdict"
-                            : "Inconclusive"
-                          }
-                        </div>
-                        <div style={{ color: "#334155" }}>{aiReview.overall_assessment.reasoning}</div>
-                      </div>
-                    )}
-                    {aiReview.job_c_error && (
-                      <div style={{ fontSize: 12, color: "#991b1b", marginTop: 10 }}>
-                        ⚠️ {aiReview.job_c_error}
-                      </div>
-                    )}
-                  </>
+              )}
+              <div style={{
+                marginTop: aiReview.ai_disagreement_flag ? 8 : 24,
+                border: "1px solid #333", borderRadius: 10,
+                padding: "10px 14px", fontSize: 12, color: "#8890a0", lineHeight: 1.6,
+              }}>
+                🤖 AI review applied ({aiReview.provider}) — {
+                  aiReview.scan_mode === "full-scan"
+                    ? "region review + independent full-page scan (engine findings lacked a confident location)"
+                    : "region review only (engine locations were confident — full-page scan skipped)"
+                } · {aiReview.ai_calls_made} AI call{aiReview.ai_calls_made === 1 ? "" : "s"}
+                {aiReview.from_cache ? " · cached result (no new AI calls)" : ""}
+                {" "}· score{" "}
+                <span title="Deterministic 6-layer score, preserved for audit — also in the response JSON as combined_score.">
+                  {result.combined_score.toFixed(1)}
+                </span>
+                {" → "}{aiReview.combined_score_with_ai.toFixed(1)}
+                {aiReview.regions_error && (
+                  <div style={{ color: "#b45309" }}>⚠️ {aiReview.regions_error}</div>
+                )}
+                {aiReview.job_c_error && (
+                  <div style={{ color: "#b45309" }}>⚠️ {aiReview.job_c_error}</div>
                 )}
               </div>
-            </div>
+            </>
           )}
         </div>
       )}

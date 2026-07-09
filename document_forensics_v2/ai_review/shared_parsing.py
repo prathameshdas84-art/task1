@@ -1,8 +1,10 @@
 """
 Shared response-parsing/validation for AI Review providers (Gemini, NVIDIA
 NIM, and any future provider). Both providers are instructed (via their own,
-provider-specific prompts) to produce the exact same JSON contracts for Job
-A/B/C — this module is the ONE place that validates/coerces that JSON into
+provider-specific prompts) to produce the exact same JSON contracts for the
+merged region-review+explanation call (former Job A + Job B, now ONE
+request) and the independent scan (Job C) — this module is the ONE place
+that validates/coerces that JSON into
 the internal result structures the rest of the app (scoring, caching,
 frontend) consumes, so a NVIDIA response and a Gemini response for the same
 document produce byte-for-byte identically SHAPED results (values will
@@ -55,41 +57,19 @@ def coerce_to_text(value) -> str:
     return str(value).strip()
 
 
-def parse_explanation(raw: str, provider_label: str = "AI provider") -> dict:
-    """Job A. Best-effort structured parse — never raises. A malformed/
-    non-JSON reply degrades to putting everything in 'detail' with no
-    separated lead sentence, rather than losing the explanation outright
-    (unlike Job C, where a missing overall_assessment IS treated as a hard
-    failure — here there's always a reasonable degraded fallback)."""
-    try:
-        data = json.loads(strip_json_fences(raw))
-        if isinstance(data, dict) and "detail" in data:
-            return {
-                "lead_sentence": coerce_to_text(data.get("lead_sentence")) or None,
-                "detail": coerce_to_text(data.get("detail")),
-            }
-    except (ValueError, TypeError):
-        logger.warning("%s: could not parse Job A JSON reply, falling back to raw text:\n%s", provider_label, raw)
-    return {"lead_sentence": None, "detail": (raw or "").strip()}
-
-
-def parse_region_batch(raw: str, expected_n: int, provider_label: str = "AI provider") -> list:
-    """Job B (batched). Returns a list of length expected_n, in order, of
-    {"label": one of REGION_LABELS or "unavailable", "reasoning": str}.
-    Never raises — malformed/missing entries fill in as 'unavailable'
-    rather than losing the whole batch."""
+def _coerce_region_items(data, expected_n: int) -> list:
+    """Coerces the model's region-verdict JSON array into a list of length
+    expected_n, in order, of {"label": one of REGION_LABELS or
+    "unavailable", "reasoning": str}. Malformed/missing entries fill in as
+    'unavailable' rather than losing the whole batch."""
     parsed = {}
-    try:
-        data = json.loads(strip_json_fences(raw))
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                idx = item.get("index")
-                if isinstance(idx, int) and 1 <= idx <= expected_n:
-                    parsed[idx] = item
-    except (ValueError, TypeError):
-        logger.warning("%s: could not parse Job B batch JSON reply:\n%s", provider_label, raw)
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            if isinstance(idx, int) and 1 <= idx <= expected_n:
+                parsed[idx] = item
 
     out = []
     for i in range(1, expected_n + 1):
@@ -106,6 +86,62 @@ def parse_region_batch(raw: str, expected_n: int, provider_label: str = "AI prov
         reasoning = (item.get("reasoning") or "").strip()[:280] or "No reasoning returned."
         out.append({"label": label, "reasoning": reasoning})
     return out
+
+
+def _lenient_json_load(text: str):
+    """json.loads with one extra chance: a reply truncated just before its
+    final closing brace(s)/quote (seen in practice from NVIDIA NIM's text
+    model) gets the missing closers appended and re-tried, instead of
+    dumping an otherwise-perfect reply into the raw-text fallback."""
+    t = strip_json_fences(text)
+    try:
+        return json.loads(t)
+    except (ValueError, TypeError):
+        pass
+    for suffix in ("}", "}}", "}}}", '"}', '"}}', '"}}}'):
+        try:
+            return json.loads(t + suffix)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def parse_review_and_explanation(raw: str, expected_n: int,
+                                  provider_label: str = "AI provider") -> tuple:
+    """The MERGED region-review + explanation call (former Job A + Job B,
+    now one request — see api/ai_review_routes.py). Returns
+    (regions: list, explanation: dict):
+      regions — length expected_n, in order, each {"label": one of
+                REGION_LABELS or "unavailable", "reasoning": str}
+      explanation — {"lead_sentence": str|None, "detail": str}
+
+    Never raises. A reply that isn't a JSON object at all degrades to every
+    region 'unavailable' plus the raw text as the explanation detail — the
+    same per-half fallbacks the two separate calls used to have."""
+    data = _lenient_json_load(raw)
+    if not isinstance(data, dict):
+        logger.warning("%s: could not parse merged review/explanation JSON reply, "
+                       "falling back to raw text:\n%s", provider_label, raw)
+        regions = [{
+            "label": "unavailable",
+            "reasoning": "AI review unavailable for this item — the model's reply could not be parsed.",
+        } for _ in range(expected_n)]
+        return regions, {"lead_sentence": None, "detail": (raw or "").strip()}
+
+    regions = _coerce_region_items(data.get("regions"), expected_n)
+    expl_raw = data.get("explanation")
+    if not isinstance(expl_raw, dict):
+        expl_raw = {}
+    # Some models nest the whole explanation object INSIDE lead_sentence
+    # ({"explanation": {"lead_sentence": {"lead_sentence": ..., "detail":
+    # ...}}}) — unwrap rather than stringify a dict into the lead.
+    if isinstance(expl_raw.get("lead_sentence"), dict):
+        expl_raw = expl_raw["lead_sentence"]
+    explanation = {
+        "lead_sentence": coerce_to_text(expl_raw.get("lead_sentence")) or None,
+        "detail": coerce_to_text(expl_raw.get("detail")),
+    }
+    return regions, explanation
 
 
 def parse_cross_examination(raw: str, provider_label: str = "AI provider") -> dict:
