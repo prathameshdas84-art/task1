@@ -122,6 +122,22 @@ class SignalFusion:
     SCORE_PER_LAYER = 30
     PROXIMITY_BONUS = 10  # if findings are very close
 
+    # ── detect_contradictions() thresholds ──────────────────────────────
+    # Same-row test: the two bboxes' y-ranges must overlap by at least
+    # this fraction of the SMALLER box's height. Cells in the same table
+    # row share nearly their whole y-range even across font-size
+    # differences, while adjacent rows in dense tables graze each other
+    # by at most a few points of descender/padding — half the smaller
+    # height cleanly separates the two. (A 50pt center-radius was used
+    # before and vetoed genuine findings one row away from any label.)
+    SAME_ROW_MIN_Y_OVERLAP_FRACTION = 0.5
+    # Cross-page self-repetition: a finding whose text sits at the same
+    # position on this many distinct pages is page furniture (headers/
+    # footers/table headers), not an edit — edits are localized. Two
+    # pages can legitimately repeat (a duplicated summary page); three
+    # is header behavior.
+    CROSS_PAGE_REPEAT_MIN_PAGES = 3
+
     def fuse(self,
              suspicious_lines: list = None,
              numeric_anomalies: list = None,
@@ -328,17 +344,41 @@ class SignalFusion:
 
         return False
 
-    def _bbox_close(self, b1, b2) -> bool:
-        """Check if two bounding boxes overlap or are within threshold."""
+    def _bbox_overlaps(self, b1, b2) -> bool:
+        """TRUE rectangle intersection only — no proximity fallback."""
         if not b1 or not b2:
             return False
         x0_1, y0_1, x1_1, y1_1 = b1
         x0_2, y0_2, x1_2, y1_2 = b2
+        return (x0_1 < x1_2 and x1_1 > x0_2 and
+                y0_1 < y1_2 and y1_1 > y0_2)
 
-        # Overlap check
-        if (x0_1 < x1_2 and x1_1 > x0_2 and
-                y0_1 < y1_2 and y1_1 > y0_2):
+    def _same_row(self, b1, b2) -> bool:
+        """Do these two bboxes share a table/text row? True when their
+        y-ranges overlap by >= SAME_ROW_MIN_Y_OVERLAP_FRACTION of the
+        smaller box's height, regardless of horizontal distance — a header
+        and a data cell in the same row are the same structural element; a
+        label one row above or below is not, however close in raw distance.
+        Used by detect_contradictions(), where the question is identity
+        ("this finding sits ON page furniture"), not corroboration."""
+        if not b1 or not b2:
+            return False
+        y_overlap = min(b1[3], b2[3]) - max(b1[1], b2[1])
+        if y_overlap <= 0:
+            return False
+        smaller_h = min(b1[3] - b1[1], b2[3] - b2[1])
+        if smaller_h <= 0:
+            return True  # degenerate zero-height box that still intersects
+        return y_overlap >= self.SAME_ROW_MIN_Y_OVERLAP_FRACTION * smaller_h
+
+    def _bbox_close(self, b1, b2) -> bool:
+        """Check if two bounding boxes overlap or are within threshold."""
+        if self._bbox_overlaps(b1, b2):
             return True
+        if not b1 or not b2:
+            return False
+        x0_1, y0_1, x1_1, y1_1 = b1
+        x0_2, y0_2, x1_2, y1_2 = b2
 
         # Proximity check (centers)
         cx1, cy1 = (x0_1+x1_1)/2, (y0_1+y1_1)/2
@@ -437,11 +477,23 @@ class SignalFusion:
                                overlay_regions: list = None) -> Tuple[List[ContradictedFinding], dict]:
         """
         Detects when a finding from one layer is undermined by independent
-        structural evidence from another — currently, whether its bbox
-        overlaps a location content_analyzer.py already classified as
-        structural/repeated page furniture. Reuses the same overlap/
-        proximity heuristic as fuse() (_bbox_close) rather than a new
-        threshold. NEVER deletes the original finding.
+        structural evidence, via two tests — NEVER deleting the original
+        finding:
+
+        1. Same-row furniture: the finding shares a text/table row
+           (_same_row — substantial y-range overlap, any horizontal
+           distance) with a location content_analyzer.py classified as
+           structural/repeated page furniture. Unlike fuse(), no
+           center-proximity fallback: proximity is right for "these
+           anomalies corroborate" but wrong for "this finding IS page
+           furniture" — the old 50pt radius let label lines one row
+           above/below veto a genuine finding between them.
+        2. Cross-page self-repetition: the finding's own text appears at
+           the same position on CROSS_PAGE_REPEAT_MIN_PAGES+ distinct
+           pages. Repeating identically across pages is the definition of
+           page furniture (running table headers, footers) regardless of
+           whether content_analyzer's structural classifier caught that
+           specific line.
 
         structural_line_locations: list of {"page", "bbox", "text"} dicts —
         ContentReport.structural_line_locations, i.e. every line
@@ -454,22 +506,56 @@ class SignalFusion:
         locations = structural_line_locations or []
         contradicted: List[ContradictedFinding] = []
 
+        def _repeat_key(it, bbox):
+            # Position rounded to a 10pt cell + text prefix: identical
+            # running headers land on the same key across pages even with
+            # sub-point layout jitter. Returns None for text-less findings
+            # (ELA blocks, overlay rects): position-only repetition is
+            # trivially satisfied by grid-aligned visual regions and would
+            # let per-page noise suppress the visual layers wholesale —
+            # verbatim TEXT repeating at the same position is the actual
+            # page-furniture signature.
+            text = str(_field(it, "text", None) or _field(it, "word", None) or "")
+            if not text.strip():
+                return None
+            return (round(bbox[0] / 10), round(bbox[1] / 10), text[:25])
+
         def check(items, layer_name, rule_name):
+            # Pass 1 — group this layer's findings by (position, text) and
+            # count distinct pages, for the self-repetition test.
+            pages_by_key = {}
+            for it in items or []:
+                bbox = _field(it, "bbox")
+                if not bbox:
+                    continue
+                key = _repeat_key(it, tuple(bbox))
+                if key is not None:
+                    pages_by_key.setdefault(key, set()).add(_field(it, "page", 0))
+
             for it in items or []:
                 bbox = _field(it, "bbox")
                 page = _field(it, "page", 0)
                 if not bbox:
                     continue
                 bbox = tuple(bbox)
-                for loc in locations:
-                    if loc.get("page") != page or not loc.get("bbox"):
-                        continue
-                    if not self._bbox_close(bbox, tuple(loc["bbox"])):
-                        continue
-                    original_desc = (
-                        _field(it, "text", None) or _field(it, "reason", None)
-                        or _field(it, "word", None) or f"{layer_name} finding"
-                    )
+
+                # Both contradiction tests are claims about TEXT-row identity
+                # ("this finding IS that header/label/repeated line"), so they
+                # only apply to text-bearing findings. Visual-layer regions
+                # (ELA blocks, overlay rects) inevitably y-align with SOME
+                # text row on a dense page — row alignment says nothing about
+                # them being page furniture.
+                key = _repeat_key(it, bbox)
+                if key is None:
+                    continue
+                original_desc = (
+                    _field(it, "text", None) or _field(it, "reason", None)
+                    or _field(it, "word", None) or f"{layer_name} finding"
+                )
+
+                # Test 2 — cross-page self-repetition.
+                n_pages = len(pages_by_key.get(key, ()))
+                if n_pages >= self.CROSS_PAGE_REPEAT_MIN_PAGES:
                     contradicted.append(ContradictedFinding(
                         page=page,
                         bbox=bbox,
@@ -477,8 +563,29 @@ class SignalFusion:
                         original_description=str(original_desc)[:200],
                         contradiction_rule=rule_name,
                         contradicting_evidence=(
-                            f"Overlaps a line content_analyzer classified as structural/"
-                            f"repeated page furniture (\"{str(loc.get('text', ''))[:60]}\") "
+                            f"The same finding repeats at the same position on "
+                            f"{n_pages} pages — edits are typically localized; "
+                            f"uniform repetition is page furniture."
+                        ),
+                        weight_reduction_points=self.CONTRADICTION_DOWNWEIGHT_POINTS,
+                    ))
+                    continue  # one contradiction per finding
+
+                # Test 1 — same-row overlap with classified page furniture.
+                for loc in locations:
+                    if loc.get("page") != page or not loc.get("bbox"):
+                        continue
+                    if not self._same_row(bbox, tuple(loc["bbox"])):
+                        continue
+                    contradicted.append(ContradictedFinding(
+                        page=page,
+                        bbox=bbox,
+                        layer=layer_name,
+                        original_description=str(original_desc)[:200],
+                        contradiction_rule=rule_name,
+                        contradicting_evidence=(
+                            f"Shares a row with a line content_analyzer classified as "
+                            f"structural/repeated page furniture (\"{str(loc.get('text', ''))[:60]}\") "
                             f"— edits are typically localized, not uniformly repeated."
                         ),
                         weight_reduction_points=self.CONTRADICTION_DOWNWEIGHT_POINTS,
