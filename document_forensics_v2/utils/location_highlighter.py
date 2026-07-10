@@ -43,6 +43,13 @@ COLOR_OCR_SIZE  = (255, 100, 0)   # orange-red — OCR word font-size anomaly
 COLOR_OCR_COLOR = (255, 0, 200)   # magenta    — OCR word color anomaly
 COLOR_OCR_CONF  = (255, 140, 0)   # orange     — OCR word low-confidence anomaly
 COLOR_OCR_BASELINE = (0, 255, 120)  # green      — OCR word baseline-misalignment anomaly
+# Coordinate-collision text stacking (utils/hidden_text_extractor.detect_stacked_text)
+# — 2+ DIFFERENT text values at the same coordinates. Drawn in bright magenta
+# with a DASHED border so it reads as its own category even when it lands on
+# top of pymupdf's gold "ghost text" box (the two frequently co-locate on a
+# genuine paste-over) — the dash pattern lets the underlying box show through
+# rather than one solidly hiding the other.
+COLOR_TEXT_STACKING = (255, 0, 255)   # magenta (dashed) — hidden text stacking
 
 BOX_PADDING        = 4   # px padding added around each drawn box
 LABEL_HEIGHT        = 16  # px height of the label background strip
@@ -66,6 +73,7 @@ class LocationHighlighter:
         overlay_regions: list = None,
         age_days: int = None,
         fused_findings: list = None,
+        text_stacking_findings: list = None,
     ) -> dict:
         """
         Returns dict of {page_num: PIL.Image} with colored boxes drawn.
@@ -79,6 +87,11 @@ class LocationHighlighter:
         overlay_regions:     list of OverlayRegion from pymupdf_analyzer
         age_days:            document's last-modification age in days
         fused_findings:      list of FusedFinding from signal_fusion
+        text_stacking_findings: list of TextStackingFinding from
+                             hidden_text_extractor.detect_stacked_text (page is
+                             0-indexed, bbox in PDF points — the identical
+                             coordinate space as pymupdf's own overlay findings,
+                             so no conversion is needed)
         """
         # Blend factor applied to box base colors (recent = redder/brighter)
         age_mult = _age_color_intensity(age_days)
@@ -129,10 +142,15 @@ class LocationHighlighter:
         for r in (overlay_regions or []):
             overlay_by_page.setdefault(r.page, []).append(r)
 
+        stacking_by_page = {}
+        for r in (text_stacking_findings or []):
+            stacking_by_page.setdefault(r.page, []).append(r)
+
         all_pages = (set(lines_by_page.keys()) |
                      set(ocr_by_page.keys()) |
                      set(numeric_by_page.keys()) |
-                     set(overlay_by_page.keys()))
+                     set(overlay_by_page.keys()) |
+                     set(stacking_by_page.keys()))
         result = {}
 
         for page_num in sorted(all_pages):
@@ -253,6 +271,28 @@ class LocationHighlighter:
                         thickness=2,
                     )
 
+            # Draw text-stacking findings — MAGENTA DASHED boxes. A coordinate
+            # collision (2+ different text values at the same spot) is a strong,
+            # reliable signal, so — like the pymupdf overlays above — it's
+            # always drawn (no _should_draw_signal gate). The label sits BELOW
+            # the box and the border is dashed so it stays legible when it lands
+            # directly on top of pymupdf's gold "ghost text" box for the same
+            # paste-over.
+            for r in stacking_by_page.get(page_num, []):
+                vals = " / ".join(t[:14] for t in (r.texts or [])[:2])
+                self._draw_box(
+                    draw=draw,
+                    img_size=img.size,
+                    bbox=r.bbox,
+                    page_h_pts=page_h,
+                    color=COLOR_TEXT_STACKING,
+                    label=f"Hidden Text: {vals}" if vals else "Hidden Text Found",
+                    label_color=COLOR_TEXT_STACKING,
+                    thickness=2,
+                    dashed=True,
+                    label_below=True,
+                )
+
             # Age indicator badge — top-right corner of the page. Shows the
             # document's last-modification age (whole-file, not per-edit).
             self._draw_age_badge(draw, img.size[0], age_days)
@@ -370,6 +410,28 @@ class LocationHighlighter:
                 continue
         return ImageFont.load_default()
 
+    def _draw_dashed_rect(self, draw, x0, y0, x1, y1, color, dash=6, gap=4):
+        """Draw a dashed rectangle outline (PIL has no native dashed stroke)."""
+        def dashed_line(a, b, horizontal):
+            start = a
+            while start < b:
+                end = min(start + dash, b)
+                if horizontal is not None:  # horizontal edge at y=horizontal
+                    draw.line([start, horizontal, end, horizontal], fill=color)
+                start = end + gap
+        def dashed_vline(a, b, x):
+            start = a
+            while start < b:
+                end = min(start + dash, b)
+                draw.line([x, start, x, end], fill=color)
+                start = end + gap
+        if x1 < x0 or y1 < y0:
+            return
+        dashed_line(x0, x1, y0)   # top
+        dashed_line(x0, x1, y1)   # bottom
+        dashed_vline(y0, y1, x0)  # left
+        dashed_vline(y0, y1, x1)  # right
+
     def _draw_box(
         self,
         draw: ImageDraw.Draw,
@@ -380,10 +442,19 @@ class LocationHighlighter:
         label: str,
         label_color: tuple,
         thickness: int = 2,
+        dashed: bool = False,
+        label_below: bool = False,
     ):
         """
         Draw a colored rectangle on the image.
         Converts PDF points (top-left origin) to pixels (top-left origin).
+
+        dashed:      draw a dashed outline instead of a solid one — used so a
+                     box that co-locates with another layer's solid box stays
+                     distinguishable (the underlying box shows through the gaps).
+        label_below: place the label strip just below the box instead of above
+                     it — used to keep two co-located findings' labels from
+                     overprinting each other.
         """
         x0, y0, x1, y1 = bbox
         # Normalize ordering — PIL's rectangle() raises on x1<x0 / y1<y0,
@@ -410,15 +481,23 @@ class LocationHighlighter:
         # clamp above — collapse it to a zero-width box instead of crashing.
         px0 = min(px0, px1)
 
-        # Draw rectangle outline
-        for i in range(thickness):
-            draw.rectangle(
-                [px0 - i, py0 - i, px1 + i, py1 + i],
-                outline=color
-            )
+        # Draw rectangle outline (solid, or dashed when requested)
+        if dashed:
+            for i in range(thickness):
+                self._draw_dashed_rect(draw, px0 - i, py0 - i, px1 + i, py1 + i, color)
+        else:
+            for i in range(thickness):
+                draw.rectangle(
+                    [px0 - i, py0 - i, px1 + i, py1 + i],
+                    outline=color
+                )
 
-        # Draw label above the box
-        label_y = max(0, py0 - LABEL_VERTICAL_OFFSET)
+        # Draw label — above the box by default, or just below it when
+        # label_below is set (so co-located findings' labels don't overprint).
+        if label_below:
+            label_y = min(img_size[1] - LABEL_HEIGHT, py1 + 2)
+        else:
+            label_y = max(0, py0 - LABEL_VERTICAL_OFFSET)
         label_x = px0
 
         # Background for label

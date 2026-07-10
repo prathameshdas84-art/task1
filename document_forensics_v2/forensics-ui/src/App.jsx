@@ -34,6 +34,7 @@ const SIGNAL_COLORS = {
   "[NUMERIC]":  "#ffdd00",
   "[ELA]":      "#cc44ff",
   "[PYMUPDF]":  "#00ffcc",
+  "[TEXT_STACKING]": "#ff00ff",
 };
 
 // Renders **bold** markdown as real <strong> emphasis instead of literal
@@ -453,6 +454,9 @@ export default function App() {
   const suspiciousList = mergedFindings?.suspicious_lines    ?? result?.suspicious_lines;
   const numericList    = mergedFindings?.numeric_anomalies   ?? result?.numeric_anomalies;
   const ocrList        = mergedFindings?.ocr_word_anomalies  ?? result?.ocr_word_anomalies;
+  // Text-stacking findings aren't part of the AI-review merge, so they read
+  // straight off the base result.
+  const textStackingList = result?.text_stacking_findings ?? [];
 
   // Inline decorations for a finding the AI review contradicted — applied
   // on the SAME card, in place, instead of in a separate AI panel.
@@ -1736,9 +1740,47 @@ export default function App() {
                 </div>
               )}
 
+              {/* Text-stacking findings — 2+ different text values at the same
+                  coordinates (new text placed over original without removing
+                  it). Shows BOTH/all colliding values per location, not just
+                  the annotated box. */}
+              {textStackingList.length > 0 && (
+                <div className="section">
+                  <div className="section-title">
+                    🟪 Hidden Text Found — Text Stacking
+                    <span className="badge">{textStackingList.length}</span>
+                  </div>
+                  {textStackingList.map((ts, i) => (
+                    <div key={i} className="finding-card"
+                      style={{ borderLeft: "3px solid #ff00ff" }}>
+                      <div className="finding-header">
+                        Page {ts.page} ·{" "}
+                        <span style={{ color: "#ff00ff" }}>
+                          {ts.confidence} · {Math.round(ts.overlap_fraction * 100)}% overlap
+                        </span>
+                      </div>
+                      <div className="finding-text">
+                        {ts.texts.map((t, j) => (
+                          <span key={j}>
+                            {j > 0 && <span style={{ color: "#888" }}> vs </span>}
+                            <span style={{ color: "#fff" }}>"{t}"</span>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="finding-reason">
+                        → Two or more different text runs occupy the same
+                        location — new text placed over the original without
+                        removing it.
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {suspiciousList?.length === 0 &&
                numericList?.length === 0 &&
-               ocrList?.length === 0 && (
+               ocrList?.length === 0 &&
+               textStackingList.length === 0 && (
                 <div className="empty-state">
                   ✅ No specific line-level anomalies detected
                 </div>
@@ -1788,6 +1830,15 @@ export default function App() {
                   <span className="legend-dot" style={{ background: "#ffc800" }} />
                   Gold = Ghost text / overlapping layers
                 </span>
+                {textStackingList.length > 0 && (
+                  <span className="legend-item">
+                    <span className="legend-dot" style={{
+                      background: "#ff00ff",
+                      border: "1px dashed #fff",
+                    }} />
+                    Magenta (dashed) = Hidden Text Found (2+ values at same spot)
+                  </span>
+                )}
               </div>
 
               {/* Confidence note */}
