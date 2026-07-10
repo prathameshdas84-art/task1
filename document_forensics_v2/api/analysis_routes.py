@@ -244,6 +244,18 @@ async def analyze_document(file: UploadFile = File(...)):
                 100, pymupdf_report.anomaly_score + ts_layer_score
             )
 
+        # Hidden-text recovery (white-out / z-order overlap / incremental
+        # update) — DISPLAY only, no scoring impact (kept out of combine() and
+        # the fusion fold, exactly as before). Computed here once so the
+        # annotated image can draw a "Missing Data" / "Replaced Data" box; the
+        # full ungated report is also reused by the /hidden-text endpoint.
+        try:
+            hidden_text_report = HiddenTextExtractor().analyze(pdf_path)
+            hidden_text_findings = hidden_text_report.findings
+        except Exception:
+            hidden_text_report = None
+            hidden_text_findings = []
+
         if not all([meta_report, content_report, ocr_report]):
             failed = [name for name, r in [("metadata", meta_report), ("content", content_report), ("ocr", ocr_report)] if not r]
             raise HTTPException(
@@ -517,6 +529,10 @@ async def analyze_document(file: UploadFile = File(...)):
             # completely unchanged, exactly like every other coordinate-bearing
             # list above.
             text_stacking_findings = []
+            # Same for the hidden-text DRAWING list (the ungated
+            # hidden_text_report is kept for /hidden-text, whose panel
+            # intentionally surfaces recovered text regardless of verdict).
+            hidden_text_findings = []
 
         confidence = build_confidence_detail(
             verdict=verdict_obj.verdict,
@@ -622,6 +638,8 @@ async def analyze_document(file: UploadFile = File(...)):
             "overlay_regions": overlay_regions,
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
             "text_stacking_findings": text_stacking_findings,  # raw TextStackingFinding (0-indexed pages)
+            "hidden_text_findings": hidden_text_findings,       # gated-for-drawing HiddenTextFinding (1-indexed pages)
+            "hidden_text_report": hidden_text_report,           # full ungated report, reused by /hidden-text
             # Exposed for Layer 7 (api/ai_review_routes.py) so its AI-adjusted
             # verdict label uses the SAME effective threshold (including any
             # dynamic backdating adjustment combine() applied), not a
@@ -747,6 +765,7 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
                 age_days=age_days,
                 fused_findings=cached.get("fused_findings", []),
                 text_stacking_findings=cached.get("text_stacking_findings", []),
+                hidden_text_findings=cached.get("hidden_text_findings", []),
             )
             cached["highlighted_pages"] = highlighted
 
@@ -815,7 +834,12 @@ async def get_hidden_text(file_id: str):
         )
 
     try:
-        report = HiddenTextExtractor().analyze(pdf_path)
+        # Reuse the report already computed during /analyze when available
+        # (identical, ungated output) so the recovery methods don't run twice;
+        # fall back to computing on demand for any cache entry without it.
+        report = _analysis_cache[file_id].get("hidden_text_report")
+        if report is None:
+            report = HiddenTextExtractor().analyze(pdf_path)
         return {
             "file_id": file_id,
             "total_found": report.total_found,
@@ -831,7 +855,10 @@ async def get_hidden_text(file_id: str):
                     "confidence": f.confidence,
                     "description": f.description,
                     "field_type": f.field_type,
-                    "plain_explanation": f.plain_explanation
+                    "plain_explanation": f.plain_explanation,
+                    # missing = removed with nothing visible put in its place;
+                    # replaced = different visible text put over the original.
+                    "replacement_type": f.replacement_type,
                 }
                 for f in report.findings
             ]

@@ -51,6 +51,19 @@ COLOR_OCR_BASELINE = (0, 255, 120)  # green      — OCR word baseline-misalignm
 # rather than one solidly hiding the other.
 COLOR_TEXT_STACKING = (255, 0, 255)   # magenta (dashed) — hidden text stacking
 
+def _bbox_overlaps(b1, b2) -> bool:
+    """TRUE rectangle intersection (any shared area) — the same semantics as
+    signal_fusion.SignalFusion._bbox_overlaps. Used to decide "is this the SAME
+    location" for authoritative-box absorption; deliberately NOT a proximity or
+    same-row test (this is identity, not corroboration-by-nearness)."""
+    if not b1 or not b2:
+        return False
+    x0_1, y0_1, x1_1, y1_1 = b1
+    x0_2, y0_2, x1_2, y1_2 = b2
+    return (x0_1 < x1_2 and x1_1 > x0_2 and
+            y0_1 < y1_2 and y1_1 > y0_2)
+
+
 BOX_PADDING        = 4   # px padding added around each drawn box
 LABEL_HEIGHT        = 16  # px height of the label background strip
 LABEL_CHAR_WIDTH     = 6   # px width estimate per label character (monospace-ish)
@@ -74,6 +87,7 @@ class LocationHighlighter:
         age_days: int = None,
         fused_findings: list = None,
         text_stacking_findings: list = None,
+        hidden_text_findings: list = None,
     ) -> dict:
         """
         Returns dict of {page_num: PIL.Image} with colored boxes drawn.
@@ -92,6 +106,18 @@ class LocationHighlighter:
                              0-indexed, bbox in PDF points — the identical
                              coordinate space as pymupdf's own overlay findings,
                              so no conversion is needed)
+        hidden_text_findings: list of HiddenTextFinding from
+                             hidden_text_extractor.analyze (page is 1-INDEXED —
+                             unlike every other list here — so it is converted
+                             to 0-indexed below; bbox is in PDF points)
+
+        Hidden-text and text-stacking findings are the most specific,
+        authoritative explanation for a location. They are merged into a single
+        set of "authoritative boxes" per page; any content/numeric/OCR/pymupdf
+        finding that TRULY OVERLAPS one is folded into that box's "also flagged
+        by" label instead of drawing a second, redundant box (Part 2). This is a
+        pure DRAWING decision — no findings list, score, or fusion result is
+        altered.
         """
         # Blend factor applied to box base colors (recent = redder/brighter)
         age_mult = _age_color_intensity(age_days)
@@ -146,11 +172,18 @@ class LocationHighlighter:
         for r in (text_stacking_findings or []):
             stacking_by_page.setdefault(r.page, []).append(r)
 
+        # HiddenTextFinding.page is 1-indexed — convert to the 0-indexed page
+        # space every other list here uses.
+        hidden_by_page = {}
+        for r in (hidden_text_findings or []):
+            hidden_by_page.setdefault(r.page - 1, []).append(r)
+
         all_pages = (set(lines_by_page.keys()) |
                      set(ocr_by_page.keys()) |
                      set(numeric_by_page.keys()) |
                      set(overlay_by_page.keys()) |
-                     set(stacking_by_page.keys()))
+                     set(stacking_by_page.keys()) |
+                     set(hidden_by_page.keys()))
         result = {}
 
         for page_num in sorted(all_pages):
@@ -163,6 +196,16 @@ class LocationHighlighter:
             img = Image.frombytes("RGB", [pix.w, pix.h], pix.samples)
             draw = ImageDraw.Draw(img)
 
+            # Authoritative boxes for this page — hidden-text + text-stacking
+            # findings, merged where they overlap. Built BEFORE the other-layer
+            # loops so those loops can fold overlapping findings into a box's
+            # "also flagged by" list instead of drawing a redundant box, and
+            # drawn LAST (below) so their labels reflect every fold.
+            auth_boxes = self._build_auth_boxes(
+                stacking_by_page.get(page_num, []),
+                hidden_by_page.get(page_num, []),
+            )
+
             # Draw content layer suspicious lines (RED boxes).
             # Only drawn when the signal clears the strength threshold or the
             # page is already known-suspicious from multiple layers.
@@ -171,6 +214,11 @@ class LocationHighlighter:
                     page_num, strong_pages, cross_validated_pages,
                     signal_type="content", score=sl.score,
                 ):
+                    continue
+                # Part 2 — if this line overlaps an authoritative hidden/
+                # stacking box, fold it into that box's label instead of
+                # drawing a redundant red box on top.
+                if self._absorb_into_auth(auth_boxes, sl.bbox, "content"):
                     continue
                 self._draw_box(
                     draw=draw,
@@ -192,6 +240,8 @@ class LocationHighlighter:
             for r in ocr_by_page.get(page_num, []):
                 if not any(t in r.anomaly_types for t in ("color", "digital_paste")):
                     continue  # skip size / confidence / baseline — too noisy
+                if self._absorb_into_auth(auth_boxes, r.bbox, "ocr"):
+                    continue
                 self._draw_box(
                     draw=draw,
                     img_size=img.size,
@@ -213,6 +263,8 @@ class LocationHighlighter:
                     signal_type="numeric", z_score=r.z_score,
                     numeric_context=getattr(r, "context", ""),
                 ):
+                    continue
+                if self._absorb_into_auth(auth_boxes, r.bbox, "numeric"):
                     continue
                 self._draw_box(
                     draw=draw,
@@ -237,6 +289,12 @@ class LocationHighlighter:
             # char_spacing regions are too small (single character bboxes)
             # to usefully draw, so they're skipped.
             for r in overlay_by_page.get(page_num, []):
+                # A pymupdf overlay that sits on an authoritative hidden/
+                # stacking box is the same edit seen by another layer — fold it
+                # in rather than stacking a second box on top.
+                if r.overlay_type in ("covering_rect", "image_overlay", "ghost_text") \
+                        and self._absorb_into_auth(auth_boxes, r.bbox, "pymupdf"):
+                    continue
                 if r.overlay_type == "covering_rect":
                     self._draw_box(
                         draw=draw,
@@ -271,22 +329,21 @@ class LocationHighlighter:
                         thickness=2,
                     )
 
-            # Draw text-stacking findings — MAGENTA DASHED boxes. A coordinate
-            # collision (2+ different text values at the same spot) is a strong,
-            # reliable signal, so — like the pymupdf overlays above — it's
-            # always drawn (no _should_draw_signal gate). The label sits BELOW
-            # the box and the border is dashed so it stays legible when it lands
-            # directly on top of pymupdf's gold "ghost text" box for the same
-            # paste-over.
-            for r in stacking_by_page.get(page_num, []):
-                vals = " / ".join(t[:14] for t in (r.texts or [])[:2])
+            # Draw the authoritative hidden-text / text-stacking boxes LAST, so
+            # each label already reflects every other-layer finding folded into
+            # it above. MAGENTA DASHED, label below — always drawn (a strong,
+            # reliable signal), dashed so it stays legible where it lands on top
+            # of a pymupdf overlay box for the same edit. Label reads "Missing
+            # Data" / "Replaced Data" (not a generic "Hidden Text Found"), plus
+            # an "(also flagged by: …)" suffix when other layers agreed.
+            for box in auth_boxes:
                 self._draw_box(
                     draw=draw,
                     img_size=img.size,
-                    bbox=r.bbox,
+                    bbox=box["bbox"],
                     page_h_pts=page_h,
                     color=COLOR_TEXT_STACKING,
-                    label=f"Hidden Text: {vals}" if vals else "Hidden Text Found",
+                    label=self._auth_label(box),
                     label_color=COLOR_TEXT_STACKING,
                     thickness=2,
                     dashed=True,
@@ -409,6 +466,83 @@ class LocationHighlighter:
             except Exception:
                 continue
         return ImageFont.load_default()
+
+    # ── Authoritative (hidden-text / text-stacking) box handling ────────────
+
+    def _build_auth_boxes(self, stacking_findings: list, hidden_findings: list) -> list:
+        """Merge this page's text-stacking and hidden-text findings into one set
+        of authoritative boxes (overlapping ones combined into a single box, so
+        an edit caught by BOTH detectors draws once, not twice).
+
+        Each box is a dict: bbox, kind ("missing" | "replaced"), values (the
+        text values to show), also_flagged_by (set, filled in later)."""
+        raw = []
+        for r in (stacking_findings or []):
+            raw.append({
+                "bbox": tuple(r.bbox),
+                "kind": "replaced",   # a collision always has 2+ visible values
+                "values": list(getattr(r, "texts", []) or []),
+                "also_flagged_by": set(),
+            })
+        for r in (hidden_findings or []):
+            vals = [r.original_text]
+            if getattr(r, "replacement_type", "replaced") == "replaced" and r.covering_text:
+                vals.append(r.covering_text)
+            raw.append({
+                "bbox": tuple(r.bbox),
+                "kind": getattr(r, "replacement_type", "replaced"),
+                "values": vals,
+                "also_flagged_by": set(),
+            })
+
+        merged = []
+        for box in raw:
+            for m in merged:
+                if _bbox_overlaps(box["bbox"], m["bbox"]):
+                    m["bbox"] = (
+                        min(m["bbox"][0], box["bbox"][0]),
+                        min(m["bbox"][1], box["bbox"][1]),
+                        max(m["bbox"][2], box["bbox"][2]),
+                        max(m["bbox"][3], box["bbox"][3]),
+                    )
+                    # Any covering content present anywhere in the cluster means
+                    # this location is a replacement, not a pure removal.
+                    if box["kind"] == "replaced":
+                        m["kind"] = "replaced"
+                    for v in box["values"]:
+                        if v not in m["values"]:
+                            m["values"].append(v)
+                    break
+            else:
+                merged.append(box)
+        return merged
+
+    def _absorb_into_auth(self, auth_boxes: list, bbox, layer_name: str) -> bool:
+        """If `bbox` truly overlaps an authoritative box, record `layer_name` on
+        it (for the "also flagged by" label) and return True so the caller skips
+        drawing a redundant box. Returns False when there's no overlap."""
+        if not bbox or not auth_boxes:
+            return False
+        bbox = tuple(bbox)
+        for box in auth_boxes:
+            if _bbox_overlaps(bbox, box["bbox"]):
+                box["also_flagged_by"].add(layer_name)
+                return True
+        return False
+
+    def _auth_label(self, box: dict) -> str:
+        base = "Missing Data" if box["kind"] == "missing" else "Replaced Data"
+        vals = box.get("values") or []
+        if box["kind"] == "replaced" and len(vals) >= 2:
+            detail = f": {vals[0][:14]} -> {vals[1][:14]}"
+        elif vals:
+            detail = f": {vals[0][:20]}"
+        else:
+            detail = ""
+        label = base + detail
+        if box["also_flagged_by"]:
+            label += f" (also flagged by: {', '.join(sorted(box['also_flagged_by']))})"
+        return label
 
     def _draw_dashed_rect(self, draw, x0, y0, x1, y1, color, dash=6, gap=4):
         """Draw a dashed rectangle outline (PIL has no native dashed stroke)."""

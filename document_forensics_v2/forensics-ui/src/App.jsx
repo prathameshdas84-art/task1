@@ -457,6 +457,12 @@ export default function App() {
   // Text-stacking findings aren't part of the AI-review merge, so they read
   // straight off the base result.
   const textStackingList = result?.text_stacking_findings ?? [];
+  // Whether the annotated image draws a hidden-text (Missing/Replaced) box.
+  // The backend suppresses those boxes on an ORIGINAL-verdict document (the
+  // same is_clean gate every other box uses), so mirror that here to drive the
+  // legend — the /hidden-text panel itself still lists findings regardless.
+  const hiddenTextDrawn =
+    (hiddenTextData?.total_found ?? 0) > 0 && result?.verdict !== "ORIGINAL";
 
   // Inline decorations for a finding the AI review contradicted — applied
   // on the SAME card, in place, instead of in a separate AI panel.
@@ -1258,6 +1264,18 @@ export default function App() {
                         } Field
                       </span>
                       <span style={{
+                        backgroundColor: finding.replacement_type === 'missing' ? '#b45309' : '#7c3aed',
+                        color: 'white',
+                        fontSize: '11px',
+                        fontWeight: 'bold',
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.5px',
+                      }}>
+                        {finding.replacement_type === 'missing' ? 'Missing Data' : 'Replaced Data'}
+                      </span>
+                      <span style={{
                         marginLeft: 'auto',
                         backgroundColor: methodBadges[finding.method]?.color || '#6b7280',
                         color: 'white',
@@ -1308,7 +1326,9 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Replaced with */}
+                        {/* Right side: what's visible now — either the
+                            replacement text, or (for a "missing" finding) an
+                            explicit note that nothing was put in its place. */}
                         <div style={{
                           backgroundColor: '#fef2f2',
                           border: '1px solid #fca5a5',
@@ -1323,15 +1343,20 @@ export default function App() {
                             textTransform: 'uppercase',
                             letterSpacing: '0.5px',
                           }}>
-                            ❌ REPLACED WITH (visible text)
+                            {finding.replacement_type === 'missing'
+                              ? '🚫 REMOVED (nothing put in its place)'
+                              : '❌ REPLACED WITH (visible text)'}
                           </div>
                           <div style={{
-                            fontSize: '15px',
+                            fontSize: finding.replacement_type === 'missing' ? '13px' : '15px',
                             fontWeight: 'bold',
                             color: '#dc2626',
+                            fontStyle: finding.replacement_type === 'missing' ? 'italic' : 'normal',
                             wordBreak: 'break-word',
                           }}>
-                            {finding.covering_text || 'Unknown'}
+                            {finding.replacement_type === 'missing'
+                              ? 'No replacement text — the original was covered/removed with nothing visible in its place.'
+                              : (finding.covering_text || 'Unknown')}
                           </div>
                         </div>
                       </div>
@@ -1830,13 +1855,13 @@ export default function App() {
                   <span className="legend-dot" style={{ background: "#ffc800" }} />
                   Gold = Ghost text / overlapping layers
                 </span>
-                {textStackingList.length > 0 && (
+                {(textStackingList.length > 0 || hiddenTextDrawn) && (
                   <span className="legend-item">
                     <span className="legend-dot" style={{
                       background: "#ff00ff",
                       border: "1px dashed #fff",
                     }} />
-                    Magenta (dashed) = Hidden Text Found (2+ values at same spot)
+                    Magenta (dashed) = Hidden text — Missing / Replaced data
                   </span>
                 )}
               </div>

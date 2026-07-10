@@ -30,6 +30,13 @@ class HiddenTextFinding:
     description: str     # human readable explanation
     field_type: str = "unknown"   # auto-detected: name/amount/date/id_number/address/score/unknown
     plain_explanation: str = ""   # human readable explanation of HOW it was done
+    # "replaced" — original was hidden AND different visible text was put in its
+    # place (the classic, already-working case). "missing" — original was
+    # hidden/removed with NOTHING visibly put in its place (covering_text is
+    # empty/whitespace after normalization). Classified centrally in analyze();
+    # defaults to "replaced" so any finding built without going through analyze()
+    # keeps the historical behavior.
+    replacement_type: str = "replaced"   # "replaced" | "missing"
 
 
 @dataclass
@@ -178,9 +185,12 @@ class HiddenTextExtractor:
                     hidden_combined = " | ".join(
                         h["text"] for h in hidden_texts
                     )
+                    # Empty (not the "unknown" sentinel) when nothing was typed
+                    # over the cover box — a genuine "missing" white-out, which
+                    # analyze() classifies via covering_text below.
                     covering_combined = " | ".join(
                         c["text"] for c in covering_texts_full[:3]
-                    ) or "unknown"
+                    )
 
                     findings.append(HiddenTextFinding(
                         page=page_num + 1,
@@ -189,12 +199,9 @@ class HiddenTextExtractor:
                         covering_text=covering_combined,
                         bbox=tuple(white_rect),
                         confidence="HIGH",
-                        description=(
-                            f"White rectangle covers original text: "
-                            f"'{hidden_combined}' "
-                            f"| Replacement text nearby: "
-                            f"'{covering_combined}'"
-                        ),
+                        # Placeholder — analyze() rewrites this from
+                        # replacement_type so missing vs replaced reads clearly.
+                        description="",
                     ))
 
         doc.close()
@@ -406,9 +413,11 @@ class HiddenTextExtractor:
                      if s["text"] == removed_text), None
                 )
 
+                # Empty (not the "unknown" sentinel) when the revision removed
+                # text without adding anything back — a "missing" edit.
                 replacing_text = ", ".join(
                     t for t in added if len(t) >= 2
-                )[:100] or "unknown"
+                )[:100]
 
                 findings.append(HiddenTextFinding(
                     page=page_num + 1,
@@ -419,14 +428,42 @@ class HiddenTextExtractor:
                         original_span["bbox"]
                     ) if original_span else (0, 0, 0, 0),
                     confidence="HIGH",
-                    description=(
-                        f"Incremental update removed original text: "
-                        f"'{removed_text}' "
-                        f"| New text added: '{replacing_text}'"
-                    ),
+                    # Placeholder — analyze() rewrites this from replacement_type.
+                    description="",
                 ))
 
         return findings
+
+    # ── Missing-vs-replaced classification ──────────────────────────────
+
+    def _classify_replacement_type(self, covering_text: str) -> str:
+        """Classify a hidden-text finding by whether anything visible was put
+        in place of the hidden original.
+
+        "missing"  — covering_text is empty/whitespace after normalization (the
+                     legacy "unknown" sentinel is treated as missing too, for
+                     any finding produced before this field existed). The
+                     original was removed/covered with nothing visibly typed
+                     over it.
+        "replaced" — covering_text carries actual content (the existing,
+                     already-working case)."""
+        norm = re.sub(r"\s+", "", covering_text or "")
+        if not norm or norm.lower() == "unknown":
+            return "missing"
+        return "replaced"
+
+    def _compose_hidden_text_description(self, f: "HiddenTextFinding") -> str:
+        """Human-readable description that reads clearly for each case."""
+        orig = f.original_text[:60]
+        if f.replacement_type == "missing":
+            return (
+                f"Original data hidden — no replacement text visible: "
+                f"'{orig}' (content was removed, nothing put in its place)"
+            )
+        return (
+            f"Original data hidden and replaced with different visible text: "
+            f"'{orig}' → '{f.covering_text[:60]}'"
+        )
 
     # ── Field-type classification & plain-English explanations ──────────
 
@@ -730,22 +767,41 @@ class HiddenTextExtractor:
                 seen_locations.add(key)
                 unique_findings.append(f)
 
-        # Classify field type and attach a plain-English explanation
+        # Classify field type + missing/replaced, and attach a clear
+        # description and plain-English explanation for each case.
         for f in unique_findings:
             f.field_type = self._classify_field_type(f.original_text)
-            f.plain_explanation = self._get_plain_explanation(
-                f.method, f.field_type
-            )
+            f.replacement_type = self._classify_replacement_type(f.covering_text)
+            f.description = self._compose_hidden_text_description(f)
+            if f.replacement_type == "missing":
+                f.plain_explanation = (
+                    "The original content was hidden or removed with nothing "
+                    "visible put in its place. It still exists in the file's "
+                    "underlying data even though the page shows a blank or "
+                    "covered area where it used to be."
+                )
+            else:
+                f.plain_explanation = self._get_plain_explanation(
+                    f.method, f.field_type
+                )
 
         # Build signals for the main report
         signals = []
         for f in unique_findings:
-            signals.append(
-                f"[HIDDEN TEXT] Page {f.page} "
-                f"({f.method}): "
-                f"Original='{f.original_text[:50]}' "
-                f"Replaced by='{f.covering_text[:50]}'"
-            )
+            if f.replacement_type == "missing":
+                signals.append(
+                    f"[HIDDEN TEXT] Page {f.page} "
+                    f"({f.method}): "
+                    f"Original='{f.original_text[:50]}' "
+                    f"— data removed, no replacement visible"
+                )
+            else:
+                signals.append(
+                    f"[HIDDEN TEXT] Page {f.page} "
+                    f"({f.method}): "
+                    f"Original='{f.original_text[:50]}' "
+                    f"Replaced by='{f.covering_text[:50]}'"
+                )
 
         if unique_findings:
             methods_used = set(f.method for f in unique_findings)
