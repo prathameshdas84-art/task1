@@ -32,6 +32,7 @@ from models import (
     LayerScores, SuspiciousLine, NumericAnomaly, ConfidenceDetail,
     FullMetadata, FontDetail, PageDetail,
     FusedFindingModel, FusionStats, ContradictedFindingModel,
+    TextStackingFindingModel,
 )
 from fusion.signal_fusion import SignalFusion, FusedFinding
 from utils.hidden_text_extractor import HiddenTextExtractor
@@ -60,6 +61,21 @@ SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"}
 # boosting them would re-tune every already-flagged document's score.
 FUSION_ESCALATION_POINTS = {"HIGH": 10, "MEDIUM": 5}
 FUSION_ESCALATION_CAP = 15
+
+# ── Coordinate-collision text stacking ─────────────────────────────────────────
+# Two or more DIFFERENT texts occupying the same coordinates (see
+# utils/hidden_text_extractor.detect_stacked_text) cannot happen in a
+# legitimately laid-out document, so each such location is a much stronger
+# signal than a bare hidden-text run — scored well above pymupdf's per-region
+# ghost-text weight. Its MAGNITUDE is folded into the pymupdf overlay layer's
+# score (the engine's designated hidden-overlay layer) so it rides
+# WEIGHTS["pymupdf"] without adding a new weighted layer; a document with NO
+# collisions therefore keeps a byte-identical combined_score. Its FINDINGS
+# enter fusion as their own "text_stacking" layer (below) so they still
+# cross-validate with / can be contradicted by other layers, never an
+# automatic override.
+TEXT_STACKING_SCORE_PER_FINDING = 40
+TEXT_STACKING_SCORE_CAP = 80
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -207,6 +223,39 @@ async def analyze_document(file: UploadFile = File(...)):
         except Exception as e:
             xref_report = None
 
+        # NEW high-confidence check — coordinate-collision text stacking.
+        # Reads the same all-text-runs fitz data the hidden-text recovery
+        # already uses, but reports ONLY genuine 2+-distinct-text collisions
+        # (never a lone hidden run — that stays the recovery methods' job).
+        # Its magnitude is folded into the pymupdf overlay layer BEFORE
+        # combine() so it rides WEIGHTS["pymupdf"]; its findings are handed
+        # to fusion below as their own layer. Zero collisions ⇒ no change.
+        try:
+            text_stacking_findings = HiddenTextExtractor().detect_stacked_text(pdf_path)
+        except Exception:
+            text_stacking_findings = []
+
+        if text_stacking_findings and pymupdf_report is not None:
+            ts_layer_score = min(
+                TEXT_STACKING_SCORE_CAP,
+                len(text_stacking_findings) * TEXT_STACKING_SCORE_PER_FINDING,
+            )
+            pymupdf_report.anomaly_score = min(
+                100, pymupdf_report.anomaly_score + ts_layer_score
+            )
+
+        # Hidden-text recovery (white-out / z-order overlap / incremental
+        # update) — DISPLAY only, no scoring impact (kept out of combine() and
+        # the fusion fold, exactly as before). Computed here once so the
+        # annotated image can draw a "Missing Data" / "Replaced Data" box; the
+        # full ungated report is also reused by the /hidden-text endpoint.
+        try:
+            hidden_text_report = HiddenTextExtractor().analyze(pdf_path)
+            hidden_text_findings = hidden_text_report.findings
+        except Exception:
+            hidden_text_report = None
+            hidden_text_findings = []
+
         if not all([meta_report, content_report, ocr_report]):
             failed = [name for name, r in [("metadata", meta_report), ("content", content_report), ("ocr", ocr_report)] if not r]
             raise HTTPException(
@@ -254,6 +303,24 @@ async def analyze_document(file: UploadFile = File(...)):
             combined_score=verdict_obj.combined_score,
             verdict=verdict_obj.verdict,
         )
+
+        # Surface each text-stacking collision as its own signal (page + bbox
+        # + both/all colliding values + confidence). The score already rode
+        # through pymupdf's WEIGHTS contribution above; these lines are the
+        # human-readable evidence. Zero collisions ⇒ nothing appended ⇒
+        # signals stay byte-identical for clean documents.
+        if text_stacking_findings:
+            verdict_obj.all_signals = (verdict_obj.all_signals or []) + [
+                f"[TEXT_STACKING] {len(text_stacking_findings)} location(s) where 2+ "
+                f"different text runs occupy the same coordinates — new text placed "
+                f"over original without removing it"
+            ] + [
+                f"[TEXT_STACKING] Page {f.page + 1} "
+                f"bbox={tuple(round(v, 1) for v in f.bbox)} "
+                f"({f.confidence}, {f.overlap_fraction*100:.0f}% overlap): "
+                + " vs ".join(f"'{t[:40]}'" for t in f.texts)
+                for f in text_stacking_findings
+            ]
 
         processing_time = round(time.time() - start_time, 2)
 
@@ -324,6 +391,24 @@ async def analyze_document(file: UploadFile = File(...)):
             for a in ((ocr_report.pixel_anomalies if ocr_report else None) or [])
         ]
 
+        # Coordinate-collision text-stacking findings enter fusion as their
+        # OWN layer ("text_stacking"), pre-normalized, exactly like the OCR
+        # pixel and image-pipeline findings — so a genuine stacked edit can
+        # cross-validate with the pymupdf/content/numeric layers that flag the
+        # same spot, rather than being an automatic override. Pages are
+        # already 0-indexed (see TextStackingFinding).
+        text_stacking_extra = [
+            {
+                "layer": "text_stacking",
+                "page": f.page,
+                "bbox": tuple(f.bbox) if f.bbox else None,
+                "text": " | ".join(f.texts)[:80],
+                "score": f.score,
+                "raw": f,
+            }
+            for f in text_stacking_findings
+        ]
+
         # Cross-layer signal fusion — regions confirmed by 2+ layers. Besides
         # being surfaced in the response, cross-validated findings can now
         # escalate a borderline ORIGINAL verdict (see escalation block below).
@@ -335,7 +420,7 @@ async def analyze_document(file: UploadFile = File(...)):
             ocr_regions=ocr_word_anomalies,
             overlay_regions=overlay_regions,
             metadata_findings=metadata_findings,
-            extra_findings=ocr_pixel_findings,
+            extra_findings=ocr_pixel_findings + text_stacking_extra,
         )
 
         # Contradiction-aware fusion (Phase 1, additive) — a finding from one
@@ -438,6 +523,16 @@ async def analyze_document(file: UploadFile = File(...)):
             overlay_regions = []
             fused_findings = []
             contradicted_findings = []
+            # A document whose FINAL verdict is ORIGINAL draws no boxes — the
+            # text-stacking findings are suppressed here too so a clean
+            # document's annotated image (and its response list/legend) stays
+            # completely unchanged, exactly like every other coordinate-bearing
+            # list above.
+            text_stacking_findings = []
+            # Same for the hidden-text DRAWING list (the ungated
+            # hidden_text_report is kept for /hidden-text, whose panel
+            # intentionally surfaces recovered text regardless of verdict).
+            hidden_text_findings = []
 
         confidence = build_confidence_detail(
             verdict=verdict_obj.verdict,
@@ -508,6 +603,17 @@ async def analyze_document(file: UploadFile = File(...)):
                 )
                 for c in contradicted_findings
             ],
+            text_stacking_findings=[
+                TextStackingFindingModel(
+                    page=f.page + 1,  # 1-indexed for display
+                    bbox=[float(v) for v in f.bbox],
+                    texts=list(f.texts),
+                    overlap_fraction=round(f.overlap_fraction, 3),
+                    confidence=f.confidence,
+                    description=f.description,
+                )
+                for f in text_stacking_findings
+            ],
             summary=build_summary(
                 verdict=verdict_obj.verdict,
                 combined_score=verdict_obj.combined_score,
@@ -531,6 +637,9 @@ async def analyze_document(file: UploadFile = File(...)):
             "ocr_word_anomalies": ocr_word_anomalies,
             "overlay_regions": overlay_regions,
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
+            "text_stacking_findings": text_stacking_findings,  # raw TextStackingFinding (0-indexed pages)
+            "hidden_text_findings": hidden_text_findings,       # gated-for-drawing HiddenTextFinding (1-indexed pages)
+            "hidden_text_report": hidden_text_report,           # full ungated report, reused by /hidden-text
             # Exposed for Layer 7 (api/ai_review_routes.py) so its AI-adjusted
             # verdict label uses the SAME effective threshold (including any
             # dynamic backdating adjustment combine() applied), not a
@@ -655,6 +764,8 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
                 overlay_regions=cached.get("overlay_regions", []),
                 age_days=age_days,
                 fused_findings=cached.get("fused_findings", []),
+                text_stacking_findings=cached.get("text_stacking_findings", []),
+                hidden_text_findings=cached.get("hidden_text_findings", []),
             )
             cached["highlighted_pages"] = highlighted
 
@@ -723,7 +834,12 @@ async def get_hidden_text(file_id: str):
         )
 
     try:
-        report = HiddenTextExtractor().analyze(pdf_path)
+        # Reuse the report already computed during /analyze when available
+        # (identical, ungated output) so the recovery methods don't run twice;
+        # fall back to computing on demand for any cache entry without it.
+        report = _analysis_cache[file_id].get("hidden_text_report")
+        if report is None:
+            report = HiddenTextExtractor().analyze(pdf_path)
         return {
             "file_id": file_id,
             "total_found": report.total_found,
@@ -739,7 +855,10 @@ async def get_hidden_text(file_id: str):
                     "confidence": f.confidence,
                     "description": f.description,
                     "field_type": f.field_type,
-                    "plain_explanation": f.plain_explanation
+                    "plain_explanation": f.plain_explanation,
+                    # missing = removed with nothing visible put in its place;
+                    # replaced = different visible text put over the original.
+                    "replacement_type": f.replacement_type,
                 }
                 for f in report.findings
             ]

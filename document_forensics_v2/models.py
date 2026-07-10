@@ -148,6 +148,19 @@ class FusionStats(BaseModel):
     fusion_groups: int = 0
 
 
+class TextStackingFindingModel(BaseModel):
+    """A coordinate-collision text-stacking finding — 2+ different text values
+    occupying the same location (new text placed over original without removing
+    it). Surfaced so the UI can show both/all colliding values per location,
+    not just an annotated box."""
+    page: int                     # 1-indexed for display
+    bbox: list[float]
+    texts: list[str]              # the distinct colliding text values
+    overlap_fraction: float       # 0.0-1.0 strongest pairwise overlap
+    confidence: str               # HIGH
+    description: str
+
+
 class ContradictedFindingModel(BaseModel):
     page: int
     bbox: list[float]
@@ -198,6 +211,11 @@ class ForensicResponse(BaseModel):
     # score was reduced (never deleted) because independent structural
     # evidence from another layer undermined them.
     contradicted_findings: list[ContradictedFindingModel] = []
+
+    # Coordinate-collision text stacking — locations where 2+ different text
+    # values occupy the same coordinates (new text placed over original without
+    # removing it). Empty for documents with no such collision.
+    text_stacking_findings: list[TextStackingFindingModel] = []
 
     # Summary
     summary: str

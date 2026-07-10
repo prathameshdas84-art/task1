@@ -34,6 +34,7 @@ const SIGNAL_COLORS = {
   "[NUMERIC]":  "#ffdd00",
   "[ELA]":      "#cc44ff",
   "[PYMUPDF]":  "#00ffcc",
+  "[TEXT_STACKING]": "#ff00ff",
 };
 
 // Renders **bold** markdown as real <strong> emphasis instead of literal
@@ -453,6 +454,15 @@ export default function App() {
   const suspiciousList = mergedFindings?.suspicious_lines    ?? result?.suspicious_lines;
   const numericList    = mergedFindings?.numeric_anomalies   ?? result?.numeric_anomalies;
   const ocrList        = mergedFindings?.ocr_word_anomalies  ?? result?.ocr_word_anomalies;
+  // Text-stacking findings aren't part of the AI-review merge, so they read
+  // straight off the base result.
+  const textStackingList = result?.text_stacking_findings ?? [];
+  // Whether the annotated image draws a hidden-text (Missing/Replaced) box.
+  // The backend suppresses those boxes on an ORIGINAL-verdict document (the
+  // same is_clean gate every other box uses), so mirror that here to drive the
+  // legend — the /hidden-text panel itself still lists findings regardless.
+  const hiddenTextDrawn =
+    (hiddenTextData?.total_found ?? 0) > 0 && result?.verdict !== "ORIGINAL";
 
   // Inline decorations for a finding the AI review contradicted — applied
   // on the SAME card, in place, instead of in a separate AI panel.
@@ -1254,6 +1264,18 @@ export default function App() {
                         } Field
                       </span>
                       <span style={{
+                        backgroundColor: finding.replacement_type === 'missing' ? '#b45309' : '#7c3aed',
+                        color: 'white',
+                        fontSize: '11px',
+                        fontWeight: 'bold',
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.5px',
+                      }}>
+                        {finding.replacement_type === 'missing' ? 'Missing Data' : 'Replaced Data'}
+                      </span>
+                      <span style={{
                         marginLeft: 'auto',
                         backgroundColor: methodBadges[finding.method]?.color || '#6b7280',
                         color: 'white',
@@ -1304,7 +1326,9 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Replaced with */}
+                        {/* Right side: what's visible now — either the
+                            replacement text, or (for a "missing" finding) an
+                            explicit note that nothing was put in its place. */}
                         <div style={{
                           backgroundColor: '#fef2f2',
                           border: '1px solid #fca5a5',
@@ -1319,15 +1343,20 @@ export default function App() {
                             textTransform: 'uppercase',
                             letterSpacing: '0.5px',
                           }}>
-                            ❌ REPLACED WITH (visible text)
+                            {finding.replacement_type === 'missing'
+                              ? '🚫 REMOVED (nothing put in its place)'
+                              : '❌ REPLACED WITH (visible text)'}
                           </div>
                           <div style={{
-                            fontSize: '15px',
+                            fontSize: finding.replacement_type === 'missing' ? '13px' : '15px',
                             fontWeight: 'bold',
                             color: '#dc2626',
+                            fontStyle: finding.replacement_type === 'missing' ? 'italic' : 'normal',
                             wordBreak: 'break-word',
                           }}>
-                            {finding.covering_text || 'Unknown'}
+                            {finding.replacement_type === 'missing'
+                              ? 'No replacement text — the original was covered/removed with nothing visible in its place.'
+                              : (finding.covering_text || 'Unknown')}
                           </div>
                         </div>
                       </div>
@@ -1736,9 +1765,47 @@ export default function App() {
                 </div>
               )}
 
+              {/* Text-stacking findings — 2+ different text values at the same
+                  coordinates (new text placed over original without removing
+                  it). Shows BOTH/all colliding values per location, not just
+                  the annotated box. */}
+              {textStackingList.length > 0 && (
+                <div className="section">
+                  <div className="section-title">
+                    🟪 Hidden Text Found — Text Stacking
+                    <span className="badge">{textStackingList.length}</span>
+                  </div>
+                  {textStackingList.map((ts, i) => (
+                    <div key={i} className="finding-card"
+                      style={{ borderLeft: "3px solid #ff00ff" }}>
+                      <div className="finding-header">
+                        Page {ts.page} ·{" "}
+                        <span style={{ color: "#ff00ff" }}>
+                          {ts.confidence} · {Math.round(ts.overlap_fraction * 100)}% overlap
+                        </span>
+                      </div>
+                      <div className="finding-text">
+                        {ts.texts.map((t, j) => (
+                          <span key={j}>
+                            {j > 0 && <span style={{ color: "#888" }}> vs </span>}
+                            <span style={{ color: "#fff" }}>"{t}"</span>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="finding-reason">
+                        → Two or more different text runs occupy the same
+                        location — new text placed over the original without
+                        removing it.
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {suspiciousList?.length === 0 &&
                numericList?.length === 0 &&
-               ocrList?.length === 0 && (
+               ocrList?.length === 0 &&
+               textStackingList.length === 0 && (
                 <div className="empty-state">
                   ✅ No specific line-level anomalies detected
                 </div>
@@ -1788,6 +1855,15 @@ export default function App() {
                   <span className="legend-dot" style={{ background: "#ffc800" }} />
                   Gold = Ghost text / overlapping layers
                 </span>
+                {(textStackingList.length > 0 || hiddenTextDrawn) && (
+                  <span className="legend-item">
+                    <span className="legend-dot" style={{
+                      background: "#ff00ff",
+                      border: "1px dashed #fff",
+                    }} />
+                    Magenta (dashed) = Hidden text — Missing / Replaced data
+                  </span>
+                )}
               </div>
 
               {/* Confidence note */}
