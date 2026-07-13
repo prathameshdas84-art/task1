@@ -75,6 +75,7 @@ _CONTENT_LABEL_PREFIXES = [
     ("sharpness",            "Sharpness Outlier"),
     ("unnaturally uniform",  "Uniform Spacing (Retyped?)"),
     ("replacement character", "Font Encoding Mismatch"),
+    ("[line_gap]",           "Abnormal Line Gap"),
 ]
 
 

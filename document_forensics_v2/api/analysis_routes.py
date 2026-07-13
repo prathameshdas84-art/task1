@@ -32,7 +32,7 @@ from models import (
     LayerScores, SuspiciousLine, NumericAnomaly, ConfidenceDetail,
     FullMetadata, FontDetail, PageDetail,
     FusedFindingModel, FusionStats, ContradictedFindingModel,
-    TextStackingFindingModel,
+    TextStackingFindingModel, EmbeddedImageFindingModel,
 )
 from fusion.signal_fusion import SignalFusion, FusedFinding
 from utils.hidden_text_extractor import HiddenTextExtractor
@@ -673,6 +673,17 @@ async def analyze_document(file: UploadFile = File(...)):
                 )
                 for f in text_stacking_findings
             ],
+            embedded_image_findings=[
+                EmbeddedImageFindingModel(
+                    page=f["page"] + 1,  # 1-indexed for display
+                    bbox=[float(v) for v in f["bbox"]],
+                    label=f["label"],
+                    detail=f["text"],
+                    confidence=f["score"],
+                    evidence_check=f["evidence_check"],
+                )
+                for f in embedded_image_findings
+            ],
             summary=build_summary(
                 verdict=verdict_obj.verdict,
                 combined_score=verdict_obj.combined_score,
@@ -742,17 +753,6 @@ async def analyze_document(file: UploadFile = File(...)):
             "avg_confidence": ocr_report.avg_confidence if ocr_report else 0,
         }
         result_dict["incremental_updates"] = ela_report.incremental_updates if ela_report else {}
-        result_dict["embedded_image_findings"] = [
-            {
-                "page": f["page"] + 1,  # 1-indexed for display
-                "bbox": [float(v) for v in f["bbox"]],
-                "label": f["label"],
-                "detail": f["text"],
-                "confidence": f["score"],
-                "evidence_check": f["evidence_check"],
-            }
-            for f in embedded_image_findings
-        ]
         return result_dict
 
     except HTTPException:

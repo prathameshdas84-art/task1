@@ -190,8 +190,20 @@ def main():
         stubbed = run(tampered_pdf)
     finally:
         eif.analyze_embedded_images = orig_fn
-    check(real["metadata"] == stubbed["metadata"],
-          "response.metadata identical (full dict equality)")
+    # metadata.authenticity is BY DESIGN recomputed from the final combined
+    # verdict (analysis_routes: "Recompute authenticity now that the
+    # cross-layer verdict exists") — so it legitimately reflects the score
+    # this check contributed. Everything else in the metadata output — the
+    # actual metadata ANALYSIS — must be byte-identical.
+    m_real = {k: v for k, v in real["metadata"].items() if k != "authenticity"}
+    m_stub = {k: v for k, v in stubbed["metadata"].items() if k != "authenticity"}
+    diff_keys = sorted(
+        set(k for k in real["metadata"] if real["metadata"][k] != stubbed["metadata"].get(k))
+    )
+    check(m_real == m_stub,
+          "metadata analysis identical (all fields except verdict-derived authenticity)")
+    check(diff_keys in ([], ["authenticity"]),
+          f"only the verdict-derived authenticity block may differ (diff={diff_keys})")
     check(real["layers"]["metadata"] == stubbed["layers"]["metadata"],
           f"metadata layer score identical ({real['layers']['metadata']})")
     check(real["layers"]["ela"] > stubbed["layers"]["ela"],

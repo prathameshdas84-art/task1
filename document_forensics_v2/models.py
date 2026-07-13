@@ -161,6 +161,20 @@ class TextStackingFindingModel(BaseModel):
     description: str
 
 
+class EmbeddedImageFindingModel(BaseModel):
+    """A finding from running the standalone image pipeline's checks on an
+    embedded raster image XObject extracted from the PDF (utils/
+    embedded_image_forensics) — distinct from page-level ELA findings, which
+    analyze whole-page renders. bbox is already mapped into the parent
+    page's point space through the image's placement rect."""
+    page: int                     # 1-indexed for display
+    bbox: list[float]
+    label: str                    # e.g. "Embedded Image: Cutout Edge"
+    detail: str
+    confidence: float             # 0.0-1.0
+    evidence_check: str           # image-pipeline check id, e.g. "check9_stamp_boundary"
+
+
 class ContradictedFindingModel(BaseModel):
     page: int
     bbox: list[float]
@@ -216,6 +230,12 @@ class ForensicResponse(BaseModel):
     # values occupy the same coordinates (new text placed over original without
     # removing it). Empty for documents with no such collision.
     text_stacking_findings: list[TextStackingFindingModel] = []
+
+    # Embedded-image forensics — the image pipeline's checks run on raster
+    # image XObjects extracted from the PDF itself. Empty when no embedded
+    # image qualifies or none shows anomalies. (Declared here because
+    # response_model filtering drops undeclared keys from the payload.)
+    embedded_image_findings: list[EmbeddedImageFindingModel] = []
 
     # Summary
     summary: str
