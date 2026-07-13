@@ -33,6 +33,9 @@ RENDER_DPI = 150  # page render resolution, matches the DPI used for box-coordin
 
 # Box colors per signal source, RGB. Each layer gets a distinct color so a
 # page with multiple anomaly types is still visually distinguishable.
+# COLOR = which layer flagged it; the box LABEL states the specific finding
+# (derived from the finding's own reason/type, not a generic layer name) —
+# see the _*_label helpers below.
 COLOR_CONTENT = (255, 50, 50)    # red    — font/spacing anomaly (content_analyzer)
 COLOR_NUMERIC = (255, 220, 0)    # yellow — numeric outlier
 COLOR_ELA     = (180, 0, 255)    # purple — ELA outlier (image edit)
@@ -50,6 +53,72 @@ COLOR_OCR_BASELINE = (0, 255, 120)  # green      — OCR word baseline-misalignm
 # genuine paste-over) — the dash pattern lets the underlying box show through
 # rather than one solidly hiding the other.
 COLOR_TEXT_STACKING = (255, 0, 255)   # magenta (dashed) — hidden text stacking
+# Embedded-image forensics (utils/embedded_image_forensics) — the image
+# pipeline's checks run on an image OBJECT extracted from the PDF, with
+# findings mapped into page space. Green: no other drawn layer uses it.
+COLOR_EMBEDDED_IMAGE = (0, 190, 90)
+
+
+# ── Box-label helpers ───────────────────────────────────────────────────────
+# Each label states WHAT was found, short enough for the one-line label
+# strip; the full detail lives in the findings list / signals, not here.
+
+# Content-layer anomaly strings (content_analyzer) → short specific labels.
+# Matched by prefix against the finding's own first anomaly reason.
+_CONTENT_LABEL_PREFIXES = [
+    ("font size",            "Font Size Mismatch"),
+    ("font:",                "Font Mismatch"),
+    ("char spacing",         "Char Spacing Anomaly"),
+    ("word spacing",         "Word Spacing Anomaly"),
+    ("line height",          "Line Height Anomaly"),
+    ("visual noise",         "Visual Noise Outlier"),
+    ("sharpness",            "Sharpness Outlier"),
+    ("unnaturally uniform",  "Uniform Spacing (Retyped?)"),
+    ("replacement character", "Font Encoding Mismatch"),
+]
+
+
+def _content_label(sl) -> str:
+    reason = (sl.anomalies[0] if getattr(sl, "anomalies", None) else "").strip()
+    low = reason.lower()
+    for prefix, label in _CONTENT_LABEL_PREFIXES:
+        if low.startswith(prefix):
+            return f"Line {sl.line_num + 1}: {label}"
+    # Unknown anomaly type — fall back to the finding's own reason text.
+    return f"Line {sl.line_num + 1}: {reason[:34] if reason else 'Content Anomaly'}"
+
+
+def _numeric_label(r) -> str:
+    ctx = (getattr(r, "context", "") or "")
+    if ctx.startswith("running_balance"):
+        return "Balance Mismatch"
+    if ctx.startswith("arithmetic_"):
+        return "Arithmetic Inconsistency"
+    return f"Statistical Outlier (z={r.z_score:.1f})"
+
+
+def _ocr_label(r) -> str:
+    # Only color/digital_paste anomalies are drawn (see the loop below);
+    # digital_paste is the stronger, more specific claim when both fired.
+    if "digital_paste" in r.anomaly_types:
+        return "Digital Paste Artifact"
+    return "Font Color Mismatch"
+
+
+# PyMuPDF overlay_type → specific label.
+_OVERLAY_LABELS = {
+    "covering_rect": "White-Out Cover-Up",
+    "image_overlay": "Hidden Image Overlay",
+    "ghost_text":    "Ghost Text (Layered)",
+}
+
+
+def _flat_zone_label(r) -> str:
+    # ELA-layer flat/pasted-patch regions (ela_analyzer flat-zone check).
+    if getattr(r, "stamp_associated", False):
+        return "Pasted Stamp: Flat Background"
+    return "Flat Region: Texture Mismatch"
+
 
 def _bbox_overlaps(b1, b2) -> bool:
     """TRUE rectangle intersection (any shared area) — the same semantics as
@@ -88,6 +157,7 @@ class LocationHighlighter:
         fused_findings: list = None,
         text_stacking_findings: list = None,
         hidden_text_findings: list = None,
+        embedded_image_findings: list = None,
     ) -> dict:
         """
         Returns dict of {page_num: PIL.Image} with colored boxes drawn.
@@ -96,8 +166,12 @@ class LocationHighlighter:
         suspicious_lines:    list of SuspiciousLine from content_analyzer
         ocr_word_anomalies:  list of OCRWordAnomaly from ocr_analyzer
         numeric_anomalies:   list of NumericAnomaly from numeric_analyzer
-        ela_regions:         list of ELARegion from ela_analyzer (not drawn,
-                             but counted for strong-page detection)
+        ela_regions:         list of ELARegion from ela_analyzer. Block-grid
+                             regions are counted for strong-page detection but
+                             not drawn (too imprecise spatially); flat-zone
+                             regions (flat_zone_anomaly=True) ARE drawn in
+                             purple — their bbox is the pixel-refined flat
+                             patch itself
         overlay_regions:     list of OverlayRegion from pymupdf_analyzer
         age_days:            document's last-modification age in days
         fused_findings:      list of FusedFinding from signal_fusion
@@ -110,6 +184,10 @@ class LocationHighlighter:
                              hidden_text_extractor.analyze (page is 1-INDEXED —
                              unlike every other list here — so it is converted
                              to 0-indexed below; bbox is in PDF points)
+        embedded_image_findings: list of normalized dicts from
+                             utils/embedded_image_forensics (0-indexed page,
+                             bbox already mapped into PDF points, "label"
+                             carries the specific finding text)
 
         Hidden-text and text-stacking findings are the most specific,
         authoritative explanation for a location. They are merged into a single
@@ -160,6 +238,19 @@ class LocationHighlighter:
         for r in (ocr_word_anomalies or []):
             ocr_by_page.setdefault(r.page, []).append(r)
 
+        # ELA flat/pasted-patch regions ARE drawn (rare, high-precision,
+        # pixel-exact bbox) — unlike ELA's block-grid regions, whose spatial
+        # imprecision keeps them out of the annotation entirely (see the
+        # comment where their loop used to be).
+        flat_zone_by_page = {}
+        for r in (ela_regions or []):
+            if getattr(r, "flat_zone_anomaly", False):
+                flat_zone_by_page.setdefault(r.page, []).append(r)
+
+        embedded_by_page = {}
+        for f in (embedded_image_findings or []):
+            embedded_by_page.setdefault(f["page"], []).append(f)
+
         numeric_by_page = {}
         for r in (numeric_anomalies or []):
             numeric_by_page.setdefault(r.page, []).append(r)
@@ -182,6 +273,8 @@ class LocationHighlighter:
                      set(ocr_by_page.keys()) |
                      set(numeric_by_page.keys()) |
                      set(overlay_by_page.keys()) |
+                     set(flat_zone_by_page.keys()) |
+                     set(embedded_by_page.keys()) |
                      set(stacking_by_page.keys()) |
                      set(hidden_by_page.keys()))
         result = {}
@@ -226,7 +319,7 @@ class LocationHighlighter:
                     bbox=sl.bbox,
                     page_h_pts=page_h,
                     color=self._blend_age_color(COLOR_CONTENT, age_mult),
-                    label=f"Line {sl.line_num+1}: {sl.anomalies[0][:40] if sl.anomalies else '?'}",
+                    label=_content_label(sl),
                     label_color=COLOR_CONTENT,
                     thickness=2,
                 )
@@ -248,7 +341,7 @@ class LocationHighlighter:
                     bbox=r.bbox,
                     page_h_pts=page_h,
                     color=COLOR_OCR_COLOR,
-                    label=f"OCR:{','.join(r.anomaly_types)}",
+                    label=_ocr_label(r),
                     label_color=COLOR_OCR_COLOR,
                     thickness=2,
                 )
@@ -272,16 +365,18 @@ class LocationHighlighter:
                     bbox=r.bbox,
                     page_h_pts=page_h,
                     color=self._blend_age_color(COLOR_NUMERIC, age_mult),
-                    label=f"Numeric: z={r.z_score:.1f}",
+                    label=_numeric_label(r),
                     label_color=COLOR_NUMERIC,
                     thickness=2,
                 )
 
-            # ELA findings still score and still appear in the text report's
-            # signals — they're just not drawn here. ELA's pixel-noise
-            # regions are too imprecise spatially (logos, dense text, scan
-            # artifacts) to annotate reliably, so this loop is intentionally
-            # removed rather than filtered by z-score.
+            # ELA block-grid findings still score and still appear in the
+            # text report's signals — they're just not drawn here. ELA's
+            # pixel-noise regions are too imprecise spatially (logos, dense
+            # text, scan artifacts) to annotate reliably, so this loop is
+            # intentionally removed rather than filtered by z-score. The
+            # exception is the flat/pasted-patch regions, drawn below —
+            # those bboxes are pixel-refined and precise.
 
             # Draw PyMuPDF overlay regions — CYAN for white-rect cover-ups,
             # MAGENTA for image overlays, GOLD for ghost/overlapping text.
@@ -302,7 +397,7 @@ class LocationHighlighter:
                         bbox=r.bbox,
                         page_h_pts=page_h,
                         color=COLOR_WHITE_RECT,
-                        label="White rect overlay",
+                        label=_OVERLAY_LABELS["covering_rect"],
                         label_color=COLOR_WHITE_RECT,
                         thickness=2,
                     )
@@ -313,7 +408,7 @@ class LocationHighlighter:
                         bbox=r.bbox,
                         page_h_pts=page_h,
                         color=COLOR_IMAGE_OVERLAY,
-                        label="Image overlay",
+                        label=_OVERLAY_LABELS["image_overlay"],
                         label_color=COLOR_IMAGE_OVERLAY,
                         thickness=2,
                     )
@@ -324,10 +419,46 @@ class LocationHighlighter:
                         bbox=r.bbox,
                         page_h_pts=page_h,
                         color=COLOR_GHOST,
-                        label="Ghost text overlap",
+                        label=_OVERLAY_LABELS["ghost_text"],
                         label_color=COLOR_GHOST,
                         thickness=2,
                     )
+
+            # Draw embedded-image forensic findings (GREEN boxes) — the image
+            # pipeline's checks run on the embedded image OBJECT, bbox already
+            # mapped into page space by utils/embedded_image_forensics. Rare
+            # and internally gated (born-digital, glare) — always drawn.
+            for f in embedded_by_page.get(page_num, []):
+                if self._absorb_into_auth(auth_boxes, f["bbox"], "embedded_image"):
+                    continue
+                self._draw_box(
+                    draw=draw,
+                    img_size=img.size,
+                    bbox=f["bbox"],
+                    page_h_pts=page_h,
+                    color=COLOR_EMBEDDED_IMAGE,
+                    label=f.get("label", "Embedded Image: Anomaly"),
+                    label_color=COLOR_EMBEDDED_IMAGE,
+                    thickness=2,
+                )
+
+            # Draw ELA flat/pasted-patch regions (PURPLE boxes) — the box is
+            # the ACTUAL flat patch (pixel-refined by the shared detector),
+            # not the stamp graphic sitting on it. Rare and high-precision
+            # (born-digital + glare gates already applied) — always drawn.
+            for r in flat_zone_by_page.get(page_num, []):
+                if self._absorb_into_auth(auth_boxes, r.bbox, "ela"):
+                    continue
+                self._draw_box(
+                    draw=draw,
+                    img_size=img.size,
+                    bbox=r.bbox,
+                    page_h_pts=page_h,
+                    color=COLOR_ELA,
+                    label=_flat_zone_label(r),
+                    label_color=COLOR_ELA,
+                    thickness=2,
+                )
 
             # Draw the authoritative hidden-text / text-stacking boxes LAST, so
             # each label already reflects every other-layer finding folded into

@@ -244,6 +244,28 @@ async def analyze_document(file: UploadFile = File(...)):
                 100, pymupdf_report.anomaly_score + ts_layer_score
             )
 
+        # NEW check — embedded raster image OBJECTS (photo/stamp/signature
+        # XObjects pasted into the PDF), analyzed by the standalone image
+        # pipeline's own checks on the extracted bytes. Runs IN ADDITION to
+        # every layer above (metadata included — nothing here touches
+        # meta_report); its capped magnitude folds into the ELA layer's
+        # score BEFORE combine() (same pattern as the text-stacking fold
+        # above), and its findings enter fusion below as their own
+        # "embedded_image" layer. PDFs without qualifying embedded images
+        # get an empty result ⇒ byte-identical scores.
+        try:
+            from utils.embedded_image_forensics import analyze_embedded_images
+            embedded_img_result = analyze_embedded_images(pdf_path)
+        except Exception:
+            embedded_img_result = {"findings": [], "signals": [], "fold_score": 0,
+                                   "images_analyzed": 0, "images_skipped": 0}
+        embedded_image_findings = embedded_img_result["findings"]
+
+        if embedded_img_result["fold_score"] > 0 and ela_report is not None:
+            ela_report.anomaly_score = min(
+                100, int(round(ela_report.anomaly_score + embedded_img_result["fold_score"]))
+            )
+
         # Hidden-text recovery (white-out / z-order overlap / incremental
         # update) — DISPLAY only, no scoring impact (kept out of combine() and
         # the fusion fold, exactly as before). Computed here once so the
@@ -309,6 +331,16 @@ async def analyze_document(file: UploadFile = File(...)):
         # through pymupdf's WEIGHTS contribution above; these lines are the
         # human-readable evidence. Zero collisions ⇒ nothing appended ⇒
         # signals stay byte-identical for clean documents.
+        # Embedded-image evidence lines (the score already rode the ELA fold
+        # above; these are the human-readable findings, each explicitly
+        # distinguished from page-level ELA).
+        if embedded_img_result["signals"]:
+            verdict_obj.all_signals = (verdict_obj.all_signals or []) + [
+                f"[EMBEDDED_IMG] {embedded_img_result['images_analyzed']} embedded image "
+                f"object(s) analyzed with the image-forensics checks — "
+                f"{len(embedded_image_findings)} anomaly finding(s)"
+            ] + [f"[EMBEDDED_IMG] {s}" for s in embedded_img_result["signals"]]
+
         if text_stacking_findings:
             verdict_obj.all_signals = (verdict_obj.all_signals or []) + [
                 f"[TEXT_STACKING] {len(text_stacking_findings)} location(s) where 2+ "
@@ -409,6 +441,31 @@ async def analyze_document(file: UploadFile = File(...)):
             for f in text_stacking_findings
         ]
 
+        # Flat/pasted-patch regions (scanned/mixed raster pages — see
+        # ela_analyzer's FLAT_ZONE_* constants) enter fusion as their OWN
+        # layer ("flat_zone"), and are EXCLUDED from the generic "ela" list
+        # handed to fuse() below — the same physical finding entering as two
+        # layers would cross-validate itself. Their score already rode
+        # WEIGHTS["ela"] inside ela_report.anomaly_score.
+        flat_zone_regions = [
+            r for r in ela_regions if getattr(r, "flat_zone_anomaly", False)
+        ]
+        ela_fusion_regions = [
+            r for r in ela_regions if not getattr(r, "flat_zone_anomaly", False)
+        ]
+        flat_zone_extra = [
+            {
+                "layer": "flat_zone",
+                "page": r.page,
+                "bbox": tuple(r.bbox),
+                "text": ("Pasted stamp — flat background" if r.stamp_associated
+                         else "Flat/uniform region — inconsistent with page texture"),
+                "score": r.flat_confidence,
+                "raw": r,
+            }
+            for r in flat_zone_regions
+        ]
+
         # Cross-layer signal fusion — regions confirmed by 2+ layers. Besides
         # being surfaced in the response, cross-validated findings can now
         # escalate a borderline ORIGINAL verdict (see escalation block below).
@@ -416,11 +473,12 @@ async def analyze_document(file: UploadFile = File(...)):
         fused_findings, fusion_stats = fusion_engine.fuse(
             suspicious_lines=suspicious_lines,
             numeric_anomalies=numeric_anomalies,
-            ela_regions=ela_regions,
+            ela_regions=ela_fusion_regions,
             ocr_regions=ocr_word_anomalies,
             overlay_regions=overlay_regions,
             metadata_findings=metadata_findings,
-            extra_findings=ocr_pixel_findings + text_stacking_extra,
+            extra_findings=(ocr_pixel_findings + text_stacking_extra
+                            + flat_zone_extra + embedded_image_findings),
         )
 
         # Contradiction-aware fusion (Phase 1, additive) — a finding from one
@@ -533,6 +591,7 @@ async def analyze_document(file: UploadFile = File(...)):
             # hidden_text_report is kept for /hidden-text, whose panel
             # intentionally surfaces recovered text regardless of verdict).
             hidden_text_findings = []
+            embedded_image_findings = []
 
         confidence = build_confidence_detail(
             verdict=verdict_obj.verdict,
@@ -639,6 +698,7 @@ async def analyze_document(file: UploadFile = File(...)):
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
             "text_stacking_findings": text_stacking_findings,  # raw TextStackingFinding (0-indexed pages)
             "hidden_text_findings": hidden_text_findings,       # gated-for-drawing HiddenTextFinding (1-indexed pages)
+            "embedded_image_findings": embedded_image_findings,  # normalized dicts (0-indexed pages, page-space bboxes)
             "hidden_text_report": hidden_text_report,           # full ungated report, reused by /hidden-text
             # Exposed for Layer 7 (api/ai_review_routes.py) so its AI-adjusted
             # verdict label uses the SAME effective threshold (including any
@@ -682,6 +742,17 @@ async def analyze_document(file: UploadFile = File(...)):
             "avg_confidence": ocr_report.avg_confidence if ocr_report else 0,
         }
         result_dict["incremental_updates"] = ela_report.incremental_updates if ela_report else {}
+        result_dict["embedded_image_findings"] = [
+            {
+                "page": f["page"] + 1,  # 1-indexed for display
+                "bbox": [float(v) for v in f["bbox"]],
+                "label": f["label"],
+                "detail": f["text"],
+                "confidence": f["score"],
+                "evidence_check": f["evidence_check"],
+            }
+            for f in embedded_image_findings
+        ]
         return result_dict
 
     except HTTPException:
@@ -766,6 +837,7 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
                 fused_findings=cached.get("fused_findings", []),
                 text_stacking_findings=cached.get("text_stacking_findings", []),
                 hidden_text_findings=cached.get("hidden_text_findings", []),
+                embedded_image_findings=cached.get("embedded_image_findings", []),
             )
             cached["highlighted_pages"] = highlighted
 

@@ -18,6 +18,10 @@ import numpy as np
 from PIL import Image
 
 from utils.pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
+from utils.flat_zone_detection import (
+    local_std_map, detect_flat_zones, isolate_ink_regions,
+    BORN_DIGITAL_STD_FLOOR,
+)
 
 
 RENDER_DPI    = 150
@@ -174,6 +178,29 @@ ERASURE_SCORE_PER_REGION = 15
 ERASURE_SCORE_CAP        = 45
 ERASURE_MAX_REGIONS      = 10
 
+# Flat/pasted-patch detection on scanned/mixed raster pages — the SAME
+# flat-zone + boundary-step algorithm the image pipeline's Check 1/2 uses
+# (utils/flat_zone_detection), applied to each raster page render. Catches
+# the pattern neither existing image-doc check can: a stamp/seal sitting on
+# a flat, texture-less rectangle starkly different from the surrounding
+# scan grain. _analyze_noise_consistency can't fire on it (a low-variance
+# block can never get 9.5 sigma BELOW the page mean) and
+# _detect_erased_regions only examines near-white blocks (>=180 brightness),
+# so a DARK pasted patch behind a seal passed both. Gated to non-native_text
+# documents (see the run condition in analyze()) plus the same born-digital
+# noise-floor gate the image pipeline applies — a render with no scan noise
+# makes flat regions normal, not evidence. Scored into this layer's
+# anomaly_score (rides WEIGHTS["ela"], no new weighted layer), same pattern
+# as the noise/erasure checks above.
+FLAT_ZONE_SCORE_PER_REGION   = 15    # × the region's 0-1 confidence
+FLAT_ZONE_SCORE_CAP          = 45
+FLAT_ZONE_STAMP_OVERLAP_MIN  = 0.5   # fraction of a stamp's bbox inside the
+                                     # flat patch for "pasted stamp" labeling
+FLAT_ZONE_MAX_PAGE_FRACTION  = 0.5   # a "flat region" covering more than half
+                                     # the page is the page background itself
+                                     # (e.g. uniform colored form stock), not
+                                     # a pasted patch
+
 # Cross-page noise-consistency check (possible whole-page substitution).
 CROSS_PAGE_MIN_PAGES     = 3     # need at least this many pages to compare
 CROSS_PAGE_Z_THRESHOLD   = 2.5
@@ -258,6 +285,14 @@ class ELARegion:
     noise_anomaly: bool = False
     erasure_anomaly: bool = False
     score_weight: float = 1.0  # scanned-doc header/footer zones count for less (see SCANNED_* constants)
+
+    # Flat/pasted-patch detection (see FLAT_ZONE_* constants). flat_confidence
+    # is the shared detector's 0-1 confidence; stamp_associated marks a patch
+    # that geometrically contains/surrounds an isolated stamp-ink component.
+    flat_zone_anomaly: bool = False
+    stamp_associated: bool = False
+    flat_confidence: float = 0.0
+    detail: str = ""
 
 
 @dataclass
@@ -486,6 +521,29 @@ class ELAAnalyzer:
                 )
             all_regions.extend(erasure_regions)
 
+        # ── Flat/pasted-patch check (scanned/mixed raster pages only) ──
+        # GENUINELY skipped for pdf_type="native_text" — a born-digital text
+        # page has no scan-noise texture for a flat patch to be inconsistent
+        # WITH, so running the detector there could only manufacture noise
+        # (and the born-digital gate inside would zero it anyway). See the
+        # FLAT_ZONE_* constants for what this catches and why the two
+        # existing image-doc checks structurally could not.
+        flat_zone_regions = []
+        if pdf_type != "native_text" and (is_image_doc or is_scanned_type):
+            for page_num, img in page_low_imgs.items():
+                flat_zone_regions.extend(self._detect_flat_zone_patches(
+                    doc[page_num], img, page_num, low_dpi
+                ))
+            if flat_zone_regions:
+                n_stamp = sum(1 for r in flat_zone_regions if r.stamp_associated)
+                signals.append(
+                    f"{len(flat_zone_regions)} flat/texture-less region(s) "
+                    f"inconsistent with the page's scan noise found "
+                    f"({n_stamp} containing a stamp/seal-shaped graphic) — "
+                    f"possible pasted-in patch"
+                )
+            all_regions.extend(flat_zone_regions)
+
         # Cap how many boxes get drawn per page — keep only the strongest
         # outliers so the UI doesn't flood with low-confidence boxes.
         regions_by_page = {}
@@ -499,7 +557,16 @@ class ELAAnalyzer:
         doc.close()
 
         for r in all_regions:
-            if r.erasure_anomaly:
+            if r.flat_zone_anomaly:
+                kind = ("pasted stamp — flat background"
+                        if r.stamp_associated
+                        else "flat/uniform region inconsistent with page texture")
+                signals.append(
+                    f"Page {r.page + 1}: {kind} at "
+                    f"({r.bbox[0]:.0f},{r.bbox[1]:.0f})-({r.bbox[2]:.0f},{r.bbox[3]:.0f}) "
+                    f"confidence={r.flat_confidence:.2f} — {r.detail}"
+                )
+            elif r.erasure_anomaly:
                 signals.append(
                     f"Page {r.page + 1}: erased region detected at "
                     f"({r.bbox[0]:.0f},{r.bbox[1]:.0f})-({r.bbox[2]:.0f},{r.bbox[3]:.0f}) "
@@ -529,7 +596,10 @@ class ELAAnalyzer:
         # than the raw phase-1 fraction — a block surviving 2+ independent
         # DPI scales is a much stronger signal than "this fraction of blocks
         # looked busy at one resolution."
-        ela_confirmed_regions = [r for r in all_regions if not r.noise_anomaly and not r.erasure_anomaly]
+        ela_confirmed_regions = [
+            r for r in all_regions
+            if not r.noise_anomaly and not r.erasure_anomaly and not r.flat_zone_anomaly
+        ]
         n_ela_confirmed = sum(r.score_weight for r in ela_confirmed_regions)
         ela_confirmed_score = min(CONFIRMED_BLOCK_SCORE_CAP, n_ela_confirmed * CONFIRMED_BLOCK_SCORE_PER_BLOCK)
         if is_scanned_type:
@@ -546,6 +616,9 @@ class ELAAnalyzer:
             ela_confirmed_score
             + min(NOISE_SCORE_CAP, len(noise_regions) * NOISE_SCORE_PER_REGION)
             + min(ERASURE_SCORE_CAP, len(erasure_regions) * ERASURE_SCORE_PER_REGION)
+            + min(FLAT_ZONE_SCORE_CAP,
+                  sum(FLAT_ZONE_SCORE_PER_REGION * r.flat_confidence
+                      for r in flat_zone_regions))
         )
 
         # Cross-page consistency check (for multi-page documents)
@@ -1744,6 +1817,82 @@ class ELAAnalyzer:
                 })
 
         return self._cluster_erasure_regions(candidates)[:ERASURE_MAX_REGIONS]
+
+    def _detect_flat_zone_patches(self, page, img: Image.Image,
+                                  page_num: int, render_dpi: float) -> list:
+        """
+        Run the shared flat-zone detector (utils/flat_zone_detection — the
+        image pipeline's Check 1/2 algorithm, including its glare-vs-edit
+        boundary discrimination) over this page's low-DPI render, then
+        classify each surviving patch by whether it geometrically contains
+        a stamp/seal-shaped ink component (Check 7's isolation, also shared).
+
+        Returns list[ELARegion] with flat_zone_anomaly=True, bboxes in PDF
+        points. On a MIXED page (extractable text present) the patches are
+        additionally restricted to embedded raster content, same as the ELA
+        block candidates — a flat vector-drawn rectangle is normal design,
+        not a paste-in.
+        """
+        gray = np.asarray(img.convert("L"), dtype=np.float64)
+        std_map, baseline = local_std_map(gray)
+        # Born-digital gate (same as the image pipeline's): no sensor/scan
+        # noise baseline means flat regions are normal, not evidence.
+        if baseline < BORN_DIGITAL_STD_FLOOR:
+            return []
+
+        zones, _glare = detect_flat_zones(gray, std_map, baseline)
+        if not zones:
+            return []
+
+        # A "flat patch" covering most of the page is the page stock itself.
+        page_area_px = gray.shape[0] * gray.shape[1]
+        zones = [
+            z for z in zones
+            if (z["bbox"][2] * z["bbox"][3]) / max(page_area_px, 1)
+            <= FLAT_ZONE_MAX_PAGE_FRACTION
+        ]
+        if not zones:
+            return []
+
+        stamp_bboxes = [
+            c["bbox"] for c in isolate_ink_regions(np.asarray(img.convert("RGB")))
+            if c["kind"] == "stamp"
+        ]
+
+        pts_scale = 72 / render_dpi
+        regions = []
+        for z in zones:
+            x, y, w, h = z["bbox"]
+            stamp_assoc = any(
+                self._overlap_fraction((x, y, w, h), sb) >= FLAT_ZONE_STAMP_OVERLAP_MIN
+                for sb in stamp_bboxes
+            )
+            regions.append(ELARegion(
+                page=page_num,
+                bbox=(x * pts_scale, y * pts_scale,
+                      (x + w) * pts_scale, (y + h) * pts_scale),
+                mean_error=z["region_std"],
+                # Pseudo z for the per-page strongest-N sort — scaled so a
+                # high-confidence patch outranks marginal ELA blocks.
+                z_score=z["confidence"] * 10,
+                render_dpi=render_dpi,
+                flat_zone_anomaly=True,
+                stamp_associated=stamp_assoc,
+                flat_confidence=z["confidence"],
+                detail=z["detail"],
+            ))
+
+        return self._restrict_to_raster_content(page, regions)
+
+    @staticmethod
+    def _overlap_fraction(flat_bbox_xywh: tuple, stamp_bbox_xywh: tuple) -> float:
+        """Fraction of the STAMP's bbox area inside the flat patch — the
+        'flat patch contains/closely surrounds the seal' test."""
+        fx, fy, fw, fh = flat_bbox_xywh
+        sx, sy, sw, sh = stamp_bbox_xywh
+        ix = max(0, min(fx + fw, sx + sw) - max(fx, sx))
+        iy = max(0, min(fy + fh, sy + sh) - max(fy, sy))
+        return (ix * iy) / max(sw * sh, 1)
 
     @staticmethod
     def _cluster_erasure_regions(regions: list) -> list:

@@ -204,7 +204,7 @@ function ImageReport({ data }) {
         {anomalies.length === 0 ? (
           <div className="empty-state">
             ✅ No tampering anomalies detected by the implemented checks
-            (see “Not Checked” below for techniques this engine does not run)
+            (see the coverage note below for techniques this engine does not run)
           </div>
         ) : (
           anomalies.map((a, i) => {
@@ -254,25 +254,36 @@ function ImageReport({ data }) {
         </div>
       )}
 
-      {/* Not Checked — collapsed by default. An empty anomalies list is NOT
-          a clean bill of health on these techniques: the engine explicitly
-          does not attempt them, and says why. */}
-      <details className="section" style={{ border: "1px dashed #555", borderRadius: 8, padding: "10px 14px" }}>
-        <summary style={{ cursor: "pointer", fontWeight: 700, color: "#c0a060" }}>
-          🚫 Not Checked — {notImplemented.length} technique{notImplemented.length === 1 ? "" : "s"} this
-          engine explicitly does NOT run (expand for reasons)
-        </summary>
-        <div style={{ marginTop: 10 }}>
-          {notImplemented.map((n, i) => (
-            <div key={i} style={{ marginBottom: 10 }}>
-              <div style={{ fontWeight: 600, fontSize: "0.8rem", color: "#d0d0d0" }}>
-                {String(n.technique || "").replace(/_/g, " ")}
-              </div>
-              <div style={{ fontSize: "0.75rem", color: "#8890a0" }}>{n.reason}</div>
+      {/* Coverage disclosure — collapsed by default, informational styling
+          (NOT an error state). An empty anomalies list is not a clean bill
+          of health on these techniques: the engine deliberately does not
+          attempt them because they can't produce a reliable confidence
+          number from a single image, and says why for each. */}
+      {notImplemented.length > 0 && (
+        <details className="section" style={{ border: "1px solid #333", borderRadius: 8, padding: "10px 14px" }}>
+          <summary style={{ cursor: "pointer", fontWeight: 600, color: "#8890a0" }}>
+            ℹ️ Coverage note — {notImplemented.length} advanced technique{notImplemented.length === 1 ? "" : "s"} intentionally
+            skipped (expand for details)
+          </summary>
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: "0.75rem", color: "#8890a0", marginBottom: 12 }}>
+              This is informational, not an error. These techniques cannot
+              produce a trustworthy confidence number from a single uploaded
+              image (they need reference data this upload doesn't carry), so
+              the engine reports them as not attempted rather than inventing
+              a score. Every implemented check above ran normally.
             </div>
-          ))}
-        </div>
-      </details>
+            {notImplemented.map((n, i) => (
+              <div key={i} style={{ marginBottom: 10 }}>
+                <div style={{ fontWeight: 600, fontSize: "0.8rem", color: "#d0d0d0" }}>
+                  {String(n.technique || "").replace(/_/g, " ")}
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "#8890a0" }}>{n.reason}</div>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }
@@ -1833,27 +1844,38 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Legend */}
+              {/* Legend — color tells you which LAYER flagged the region;
+                  the label printed on each box tells you WHAT was found
+                  (e.g. "Font Size Mismatch", "Balance Mismatch",
+                  "Pasted Stamp: Flat Background"). */}
               <div className="legend">
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ff4444" }} />
-                  Red = Font/spacing anomaly (Content layer)
+                  Red = Content layer (font / spacing)
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ff00c8" }} />
-                  Magenta = Color/ink anomaly (suspicious edit)
+                  Magenta = OCR pixel layer / image overlay
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ffdd00" }} />
-                  Yellow = Numeric value outlier
+                  Yellow = Numeric layer
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#00ccff" }} />
-                  Cyan = Hidden overlay detected
+                  Cyan = Overlay layer (white-out cover-up)
                 </span>
                 <span className="legend-item">
                   <span className="legend-dot" style={{ background: "#ffc800" }} />
-                  Gold = Ghost text / overlapping layers
+                  Gold = Overlay layer (ghost text)
+                </span>
+                <span className="legend-item">
+                  <span className="legend-dot" style={{ background: "#b400ff" }} />
+                  Purple = ELA layer (flat / pasted patch)
+                </span>
+                <span className="legend-item">
+                  <span className="legend-dot" style={{ background: "#00be5a" }} />
+                  Green = Embedded-image forensics
                 </span>
                 {(textStackingList.length > 0 || hiddenTextDrawn) && (
                   <span className="legend-item">
@@ -1864,6 +1886,12 @@ export default function App() {
                     Magenta (dashed) = Hidden text — Missing / Replaced data
                   </span>
                 )}
+              </div>
+              <div className="legend-section">
+                <div className="legend-note">
+                  Color = which detection layer flagged the region; the label
+                  on each box states the specific finding.
+                </div>
               </div>
 
               {/* Confidence note */}
