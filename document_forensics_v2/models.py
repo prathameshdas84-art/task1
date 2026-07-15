@@ -231,6 +231,12 @@ class ForensicResponse(BaseModel):
     # response_model filtering drops undeclared keys from the payload.)
     embedded_image_findings: list[EmbeddedImageFindingModel] = []
 
+    # Scanned-page pixel-forensics findings (utils/scanned_page_forensics) —
+    # the image pipeline's page-render-safe checks (5/6/8/9) routed over
+    # scanned/mixed page RENDERS. Same field shape as embedded-image
+    # findings (label distinguishes them); empty for native_text uploads.
+    scanned_pixel_findings: list[EmbeddedImageFindingModel] = []
+
     # Summary
     summary: str
 

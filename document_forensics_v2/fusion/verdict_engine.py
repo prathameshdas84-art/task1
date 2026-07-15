@@ -31,10 +31,22 @@ from analyzers.pymupdf_analyzer import PyMuPDFReport
 #                   have both text and raster evidence, no single layer
 #                   dominates.
 #   image_document: OCR was already 0.00 — unchanged.
+#
+# 2nd rebalance (scanned-pixel routing): scanned/mixed page renders are now
+# also routed through the image pipeline's pixel checks (5/6/8/9 — see
+# utils/scanned_page_forensics), whose magnitude folds into the ELA layer.
+# ELA is therefore the designated carrier of ALL pixel-forensics evidence
+# on raster documents, so it takes another 0.05 from metadata (a scanner's
+# producer string is the weakest evidence class on a scan):
+#   scanned: metadata 0.20→0.15, ela 0.45→0.50
+#   mixed:   metadata 0.25→0.20, ela 0.25→0.30
+#   scanned_native: left at the post-OCR-removal values — the routing
+#   applies there too, but its usable native text layer keeps the text
+#   layers' relative weighting unchanged.
 WEIGHTS = {
     "native_text":    {"metadata": 0.20, "content": 0.35, "numeric": 0.20, "ela": 0.15, "pymupdf": 0.10},
-    "scanned":        {"metadata": 0.20, "content": 0.05, "numeric": 0.10, "ela": 0.45, "pymupdf": 0.20},
-    "mixed":          {"metadata": 0.25, "content": 0.20, "numeric": 0.15, "ela": 0.25, "pymupdf": 0.15},
+    "scanned":        {"metadata": 0.15, "content": 0.05, "numeric": 0.10, "ela": 0.50, "pymupdf": 0.20},
+    "mixed":          {"metadata": 0.20, "content": 0.20, "numeric": 0.15, "ela": 0.30, "pymupdf": 0.15},
     "scanned_native": {"metadata": 0.20, "content": 0.10, "numeric": 0.15, "ela": 0.35, "pymupdf": 0.20},
     # Direct image uploads (POST /analyze-image) — a single image has NO
     # PDF structure, so every PDF layer's weight is 0 and the dedicated

@@ -219,6 +219,33 @@ async def analyze_document(file: UploadFile = File(...)):
                 100, int(round(ela_report.anomaly_score + embedded_img_result["fold_score"]))
             )
 
+        # NEW routing — scanned/mixed PAGE RENDERS through the image
+        # pipeline's page-render-safe checks (5/6/8/9). Since the OCR
+        # layer's removal this is the primary pasted-element detector for
+        # scanned documents; see utils/scanned_page_forensics for why the
+        # two existing raster paths (ELA renders, embedded image objects)
+        # structurally could not cover full-page scan pixels with these
+        # checks. Capped magnitude folds into the ELA layer's score BEFORE
+        # combine() (same pattern as the embedded-image fold above);
+        # findings enter fusion below as their own "scanned_pixel" layer.
+        # native_text/image_document uploads get an empty result ⇒
+        # byte-identical scores.
+        try:
+            from utils.scanned_page_forensics import analyze_scanned_pages
+            scanned_px_result = analyze_scanned_pages(
+                pdf_path,
+                content_report.pdf_type if content_report else "native_text",
+            )
+        except Exception:
+            scanned_px_result = {"findings": [], "signals": [], "fold_score": 0,
+                                 "pages_analyzed": 0, "pages_skipped": 0}
+        scanned_pixel_findings = scanned_px_result["findings"]
+
+        if scanned_px_result["fold_score"] > 0 and ela_report is not None:
+            ela_report.anomaly_score = min(
+                100, int(round(ela_report.anomaly_score + scanned_px_result["fold_score"]))
+            )
+
         # Hidden-text recovery (white-out / z-order overlap / incremental
         # update) — DISPLAY only, no scoring impact (kept out of combine() and
         # the fusion fold, exactly as before). Computed here once so the
@@ -293,6 +320,13 @@ async def analyze_document(file: UploadFile = File(...)):
                 f"object(s) analyzed with the image-forensics checks — "
                 f"{len(embedded_image_findings)} anomaly finding(s)"
             ] + [f"[EMBEDDED_IMG] {s}" for s in embedded_img_result["signals"]]
+
+        if scanned_px_result["signals"]:
+            verdict_obj.all_signals = (verdict_obj.all_signals or []) + [
+                f"[SCANNED_PIXEL] {scanned_px_result['pages_analyzed']} scanned/mixed "
+                f"page render(s) routed through the image-pipeline pixel checks — "
+                f"{len(scanned_pixel_findings)} anomaly finding(s)"
+            ] + [f"[SCANNED_PIXEL] {s}" for s in scanned_px_result["signals"]]
 
         if text_stacking_findings:
             verdict_obj.all_signals = (verdict_obj.all_signals or []) + [
@@ -409,7 +443,8 @@ async def analyze_document(file: UploadFile = File(...)):
             overlay_regions=overlay_regions,
             metadata_findings=metadata_findings,
             extra_findings=(text_stacking_extra
-                            + flat_zone_extra + embedded_image_findings),
+                            + flat_zone_extra + embedded_image_findings
+                            + scanned_pixel_findings),
         )
 
         # Contradiction-aware fusion (Phase 1, additive) — a finding from one
@@ -520,6 +555,7 @@ async def analyze_document(file: UploadFile = File(...)):
             # intentionally surfaces recovered text regardless of verdict).
             hidden_text_findings = []
             embedded_image_findings = []
+            scanned_pixel_findings = []
 
         confidence = build_confidence_detail(
             verdict=verdict_obj.verdict,
@@ -612,6 +648,17 @@ async def analyze_document(file: UploadFile = File(...)):
                 )
                 for f in embedded_image_findings
             ],
+            scanned_pixel_findings=[
+                EmbeddedImageFindingModel(
+                    page=f["page"] + 1,  # 1-indexed for display
+                    bbox=[float(v) for v in f["bbox"]],
+                    label=f["label"],
+                    detail=f["text"],
+                    confidence=f["score"],
+                    evidence_check=f["evidence_check"],
+                )
+                for f in scanned_pixel_findings
+            ],
             summary=build_summary(
                 verdict=verdict_obj.verdict,
                 combined_score=verdict_obj.combined_score,
@@ -637,6 +684,7 @@ async def analyze_document(file: UploadFile = File(...)):
             "text_stacking_findings": text_stacking_findings,  # raw TextStackingFinding (0-indexed pages)
             "hidden_text_findings": hidden_text_findings,       # gated-for-drawing HiddenTextFinding (1-indexed pages)
             "embedded_image_findings": embedded_image_findings,  # normalized dicts (0-indexed pages, page-space bboxes)
+            "scanned_pixel_findings": scanned_pixel_findings,    # same normalized dict shape (utils/scanned_page_forensics)
             "hidden_text_report": hidden_text_report,           # full ungated report, reused by /hidden-text
             # Exposed for Layer 7 (api/ai_review_routes.py) so its AI-adjusted
             # verdict label uses the SAME effective threshold (including any
@@ -746,7 +794,11 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
                 fused_findings=cached.get("fused_findings", []),
                 text_stacking_findings=cached.get("text_stacking_findings", []),
                 hidden_text_findings=cached.get("hidden_text_findings", []),
-                embedded_image_findings=cached.get("embedded_image_findings", []),
+                # Scanned-pixel findings share the embedded-image dict shape
+                # (0-indexed page, point-space bbox, "label") — drawn through
+                # the same path; each box's label carries the distinction.
+                embedded_image_findings=(cached.get("embedded_image_findings", [])
+                                         + cached.get("scanned_pixel_findings", [])),
             )
             cached["highlighted_pages"] = highlighted
 

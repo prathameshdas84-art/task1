@@ -155,6 +155,22 @@ CHECK_POINTS = {
 }
 DOUBLE_COMPRESSION_POINTS = 8    # categorical, recompression-fragile → tiny
 
+
+def score_anomalies(anomalies: list) -> tuple:
+    """CHECK_POINTS-weighted scoring — per_hit × confidence per anomaly,
+    capped per check. Shared by analyze() and the scanned-page routing
+    (utils/scanned_page_forensics), which must re-score after filtering
+    QR-zone hits out so its fold magnitude matches its surviving findings.
+    Returns (raw_score_float, per_check_scores_dict)."""
+    score = 0.0
+    per_check_scores = {}
+    for check, cfg in CHECK_POINTS.items():
+        hits = [a for a in anomalies if a.evidence_check == check]
+        s = min(cfg["cap"], sum(cfg["per_hit"] * a.confidence for a in hits))
+        per_check_scores[check] = round(s, 1)
+        score += s
+    return score, per_check_scores
+
 NOT_IMPLEMENTED = [
     {
         "technique": "prnu_sensor_fingerprint",
@@ -404,13 +420,7 @@ class ImageDocumentAnalyzer:
         heatmap_png = self._near_white_heatmap(gray)
 
         # ── Scoring — weighted per CHECK_POINTS, capped per check ──────
-        score = 0.0
-        per_check_scores = {}
-        for check, cfg in CHECK_POINTS.items():
-            hits = [a for a in anomalies if a.evidence_check == check]
-            s = min(cfg["cap"], sum(cfg["per_hit"] * a.confidence for a in hits))
-            per_check_scores[check] = round(s, 1)
-            score += s
+        score, per_check_scores = score_anomalies(anomalies)
         if compression_history == "double_compression_suspected":
             score += DOUBLE_COMPRESSION_POINTS
             per_check_scores["check4_double_compression"] = DOUBLE_COMPRESSION_POINTS
@@ -433,6 +443,88 @@ class ImageDocumentAnalyzer:
             signals=signals,
             heatmap_png=heatmap_png,
         )
+
+    def analyze_page_render(self, rgb: np.ndarray, gray: np.ndarray) -> dict:
+        """Run the page-render-safe SUBSET of this pipeline's checks over a
+        rendered PDF page (the scanned/mixed routing in
+        utils/scanned_page_forensics): Check 5 (edge sharpness), Check 6
+        (copy-move), and Checks 7-9 (stamp/signature ink isolation +
+        texture + boundary).
+
+        Deliberately EXCLUDED from this entry point:
+          * Checks 1+2 (flat zones + glare): ela_analyzer's
+            _detect_flat_zone_patches already runs the SAME shared
+            algorithm (utils/flat_zone_detection) on the same page
+            renders — running both would double-count one physical
+            finding into two scores.
+          * Checks 3+4 (compression history): a get_pixmap render is a
+            fresh rasterization, so those checks would measure the
+            render, not the document; compression evidence on PDFs is
+            the ELA layer's whole job.
+          * Check 10 (near-white heatmap): display-only, never scored.
+
+        Scoring is left to the caller (score_anomalies) so it can filter
+        QR-zone false positives out first. Returns
+        {"anomalies", "signals", "is_born_digital", "noise_baseline"}.
+        """
+        std_map, baseline = self._local_std_map(gray)
+        is_born_digital = baseline < BORN_DIGITAL_STD_FLOOR
+
+        anomalies = []
+        signals = []
+        sharp_map = None
+        edge_baseline = None
+
+        if is_born_digital:
+            signals.append(
+                f"Born-digital gate: page-render noise baseline "
+                f"{baseline:.2f} < {BORN_DIGITAL_STD_FLOOR} — no scan-noise "
+                f"texture exists, so the texture checks (5, 8, 9) are gated "
+                f"out for this page."
+            )
+        else:
+            sharp_anoms, sharp_map, edge_baseline, _ = \
+                self._edge_sharpness_check(gray)
+            anomalies.extend(sharp_anoms)
+            for a in sharp_anoms:
+                signals.append(
+                    f"Check 5: anomalously crisp edges at {a.bbox} vs the "
+                    f"page's own blur baseline ({a.detail})"
+                )
+
+        # Check 6 works from structure, not noise — runs either way (same
+        # as analyze()).
+        cm_anoms, _ = self._copy_move_check(gray)
+        anomalies.extend(cm_anoms)
+        for a in cm_anoms:
+            signals.append(f"Check 6: clone consensus at {a.bbox} ({a.detail})")
+
+        if not is_born_digital:
+            for comp in self._isolate_ink_regions(rgb):
+                tex_anom = self._stamp_texture_check(gray, comp, baseline)
+                if tex_anom:
+                    anomalies.append(tex_anom)
+                    signals.append(
+                        f"Check 8: flat uniform ink fill inside {comp['kind']} "
+                        f"at {tex_anom.bbox} ({tex_anom.detail})"
+                    )
+                if sharp_map is not None and edge_baseline is not None:
+                    bnd_anom = self._stamp_boundary_check(
+                        comp, sharp_map, edge_baseline
+                    )
+                    if bnd_anom:
+                        anomalies.append(bnd_anom)
+                        signals.append(
+                            f"Check 9: cutout-sharp {comp['kind']} boundary at "
+                            f"{bnd_anom.bbox} ({bnd_anom.detail})"
+                        )
+
+        return {
+            "anomalies": anomalies,
+            "signals": signals,
+            "is_born_digital": is_born_digital,
+            "noise_baseline": float(baseline),
+        }
 
     # ── Shared primitives ────────────────────────────────────────────────
 
