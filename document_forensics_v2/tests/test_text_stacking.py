@@ -8,7 +8,7 @@ Run:  ..\.venv\Scripts\python.exe test_text_stacking.py
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")

@@ -6,13 +6,9 @@ Run: start.bat (uses ..\.venv — do not run with a global/system Python;
 Test: http://localhost:8000/docs
 """
 
-from dotenv import load_dotenv
-load_dotenv()
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.ai_review_routes import router as ai_review_router
 from api.system_routes import router as system_router
 from api.analysis_routes import router as analysis_router
 from api.image_analysis_routes import router as image_analysis_router
@@ -49,7 +45,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(ai_review_router)
 app.include_router(system_router)
 app.include_router(analysis_router)
 app.include_router(image_analysis_router)

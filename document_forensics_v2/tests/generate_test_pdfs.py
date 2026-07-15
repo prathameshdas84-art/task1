@@ -12,7 +12,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 import pikepdf
 
-OUTPUT_DIR = Path("test_pdfs")
+OUTPUT_DIR = Path(__file__).resolve().parent / "test_pdfs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 

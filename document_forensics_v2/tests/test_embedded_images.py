@@ -25,7 +25,7 @@ import fitz
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.embedded_image_forensics import analyze_embedded_images, MIN_DIMENSION_PX
 

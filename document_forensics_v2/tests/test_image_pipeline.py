@@ -23,6 +23,20 @@ Part 0 — the canonical 7 exercise only negatives for these):
   S2 double JPEG save         → Check 4 must not report "single_compression"
   S3 JPEG history in a PNG    → Check 3 must detect it through the container
 
+Born-digital gate robustness (regression for the /analyze-image false
+gate: low-quality re-compression erases a genuine capture's sensor noise
+and used to trip the born-digital gate, suppressing all detection):
+  S4 recompressed capture     → genuine stamped photo re-saved at low JPEG
+                                quality (noise floor below the gate) must
+                                NOT be classified born-digital — blocking-
+                                grid residuals prove compression erased the
+                                noise; stamp still detected; no false hits
+  S5 born-digital as JPEG     → a true vector render exported AS JPEG must
+                                STILL gate (container format alone is not
+                                evidence of a capture pipeline)
+  S6 scanned form w/ stamp    → police-verification-style scanned form,
+                                re-compressed: not gated, stamp detected
+
 Run:  ..\\.venv\\Scripts\\python test_image_pipeline.py
 """
 
@@ -33,12 +47,13 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analyzers.image_document_analyzer import (
     ImageDocumentAnalyzer, normalize_for_fusion,
 )
 from fusion.signal_fusion import SignalFusion
+from utils.flat_zone_detection import BORN_DIGITAL_STD_FLOOR
 
 TEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_images")
 W, H = 800, 600
@@ -88,7 +103,7 @@ def make_base(seed, organic_stamp=False):
     return np.clip(img, 0, 255)
 
 
-def draw_organic_stamp(img, cx, cy, rng):
+def draw_organic_stamp(img, cx, cy, rng, color=(185.0, 25.0, 35.0), strength=1.0):
     """Wet-ink stamp: elliptical ring + center bar, per-pixel density
     modulated by a smooth random field (uneven pressure), feathered
     boundary (ink bleed). Composited BEFORE the photo blur+noise —
@@ -102,9 +117,9 @@ def draw_organic_stamp(img, cx, cy, rng):
     field = cv2.resize(field, (W, H), interpolation=cv2.INTER_CUBIC)
     field = cv2.GaussianBlur(field, (0, 0), 4)
     density = 0.45 + 0.55 * (field - field.min()) / (np.ptp(field) + 1e-9)
-    alpha *= density
+    alpha *= density * strength
     alpha = cv2.GaussianBlur(alpha, (0, 0), 1.5)   # ink bleed feather
-    color = np.array([185.0, 25.0, 35.0])
+    color = np.array(color, dtype=np.float64)
     return img * (1 - alpha[..., None]) + color[None, None, :] * alpha[..., None]
 
 
@@ -156,6 +171,43 @@ def apply_clone(img):
     src = out[150:230, 40:220].copy()      # a text block — feature-rich
     out[380:460, 300:480] = src
     return out
+
+
+def make_police_form(seed=67):
+    """Scanned police-verification-style form: white paper, printed form
+    fields with rule lines, and a faint blue-purple round office stamp —
+    photographed/scanned (blur + sensor noise), like the real-world false
+    gate case."""
+    rng = np.random.default_rng(seed)
+    pil = Image.new("RGB", (W, H), (246, 245, 242))
+    d = ImageDraw.Draw(pil)
+    d.text((170, 25), "POLICE VERIFICATION CERTIFICATE", font=_font(26), fill=(25, 25, 35))
+    d.text((40, 80), "Office of the Superintendent of Police", font=_font(18), fill=(60, 60, 70))
+    # Varied row pitch, underline extents, and font sizes on purpose —
+    # perfectly periodic identical rules read as a clone lattice to
+    # Check 6, which is a separate (pre-existing) concern from the
+    # born-digital gate this fixture exercises.
+    rows = [("Applicant Name: SUNIL R MEHTA", 20, 470),
+            ("Father's Name: RAMESH MEHTA", 21, 430),
+            ("Address: 12 Station Road, Ward 4, Exampli City", 19, 545),
+            ("Purpose of Verification: Passport", 22, 385),
+            ("Police Station: Central Division No. 3", 20, 505),
+            ("Result: NO ADVERSE RECORD FOUND", 23, 460)]
+    y = 140
+    for t, fs, lw in rows:
+        d.text((40, y), t, font=_font(fs), fill=(35, 35, 40))
+        d.line([40, y + 30, 40 + lw, y + 30], fill=(150, 150, 155), width=1)
+        y += 38 + fs
+    d.text((40, 540), "Date: 02/05/2026", font=_font(18), fill=(35, 35, 40))
+    d.text((560, 540), "Signature", font=_font(18), fill=(35, 35, 40))
+
+    img = np.asarray(pil, dtype=np.float64)
+    img = draw_organic_stamp(img, 640, 430, rng,
+                             color=(70.0, 55.0, 160.0), strength=0.8)
+    for ch in range(3):
+        img[:, :, ch] = cv2.GaussianBlur(img[:, :, ch], (0, 0), BLUR_SIGMA)
+    img += rng.normal(0, NOISE_SIGMA, img.shape)
+    return np.clip(img, 0, 255)
 
 
 def make_born_digital():
@@ -236,6 +288,30 @@ def build_all():
     Image.open(tmp).convert("RGB").save(p3, "PNG")
     os.unlink(tmp)
     paths["s3_png_history"] = p3
+
+    # S4: genuine stamped capture re-saved at low JPEG quality — the
+    # quantization erases the sensor-noise floor (baseline drops below
+    # BORN_DIGITAL_STD_FLOOR), which used to falsely trip the gate.
+    p4 = os.path.join(TEST_DIR, "s4_recompressed_capture.jpg")
+    Image.open(paths["7a_organic"]).convert("RGB").save(p4, "JPEG", quality=30)
+    paths["s4_recompressed"] = p4
+
+    # S5: a TRUE born-digital render exported as JPEG — must still gate.
+    p5 = os.path.join(TEST_DIR, "s5_born_digital.jpg")
+    Image.fromarray(np.clip(make_born_digital(), 0, 255).astype(np.uint8)).save(
+        p5, "JPEG", quality=85)
+    paths["s5_bd_jpeg"] = p5
+
+    # S6: scanned police-verification-style form with a stamp, then run
+    # through a messaging-app-style transform (downscale + mid-quality
+    # re-save) — the real-world false-gate report: noise floor pushed
+    # below BORN_DIGITAL_STD_FLOOR on a genuine capture.
+    form = Image.fromarray(np.clip(make_police_form(), 0, 255).astype(np.uint8))
+    small = form.resize((int(form.width * 0.75), int(form.height * 0.75)),
+                        Image.BILINEAR)
+    p6 = os.path.join(TEST_DIR, "s6_police_form_recompressed.jpg")
+    small.save(p6, "JPEG", quality=60)
+    paths["s6_police_form"] = p6
     return paths
 
 
@@ -339,6 +415,42 @@ def run():
          r.jpeg_history_detected and r.metrics["container_format"] == "PNG",
          f"jpeg_history={r.jpeg_history_detected}, "
          f"blockiness={r.metrics.get('blockiness')}")
+
+    # ── S4: recompressed genuine capture → NOT born-digital ──────────────
+    r = reports["s4_recompressed"]
+    bl = r.metrics.get("noise_baseline_std", 99)
+    case("S4 recompressed capture",
+         bl < BORN_DIGITAL_STD_FLOOR          # still reproduces the failure mode
+         and not r.is_born_digital            # ...but no longer gates
+         and r.jpeg_history_detected
+         and r.stamp_detected                 # stamp isolation still works
+         and len(r.anomalies) == 0,           # and no false positives appear
+         f"baseline={bl} (< floor {BORN_DIGITAL_STD_FLOOR}), "
+         f"is_born_digital={r.is_born_digital}, stamp={r.stamp_detected}, "
+         f"grid_z={r.metrics.get('blockiness', {}).get('grid_phase_z')}, "
+         f"anomalies={[(a.evidence_check, a.bbox) for a in r.anomalies]}")
+
+    # ── S5: born-digital exported AS JPEG → must STILL gate ──────────────
+    r = reports["s5_bd_jpeg"]
+    case("S5 born-digital as JPEG",
+         r.is_born_digital and len(r.anomalies) == 0,
+         f"is_born_digital={r.is_born_digital}, "
+         f"baseline={r.metrics.get('noise_baseline_std')}, "
+         f"grid_z={r.metrics.get('blockiness', {}).get('grid_phase_z')}, "
+         f"anomalies={[(a.evidence_check, a.bbox) for a in r.anomalies]}")
+
+    # ── S6: recompressed scanned form w/ stamp → not gated, stamp found ──
+    r = reports["s6_police_form"]
+    bl = r.metrics.get("noise_baseline_std", 99)
+    case("S6 scanned form w/ stamp",
+         bl < BORN_DIGITAL_STD_FLOOR          # reproduces the failure mode
+         and not r.is_born_digital
+         and r.stamp_detected
+         and len(r.anomalies) == 0,
+         f"baseline={bl} (< floor {BORN_DIGITAL_STD_FLOOR}), "
+         f"is_born_digital={r.is_born_digital}, stamp={r.stamp_detected}, "
+         f"grid_z={r.metrics.get('blockiness', {}).get('grid_phase_z')}, "
+         f"anomalies={[(a.evidence_check, a.bbox) for a in r.anomalies]}")
 
     # ── report ────────────────────────────────────────────────────────────
     print()

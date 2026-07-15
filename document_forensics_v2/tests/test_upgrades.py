@@ -2,10 +2,12 @@
 Quick test to verify all 4 upgrades import and work without errors.
 """
 
+import os
 import sys
 
-# Add the document_forensics_v2 directory to path
-sys.path.insert(0, r"d:\task1\document_forensics_v2")
+# Add the document_forensics_v2 directory (project root) to path
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 print("=" * 70)
 print("UPGRADE TEST SUITE — Document Forensics Engine v2.0")
@@ -33,9 +35,9 @@ except Exception as e:
 # Test 2: Import Upgrade 2 (NumericAnalyzer with trimmed mean)
 print("\n[TEST 2] Upgrade 2 — Multi-location Detection Fix (Trimmed Mean)")
 try:
-    # Check syntax by compiling
-    import py_compile
-    py_compile.compile(r"d:\task1\document_forensics_v2\analyzers\numeric_analyzer.py", doraise=True)
+    # Verify by importing (catches syntax AND import-time errors)
+    import importlib
+    importlib.import_module("analyzers.numeric_analyzer")
     print("  ✓ NumericAnalyzer syntax verified")
     print("  ✓ Trimmed mean implementation confirmed")
     print("  ✓ Upgrade 2 test PASSED")
@@ -57,9 +59,8 @@ except Exception as e:
 # Test 4: Import Upgrade 4 (XrefAnalyzer for Canva detection)
 print("\n[TEST 4] Upgrade 4 — XREF Sequence Check for Canva Edits")
 try:
-    # Check syntax by compiling
-    import py_compile
-    py_compile.compile(r"d:\task1\document_forensics_v2\analyzers\xref_analyzer.py", doraise=True)
+    import importlib
+    importlib.import_module("analyzers.xref_analyzer")
     print("  ✓ XrefAnalyzer syntax verified")
     print("  ✓ XREF analysis methods confirmed")
     print("  ✓ Upgrade 4 test PASSED")
@@ -70,16 +71,14 @@ except Exception as e:
 # Test 5: Verify integration in verdict_engine and models
 print("\n[TEST 5] Integration — Verdict engine and models with xref_score")
 try:
-    # Verify verdict_engine can be imported
-    import py_compile
-    py_compile.compile(r"d:\task1\document_forensics_v2\fusion\verdict_engine.py", doraise=True)
+    import importlib
+    importlib.import_module("fusion.verdict_engine")
     print("  ✓ Verdict engine syntax verified")
-    
-    py_compile.compile(r"d:\task1\document_forensics_v2\models.py", doraise=True)
+
+    importlib.import_module("models")
     print("  ✓ Models syntax verified")
-    
-    # Verify main.py can be compiled
-    py_compile.compile(r"d:\task1\document_forensics_v2\main.py", doraise=True)
+
+    importlib.import_module("main")
     print("  ✓ Main.py syntax verified (XrefAnalyzer integrated)")
     
     print("  ✓ Integration test PASSED")

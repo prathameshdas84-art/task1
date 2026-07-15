@@ -1,2 +1,18 @@
 # Local secrets — never commit a real API key
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Server / debug logs
+*.log
+
+# Generated test artifacts (fixtures are rebuilt by the test suites)
+tests/test_output/
+
+# Frontend
+forensics-ui/node_modules/
+forensics-ui/build/

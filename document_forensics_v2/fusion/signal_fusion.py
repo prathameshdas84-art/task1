@@ -448,9 +448,8 @@ class SignalFusion:
     # caller recomputes combined_score ──────────────────────────────────────
 
     # Points subtracted from a layer's anomaly_score per contradicted
-    # finding (0-100 scale) — same fixed-points-per-finding shape as the
-    # Gemini Layer 7 downweight in main.py, kept as its own separate,
-    # tunable constant since these are independent mechanisms.
+    # finding (0-100 scale) — a fixed-points-per-finding downweight, kept
+    # as its own tunable constant.
     CONTRADICTION_DOWNWEIGHT_POINTS = 10
 
     def detect_contradictions(self,

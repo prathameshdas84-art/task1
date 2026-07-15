@@ -27,7 +27,7 @@ import fitz
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analyzers.ela_analyzer import ELAAnalyzer
 from fusion.signal_fusion import SignalFusion

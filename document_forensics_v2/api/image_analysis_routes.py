@@ -48,9 +48,9 @@ router = APIRouter()
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 # Separate cache from api/analysis_cache.py on purpose: that cache's
-# consumers (/annotated-image, /hidden-text, /ai-review) all read
-# entry["pdf_path"] and would crash on an image entry. Image analyses are
-# only ever read back by the two endpoints in this module.
+# consumers (/annotated-image, /hidden-text) all read entry["pdf_path"]
+# and would crash on an image entry. Image analyses are only ever read
+# back by the two endpoints in this module.
 MAX_CACHED_IMAGE_ANALYSES = 50
 _image_analysis_cache: OrderedDict = OrderedDict()
 
