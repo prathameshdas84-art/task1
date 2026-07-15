@@ -1,7 +1,7 @@
 """
 Cross-Layer Signal Fusion — Document Forensics Engine
 
-Each analysis layer (content / numeric / OCR / ELA / PyMuPDF) reports anomalies
+Each analysis layer (content / numeric / ELA / PyMuPDF) reports anomalies
 independently, which is noisy: a region flagged by only one layer is often a
 false positive. This module cross-validates findings ACROSS layers and keeps
 only regions that 2+ independent layers agree on, so the UI can surface
@@ -10,11 +10,11 @@ high-confidence tamper signals and suppress single-layer noise.
 Implementation notes (deviations from the original drop-in spec, made so the
 engine actually runs and meets its stated goal):
 
-  * All five inputs are dataclasses (SuspiciousLine, NumericAnomaly, ELARegion,
-    SuspiciousRegion, OverlayRegion), NOT dicts. The original normalization
-    called ``.get()`` on the OCR/content findings, which raises AttributeError
-    on a dataclass and crashes fusion on any OCR/scanned document. ``_field()``
-    reads from either an object attribute or a dict key, so both work.
+  * The layer inputs are dataclasses (SuspiciousLine, NumericAnomaly,
+    ELARegion, OverlayRegion), NOT dicts. The original normalization
+    called ``.get()`` on the findings, which raises AttributeError on a
+    dataclass and crashes fusion. ``_field()`` reads from either an object
+    attribute or a dict key, so both work.
 
   * Content and numeric findings DO carry a real ``bbox`` (the spec assumed
     they didn't and used ``bbox=None``). Populating it is essential: the core
@@ -80,7 +80,6 @@ class FusedFinding:
     content_finding: dict = None
     numeric_finding: dict = None
     ela_finding: dict = None
-    ocr_finding: dict = None
     pymupdf_finding: dict = None
 
 
@@ -142,7 +141,6 @@ class SignalFusion:
              suspicious_lines: list = None,
              numeric_anomalies: list = None,
              ela_regions: list = None,
-             ocr_regions: list = None,
              overlay_regions: list = None,
              metadata_findings: list = None,
              extra_findings: list = None) -> Tuple[List[FusedFinding], dict]:
@@ -204,18 +202,6 @@ class SignalFusion:
                 "text": None,
                 "score": min(1.0, (_field(ela, "z_score", 0) or 0) / 10),
                 "raw": ela,
-            })
-
-        for ocr in (ocr_regions or []):
-            bbox = _field(ocr, "bbox", (0, 0, 0, 0)) or (0, 0, 0, 0)
-            all_findings.append({
-                "layer": "ocr",
-                "page": _field(ocr, "page", 0),
-                "bbox": tuple(bbox),
-                "line_num": None,
-                "text": _field(ocr, "word") or _field(ocr, "text"),
-                "score": 1.0 - (_field(ocr, "confidence", 100) or 100) / 100,
-                "raw": ocr,
             })
 
         for ov in (overlay_regions or []):
@@ -455,7 +441,6 @@ class SignalFusion:
             content_finding=findings_by_layer.get("content"),
             numeric_finding=findings_by_layer.get("numeric"),
             ela_finding=findings_by_layer.get("ela"),
-            ocr_finding=findings_by_layer.get("ocr"),
             pymupdf_finding=findings_by_layer.get("pymupdf"),
         )
 
@@ -473,7 +458,6 @@ class SignalFusion:
                                suspicious_lines: list = None,
                                numeric_anomalies: list = None,
                                ela_regions: list = None,
-                               ocr_regions: list = None,
                                overlay_regions: list = None) -> Tuple[List[ContradictedFinding], dict]:
         """
         Detects when a finding from one layer is undermined by independent
@@ -594,7 +578,6 @@ class SignalFusion:
 
         check(suspicious_lines, "content", "cross_page_repetition")
         check(ela_regions, "ela", "cross_page_repetition")
-        check(ocr_regions, "ocr", "cross_page_repetition")
         check(overlay_regions, "pymupdf", "cross_page_repetition")
         # Numeric gets its own rule tag: a numeric anomaly on page furniture
         # is a disagreement about what the region IS, not just a repeated-

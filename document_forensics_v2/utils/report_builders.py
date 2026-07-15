@@ -41,7 +41,7 @@ def _detect_merged_document(meta_report, total_pages: int) -> bool:
 # ── Upgrade 2: cross-layer timeline assertor ────────────────────────────────────
 # A document printed with "09 July 2024" but digitally created in 2026 is a
 # backdating signal no existing layer catches — metadata only compares its
-# OWN dates against each other, content/OCR never compare against metadata.
+# OWN dates against each other, content never compares against metadata.
 TIMELINE_DATE_PATTERNS = [
     # "09 July 2024", "9 Jan 2023"
     re.compile(
@@ -142,9 +142,6 @@ def build_confidence_detail(
         active_layers.append("content")
         key_signals.append(f"content anomaly score {layer_scores['content']}/100")
 
-    if layer_scores["ocr"] >= 20:
-        active_layers.append("OCR")
-        key_signals.append(f"OCR anomaly score {layer_scores['ocr']}/100")
 
     if layer_scores["numeric"] >= 20:
         active_layers.append("numeric")

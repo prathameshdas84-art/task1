@@ -3,7 +3,6 @@ Quick test to verify all 4 upgrades import and work without errors.
 """
 
 import sys
-import os
 
 # Add the document_forensics_v2 directory to path
 sys.path.insert(0, r"d:\task1\document_forensics_v2")
@@ -12,21 +11,23 @@ print("=" * 70)
 print("UPGRADE TEST SUITE — Document Forensics Engine v2.0")
 print("=" * 70)
 
-# Test 1: Import Upgrade 1 (OCRAnalyzer with pixel profiling)
-print("\n[TEST 1] Upgrade 1 — Universal OCR Pixel Profiling")
+# Test 1: The OCR layer (former Upgrade 1) was REMOVED from the engine —
+# its anomaly scoring was noise-dominated. Verify it stays gone: the module
+# must not exist and the verdict engine must carry no "ocr" weight.
+print("\n[TEST 1] OCR layer removal — module gone, no residual weight")
 try:
-    from analyzers.ocr_analyzer import OCRAnalyzer, PixelAnomaly
-    print("  ✓ OCRAnalyzer imported successfully")
-    print("  ✓ PixelAnomaly dataclass available")
-    # Check that pixel profiling methods exist
-    assert hasattr(OCRAnalyzer, '_profile_pixels_all_pages'), "Missing _profile_pixels_all_pages method"
-    assert hasattr(OCRAnalyzer, '_profile_font_heights'), "Missing _profile_font_heights method"
-    assert hasattr(OCRAnalyzer, '_profile_pixel_colors'), "Missing _profile_pixel_colors method"
-    assert hasattr(OCRAnalyzer, '_boost_phrase_anomalies'), "Missing _boost_phrase_anomalies method"
-    print("  ✓ All pixel profiling methods present")
-    print("  ✓ Upgrade 1 test PASSED")
+    import importlib.util
+    assert importlib.util.find_spec("analyzers.ocr_analyzer") is None, \
+        "analyzers/ocr_analyzer.py should be deleted"
+    from fusion.verdict_engine import WEIGHTS
+    for ptype, w in WEIGHTS.items():
+        assert "ocr" not in w, f"WEIGHTS[{ptype!r}] still has an 'ocr' entry"
+        assert abs(sum(w.values()) - 1.0) < 1e-9, f"WEIGHTS[{ptype!r}] doesn't sum to 1.0"
+    print("  ✓ ocr_analyzer module removed")
+    print("  ✓ no 'ocr' weight remains; every pdf_type's weights sum to 1.0")
+    print("  ✓ OCR removal test PASSED")
 except Exception as e:
-    print(f"  ✗ Upgrade 1 test FAILED: {e}")
+    print(f"  ✗ OCR removal test FAILED: {e}")
     sys.exit(1)
 
 # Test 2: Import Upgrade 2 (NumericAnalyzer with trimmed mean)

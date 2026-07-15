@@ -20,18 +20,14 @@ import pdfplumber
 # ── Shared constants ────────────────────────────────────────────────────────────
 # Scanner brand/keyword fingerprints used to detect "scanned_native" PDFs
 # (a native-text PDF whose producer/creator metadata identifies a physical
-# scanner). Also imported by ocr_analyzer.py — kept in one place so the two
-# files can never independently drift to different scanner keyword sets.
+# scanner). Kept module-level so any consumer shares one keyword set.
 SCANNER_KEYWORDS = [
     "scan", "canon", "epson", "hp", "fujitsu", "brother", "xerox",
     "ricoh", "sharp", "kodak", "ij scan", "scansnap", "twain", "wia",
 ]
 
 # Thresholds for classifying a PDF as native_text / mixed / scanned, based
-# on the fraction of pages with a substantial embedded text layer. Also
-# imported by ocr_analyzer.py so both files make the identical decision
-# about whether a PDF "has text" (previously ocr_analyzer used a different
-# minimum character count than this file for the same check).
+# on the fraction of pages with a substantial embedded text layer.
 NATIVE_TEXT_RATIO_THRESHOLD = 0.7   # >=70% of pages have text -> native_text
 MIXED_TEXT_RATIO_THRESHOLD  = 0.3   # >=30% of pages have text -> mixed
 NATIVE_TEXT_MIN_CHARS       = 30    # min chars extracted to count a page as "has text"
@@ -200,9 +196,8 @@ MIXED_FONT_EMBEDDING_SCORE = 25
 # The actual distinguishing fact is repetition: a label/value color pair
 # recurs on many lines throughout the document (it's the template's
 # style), while an edited span's slightly-off color appears once. So a
-# color is only a candidate anomaly if it's RARE document-wide — same
-# frequency-clustering principle ocr_analyzer.py already uses for OCR
-# word size/color outliers (_common_value_clusters/SIZE_CLUSTER_MIN_SHARE).
+# color is only a candidate anomaly if it's RARE document-wide
+# (frequency-clustering: styles recur, edits are one-offs).
 COLOR_DIFF_MIN                    = 15   # filters anti-aliasing/rounding noise, not real styling
 COLOR_CLUSTER_MIN_SHARE           = 0.03  # a color on >=3% of spans is a deliberate document style
 COLOR_CONSISTENCY_SCORE_PER_SPAN  = 10
@@ -442,7 +437,8 @@ class ContentAnalyzer:
 
         # Override: vector PDFs (text outlined to paths, e.g. Canva/Figma/
         # Illustrator exports) have no usable text layer despite rendering
-        # visible content — treat as "scanned" so the OCR layer runs on them.
+        # visible content — treat as "scanned" so the pixel-based layers
+        # (ELA and its raster checks) weight them appropriately.
         if self._is_vector_pdf(pdf_path):
             return "scanned"
 
@@ -501,8 +497,9 @@ class ContentAnalyzer:
              literal Tj/TJ string operands directly with no font/encoding
              interpretation at all (see _extract_words_pikepdf_fallback).
           4. If all three find nothing on a page, that page contributes no
-             lines — the OCR layer (Layer 3) picks up the slack since it
-             works from the rendered image, not the text layer.
+             lines — pixel-level layers (ELA noise/erasure/flat-zone and the
+             embedded-image checks) carry the evidence for such pages, since
+             they work from rendered/embedded pixels, not the text layer.
         """
         page_images = self._render_pages(pdf_path)
         all_lines   = []
@@ -1319,9 +1316,8 @@ class ContentAnalyzer:
                         spans = []
                         for span in line.get("spans", []):
                             # rawdict spans have no "text" field, only a
-                            # per-character "chars" list (see
-                            # ocr_analyzer._split_span_into_words) — same
-                            # reconstruction needed here.
+                            # per-character "chars" list — reconstruct the
+                            # text by joining the chars.
                             text = "".join(ch.get("c", "") for ch in span.get("chars", [])).strip()
                             if not text:
                                 continue

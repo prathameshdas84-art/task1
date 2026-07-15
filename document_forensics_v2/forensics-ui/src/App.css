@@ -304,16 +304,6 @@ body {
 }
 .finding-reason { font-size: 0.8rem; color: #888; }
 
-/* OCR word anomalies */
-.ocr-stats {
-  font-size: 0.8rem;
-  color: #888;
-  margin-bottom: 10px;
-  padding: 8px 12px;
-  background: #111;
-  border-radius: 6px;
-}
-
 /* Empty state */
 .empty-state {
   text-align: center;

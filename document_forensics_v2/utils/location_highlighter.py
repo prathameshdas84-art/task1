@@ -42,10 +42,6 @@ COLOR_ELA     = (180, 0, 255)    # purple — ELA outlier (image edit)
 COLOR_WHITE_RECT    = (0, 200, 255)   # cyan    — white rect overlay (pymupdf_analyzer)
 COLOR_IMAGE_OVERLAY = (255, 0, 200)   # magenta — image overlay (pymupdf_analyzer)
 COLOR_GHOST         = (255, 200, 0)   # gold    — ghost text / overlapping text layers (pymupdf_analyzer)
-COLOR_OCR_SIZE  = (255, 100, 0)   # orange-red — OCR word font-size anomaly
-COLOR_OCR_COLOR = (255, 0, 200)   # magenta    — OCR word color anomaly
-COLOR_OCR_CONF  = (255, 140, 0)   # orange     — OCR word low-confidence anomaly
-COLOR_OCR_BASELINE = (0, 255, 120)  # green      — OCR word baseline-misalignment anomaly
 # Coordinate-collision text stacking (utils/hidden_text_extractor.detect_stacked_text)
 # — 2+ DIFFERENT text values at the same coordinates. Drawn in bright magenta
 # with a DASHED border so it reads as its own category even when it lands on
@@ -98,14 +94,6 @@ def _numeric_label(r) -> str:
     return f"Statistical Outlier (z={r.z_score:.1f})"
 
 
-def _ocr_label(r) -> str:
-    # Only color/digital_paste anomalies are drawn (see the loop below);
-    # digital_paste is the stronger, more specific claim when both fired.
-    if "digital_paste" in r.anomaly_types:
-        return "Digital Paste Artifact"
-    return "Font Color Mismatch"
-
-
 # PyMuPDF overlay_type → specific label.
 _OVERLAY_LABELS = {
     "covering_rect": "White-Out Cover-Up",
@@ -150,7 +138,6 @@ class LocationHighlighter:
     def highlight_pages(
         self,
         suspicious_lines: list = None,
-        ocr_word_anomalies: list = None,
         numeric_anomalies: list = None,
         ela_regions: list = None,
         overlay_regions: list = None,
@@ -165,7 +152,6 @@ class LocationHighlighter:
         Only returns pages that have at least one suspicious region.
 
         suspicious_lines:    list of SuspiciousLine from content_analyzer
-        ocr_word_anomalies:  list of OCRWordAnomaly from ocr_analyzer
         numeric_anomalies:   list of NumericAnomaly from numeric_analyzer
         ela_regions:         list of ELARegion from ela_analyzer. Block-grid
                              regions are counted for strong-page detection but
@@ -192,7 +178,7 @@ class LocationHighlighter:
 
         Hidden-text and text-stacking findings are the most specific,
         authoritative explanation for a location. They are merged into a single
-        set of "authoritative boxes" per page; any content/numeric/OCR/pymupdf
+        set of "authoritative boxes" per page; any content/numeric/pymupdf
         finding that TRULY OVERLAPS one is folded into that box's "also flagged
         by" label instead of drawing a second, redundant box (Part 2). This is a
         pure DRAWING decision — no findings list, score, or fusion result is
@@ -215,8 +201,6 @@ class LocationHighlighter:
         layer_hits_by_page = {}
         for sl in (suspicious_lines or []):
             layer_hits_by_page.setdefault(sl.page, set()).add("content")
-        for r in (ocr_word_anomalies or []):
-            layer_hits_by_page.setdefault(r.page, set()).add("ocr")
         for r in (numeric_anomalies or []):
             layer_hits_by_page.setdefault(r.page, set()).add("numeric")
         for r in (ela_regions or []):
@@ -234,10 +218,6 @@ class LocationHighlighter:
         lines_by_page = {}
         for sl in (suspicious_lines or []):
             lines_by_page.setdefault(sl.page, []).append(sl)
-
-        ocr_by_page = {}
-        for r in (ocr_word_anomalies or []):
-            ocr_by_page.setdefault(r.page, []).append(r)
 
         # ELA flat/pasted-patch regions ARE drawn (rare, high-precision,
         # pixel-exact bbox) — unlike ELA's block-grid regions, whose spatial
@@ -271,7 +251,6 @@ class LocationHighlighter:
             hidden_by_page.setdefault(r.page - 1, []).append(r)
 
         all_pages = (set(lines_by_page.keys()) |
-                     set(ocr_by_page.keys()) |
                      set(numeric_by_page.keys()) |
                      set(overlay_by_page.keys()) |
                      set(flat_zone_by_page.keys()) |
@@ -322,28 +301,6 @@ class LocationHighlighter:
                     color=self._blend_age_color(COLOR_CONTENT, age_mult),
                     label=_content_label(sl),
                     label_color=COLOR_CONTENT,
-                    thickness=2,
-                )
-
-            # Draw OCR word anomalies — MAGENTA only for color/digital_paste
-            # anomalies. Size (font-height) and confidence boxes are skipped:
-            # they're too noisy on ID cards and scanned documents to annotate
-            # reliably (bbox measurement artifacts). The scores from those
-            # signals still flow through to the verdict — only the visual box
-            # is suppressed here.
-            for r in ocr_by_page.get(page_num, []):
-                if not any(t in r.anomaly_types for t in ("color", "digital_paste")):
-                    continue  # skip size / confidence / baseline — too noisy
-                if self._absorb_into_auth(auth_boxes, r.bbox, "ocr"):
-                    continue
-                self._draw_box(
-                    draw=draw,
-                    img_size=img.size,
-                    bbox=r.bbox,
-                    page_h_pts=page_h,
-                    color=COLOR_OCR_COLOR,
-                    label=_ocr_label(r),
-                    label_color=COLOR_OCR_COLOR,
                     thickness=2,
                 )
 

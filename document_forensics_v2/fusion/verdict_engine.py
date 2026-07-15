@@ -1,35 +1,56 @@
 """
-Verdict Engine — combines metadata + content + OCR + numeric scores → final verdict.
+Verdict Engine — combines metadata + content + numeric + ELA + PyMuPDF + xref scores → final verdict.
 Weights adjust automatically based on PDF type.
 """
 
 from dataclasses import dataclass
 from analyzers.metadata_extractor import MetadataReport
 from analyzers.content_analyzer import ContentReport
-from analyzers.ocr_analyzer import OCRReport
 from analyzers.numeric_analyzer import NumericReport
 from analyzers.ela_analyzer import ELAReport
 from analyzers.pymupdf_analyzer import PyMuPDFReport
 
 
-# Weights per PDF type — must sum to 1.0
+# Weights per PDF type — must sum to 1.0.
+#
+# The OCR layer (word-level font-size/color/confidence flagging) was REMOVED
+# from the engine entirely — its anomaly scoring was noise-dominated on
+# scans (measured: natural scan texture routinely maxed its score on
+# untampered documents). Its former weight was redistributed per pdf_type:
+#   native_text:    OCR was already 0.00 — other weights unchanged.
+#   scanned:        OCR's 0.45 goes mostly to ELA (0.15→0.45: on a scan,
+#                   pixel forensics — recompression, noise, erasure,
+#                   flat-zone, embedded-image checks, all folded there —
+#                   IS the primary evidence) and pymupdf (0.10→0.20,
+#                   overlay/paste-over structure); metadata 0.15→0.20.
+#   scanned_native: same reasoning, but the usable native text layer keeps
+#                   content/numeric meaningful: OCR's 0.40 → ela +0.20,
+#                   pymupdf +0.10, content +0.05, metadata +0.05.
+#   mixed:          OCR's 0.20 split between metadata (+0.05), content
+#                   (+0.05), ela (+0.05), pymupdf (+0.05) — mixed docs
+#                   have both text and raster evidence, no single layer
+#                   dominates.
+#   image_document: OCR was already 0.00 — unchanged.
 WEIGHTS = {
-    "native_text":    {"metadata": 0.20, "content": 0.35, "ocr": 0.00, "numeric": 0.20, "ela": 0.15, "pymupdf": 0.10},
-    "scanned":        {"metadata": 0.15, "content": 0.05, "ocr": 0.45, "numeric": 0.10, "ela": 0.15, "pymupdf": 0.10},
-    "mixed":          {"metadata": 0.20, "content": 0.15, "ocr": 0.20, "numeric": 0.15, "ela": 0.20, "pymupdf": 0.10},
-    "scanned_native": {"metadata": 0.15, "content": 0.05, "ocr": 0.40, "numeric": 0.15, "ela": 0.15, "pymupdf": 0.10},
+    "native_text":    {"metadata": 0.20, "content": 0.35, "numeric": 0.20, "ela": 0.15, "pymupdf": 0.10},
+    "scanned":        {"metadata": 0.20, "content": 0.05, "numeric": 0.10, "ela": 0.45, "pymupdf": 0.20},
+    "mixed":          {"metadata": 0.25, "content": 0.20, "numeric": 0.15, "ela": 0.25, "pymupdf": 0.15},
+    "scanned_native": {"metadata": 0.20, "content": 0.10, "numeric": 0.15, "ela": 0.35, "pymupdf": 0.20},
     # Direct image uploads (POST /analyze-image) — a single image has NO
     # PDF structure, so every PDF layer's weight is 0 and the dedicated
     # image_document_analyzer carries the whole score. Sums to 1.0 like
-    # every other row; the existing rows above are untouched. The
-    # per-CHECK weighting inside that single layer lives in
-    # analyzers/image_document_analyzer.CHECK_POINTS (edge sharpness and
-    # variance smoothing weighted highest — see the honesty note there).
-    "image_document": {"metadata": 0.00, "content": 0.00, "ocr": 0.00, "numeric": 0.00, "ela": 0.00, "pymupdf": 0.00, "image_forensics": 1.00},
+    # every other row. The per-CHECK weighting inside that single layer
+    # lives in analyzers/image_document_analyzer.CHECK_POINTS (edge
+    # sharpness and variance smoothing weighted highest — see the honesty
+    # note there).
+    "image_document": {"metadata": 0.00, "content": 0.00, "numeric": 0.00, "ela": 0.00, "pymupdf": 0.00, "image_forensics": 1.00},
 }
 
 THRESHOLD = 20   # combined score >= 20 → MODIFIED (default for most pdf_types)
-SCANNED_THRESHOLD = 25   # scanned documents need a higher bar — OCR noise inflates scores
+# Scanned documents keep a higher bar: even without the removed OCR layer,
+# scan artifacts inflate the pixel-forensics layers (ELA especially, which
+# now carries scanned docs' largest weight).
+SCANNED_THRESHOLD = 25
 
 # Combined scores within ±UNCERTAIN_BAND of the effective threshold are too
 # close to call confidently → verdict becomes "UNCERTAIN" (human review).
@@ -60,7 +81,6 @@ class FinalVerdict:
     combined_score: float
     metadata_score: int
     content_score: int
-    ocr_score: int
     numeric_score: int = 0
     ela_score: int = 0
     pymupdf_score: int = 0
@@ -73,7 +93,6 @@ class FinalVerdict:
 def combine(
     meta: MetadataReport,
     content: ContentReport,
-    ocr: OCRReport,
     numeric: NumericReport = None,
     ela: ELAReport = None,
     pymupdf: PyMuPDFReport = None,
@@ -90,7 +109,6 @@ def combine(
     combined = (
         meta.anomaly_score    * w["metadata"] +
         content.anomaly_score * w["content"]  +
-        ocr.anomaly_score     * w["ocr"]      +
         numeric_score         * w.get("numeric", 0) +
         ela_score              * w.get("ela", 0) +
         pymupdf_score           * w.get("pymupdf", 0) +
@@ -128,8 +146,6 @@ def combine(
         all_signals.append(f"[METADATA] {a}")
     for s in content.signals:
         all_signals.append(f"[CONTENT]  {s}")
-    for s in ocr.signals:
-        all_signals.append(f"[OCR]      {s}")
     if numeric:
         for s in numeric.signals:
             all_signals.append(f"[NUMERIC]  {s}")
@@ -156,7 +172,6 @@ def combine(
         combined_score=round(combined, 1),
         metadata_score=meta.anomaly_score,
         content_score=content.anomaly_score,
-        ocr_score=ocr.anomaly_score,
         numeric_score=numeric_score,
         ela_score=ela_score,
         pymupdf_score=pymupdf_score,

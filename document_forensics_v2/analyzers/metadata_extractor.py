@@ -696,7 +696,7 @@ class MetadataExtractor:
 
         Starts from the metadata-level anomaly flags, then — when available —
         folds in the cross-layer forensic result (combined_score + verdict)
-        so the headline number reflects content/OCR/numeric/ELA/PyMuPDF
+        so the headline number reflects content/numeric/ELA/PyMuPDF
         findings, not just metadata. combined_score/verdict are None when this
         is computed during extract() (before the layers run); main.py
         recomputes with them populated once combine() has produced a verdict."""

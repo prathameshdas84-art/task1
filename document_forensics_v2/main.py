@@ -28,9 +28,9 @@ Detect tampering and modifications in PDF documents.
 Upload any PDF, image, or Word document and receive a detailed forensic analysis:
 - **Layer 1 — Metadata**: Who created/modified the document and when
 - **Layer 2 — Content**: Font consistency, spacing anomalies, CIDFont edit detection
-- **Layer 3 — OCR**: Embedded vs visible text comparison, confidence analysis
-- **Layer 4 — Numeric**: Statistical outlier detection in number fields
-- **Layer 5 — ELA**: Error Level Analysis, shadow attack detection, signature validation
+- **Layer 3 — Numeric**: Statistical outlier detection in number fields
+- **Layer 4 — ELA**: Error Level Analysis, shadow attack detection, signature validation
+- **Layer 5 — PyMuPDF**: Hidden overlays, ghost text, character-spacing edits
 
 ## Supported formats
 PDF, JPG, JPEG, PNG, DOCX, DOC

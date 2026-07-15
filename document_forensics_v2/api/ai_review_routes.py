@@ -28,9 +28,9 @@ So: confident-location path = 1 call, needs-scan path = 2 calls, vs the
 old always-3. Which path was taken is logged and returned (scan_mode /
 needs_independent_scan / ai_calls_made) so it's auditable.
 
-Every region the merged call reviews is something the 6-layer engine
-ALREADY flagged (fused findings, suspicious lines, numeric outliers, ELA
-regions, OCR word anomalies, PyMuPDF overlays). Job C is the one exception
+Every region the merged call reviews is something the engine ALREADY
+flagged (fused findings, suspicious lines, numeric outliers, ELA
+regions, PyMuPDF overlays). Job C is the one exception
 — it scans full pages independently of what the 6 layers already found.
 
 The response also carries merged_findings — copies of the main report's
@@ -121,7 +121,7 @@ JOB_B_CONTRADICTION_PENALTY = 5   # region review reclassifies an existing findi
 JOB_C_SUPPORTED_BONUS       = 5   # Job C verification supports an existing finding
 JOB_C_CONTRADICTED_PENALTY  = 5   # Job C verification contradicts an existing finding
 
-_KNOWN_LAYER_KEYS = {"metadata", "content", "ocr", "numeric", "ela", "pymupdf", "xref"}
+_KNOWN_LAYER_KEYS = {"metadata", "content", "numeric", "ela", "pymupdf", "xref"}
 
 
 def _compute_needs_independent_scan(cached: dict, response: ForensicResponse) -> tuple:
@@ -219,8 +219,6 @@ def _gather_flagged_regions(cached: dict, max_regions: int = MAX_AI_REVIEW_REGIO
         add(na.page, na.bbox, "numeric", na.text, provenance=("numeric_anomalies", i))
     for er in cached.get("ela_regions", []):
         add(er.page, er.bbox, "ela", f"ELA anomaly (z-score {er.z_score:.1f})")
-    for i, oa in enumerate(cached.get("ocr_word_anomalies", [])):
-        add(oa.page, oa.bbox, "ocr", oa.word, provenance=("ocr_word_anomalies", i))
     for ov in cached.get("overlay_regions", []):
         add(ov.page, ov.bbox, "pymupdf", ov.reason)
 
@@ -451,27 +449,10 @@ def _build_merged_findings(response: ForensicResponse, cached: dict,
             out.append(d)
         return out
 
-    # ocr_word_anomalies isn't part of the cached ForensicResponse object
-    # (analysis_routes adds it to the response dict post-hoc) — rebuild the
-    # same display shape from the cached raw objects.
-    ocr_dicts = [
-        {
-            "page": a.page + 1,
-            "word": a.word,
-            "bbox": list(a.bbox),
-            "anomaly_types": a.anomaly_types,
-            "size_z": round(a.size_z, 2),
-            "color_z": round(a.color_z, 2),
-            "reason": a.reason,
-        }
-        for a in cached.get("ocr_word_anomalies", [])
-    ]
-
     merged = {
         "fused_findings": annotate([f.dict() for f in response.fused_findings], "fused_findings"),
         "suspicious_lines": annotate([s.dict() for s in response.suspicious_lines], "suspicious_lines"),
         "numeric_anomalies": annotate([n.dict() for n in response.numeric_anomalies], "numeric_anomalies"),
-        "ocr_word_anomalies": annotate(ocr_dicts, "ocr_word_anomalies"),
     }
 
     for f in additional_findings_out:

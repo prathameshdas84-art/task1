@@ -215,7 +215,7 @@ class GeminiAdvisor:
             "Independently of the engine's findings, ALSO look for any "
             "regions that look edited/inconsistent that the engine did "
             "NOT flag — use the engine's own layer definitions (content/"
-            "font consistency, numeric outliers, OCR word anomalies, ELA "
+            "font consistency, numeric outliers, ELA "
             "visual artifacts, PyMuPDF overlays/ghost text) as your frame "
             "of reference for what kind of inconsistency would matter.\n\n"
             "Finally, give ONE overall assessment: does the actual "
@@ -229,7 +229,7 @@ class GeminiAdvisor:
             "Respond with ONLY a JSON object (no markdown fences, no "
             "prose) in EXACTLY this shape:\n"
             '{"per_finding_verification": [{"engine_finding": "<restate '
-            'the specific claim>", "layer": "<metadata|content|ocr|'
+            'the specific claim>", "layer": "<metadata|content|'
             'numeric|ela|pymupdf|xref|fusion>", "verdict": '
             '"supported|contradicted|unverifiable", "reasoning": '
             '"<specific visual/textual evidence from the actual pages>"}, '

@@ -9,7 +9,6 @@ from typing import Optional
 class LayerScores(BaseModel):
     metadata: int
     content: int
-    ocr: int
     numeric: int
     ela: int
     pymupdf: int = 0
@@ -205,11 +204,6 @@ class ForensicResponse(BaseModel):
     signals: list[str]
     suspicious_lines: list[SuspiciousLine]
     numeric_anomalies: list[NumericAnomaly]
-
-    # OCR word-level anomalies (font size / color / position vs document
-    # baseline) and the document-wide stats they were compared against.
-    ocr_word_anomalies: list = []
-    ocr_stats: dict = {}
 
     # Incremental-update / old-object-recovery findings (Layer 5 / ELA) —
     # %%EOF/xref counts, /Prev trailer pointer, and any shadowed earlier

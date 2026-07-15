@@ -18,7 +18,6 @@ from fastapi.responses import StreamingResponse
 
 from analyzers.metadata_extractor import MetadataExtractor
 from analyzers.content_analyzer import ContentAnalyzer
-from analyzers.ocr_analyzer import OCRAnalyzer
 from analyzers.numeric_analyzer import NumericAnalyzer
 from analyzers.ela_analyzer import ELAAnalyzer
 from analyzers.pymupdf_analyzer import PyMuPDFAnalyzer
@@ -108,51 +107,10 @@ async def analyze_document(file: UploadFile = File(...)):
         with open(tmp_path, "wb") as f:
             f.write(content)
 
-        # For a directly-uploaded image, OCR the ORIGINAL pixels before
-        # convert_to_pdf() stretches the image into a fixed-size PDF page
-        # and re-rasterizes it at a different DPI (and deletes the
-        # original file) — that round-trip loses fine detail this layer
-        # can otherwise use directly.
-        direct_image_ocr = None
-        image_px_size = None  # (width, height) of the original upload, pixels
-        if ext in (".jpg", ".jpeg", ".png"):
-            try:
-                direct_image_ocr = OCRAnalyzer().analyze_image(tmp_path)
-                from PIL import Image as PILImage
-                with PILImage.open(tmp_path) as _im:
-                    image_px_size = _im.size
-            except Exception:
-                direct_image_ocr = None
-
-        # Convert to PDF if needed
+        # Convert to PDF if needed. (The OCR layer that used to pre-analyze
+        # directly-uploaded images here was removed from the engine — see
+        # verdict_engine.WEIGHTS for the removal note.)
         pdf_path = convert_to_pdf(tmp_path, file.filename)
-
-        # Direct-image OCR bboxes are in the ORIGINAL image's pixel space,
-        # but every downstream consumer (signal fusion's spatial matching,
-        # /annotated-image's box drawing, the response payload) works in
-        # the converted PDF's point space. Rescale here, at the source —
-        # unconverted pixel coords land outside the PDF page for any image
-        # wider than the page, which used to invert the drawn rectangle
-        # and 500 the /annotated-image endpoint.
-        if direct_image_ocr is not None and image_px_size:
-            try:
-                import fitz
-                _doc = fitz.open(pdf_path)
-                _rect = _doc[0].rect
-                _doc.close()
-                # insert_image keeps the aspect ratio (keep_proportion) and
-                # centers the image in the page rect — uniform scale plus a
-                # centering offset, NOT independent x/y stretch.
-                s = min(_rect.width / image_px_size[0],
-                        _rect.height / image_px_size[1])
-                ox = (_rect.width - image_px_size[0] * s) / 2
-                oy = (_rect.height - image_px_size[1] * s) / 2
-                for _a in direct_image_ocr.word_anomalies:
-                    x0, y0, x1, y1 = _a.bbox
-                    _a.bbox = (ox + x0 * s, oy + y0 * s,
-                               ox + x1 * s, oy + y1 * s)
-            except Exception:
-                pass
 
         # Run all 5 layers
         try:
@@ -194,11 +152,6 @@ async def analyze_document(file: UploadFile = File(...)):
                 )
         except Exception:
             pass
-
-        try:
-            ocr_report     = direct_image_ocr if direct_image_ocr is not None else OCRAnalyzer().analyze(pdf_path)
-        except Exception as e:
-            ocr_report     = None
 
         try:
             numeric_report = NumericAnalyzer().analyze(pdf_path)
@@ -278,8 +231,8 @@ async def analyze_document(file: UploadFile = File(...)):
             hidden_text_report = None
             hidden_text_findings = []
 
-        if not all([meta_report, content_report, ocr_report]):
-            failed = [name for name, r in [("metadata", meta_report), ("content", content_report), ("ocr", ocr_report)] if not r]
+        if not all([meta_report, content_report]):
+            failed = [name for name, r in [("metadata", meta_report), ("content", content_report)] if not r]
             raise HTTPException(
                 status_code=422,
                 detail=f"Could not parse the uploaded file — the following core layers failed: {', '.join(failed)}. "
@@ -288,7 +241,7 @@ async def analyze_document(file: UploadFile = File(...)):
 
         # Combine verdict
         verdict_obj = combine(
-            meta_report, content_report, ocr_report,
+            meta_report, content_report,
             numeric_report, ela_report, pymupdf_report, xref_report
         )
 
@@ -318,7 +271,7 @@ async def analyze_document(file: UploadFile = File(...)):
             verdict_obj.verdict = new_verdict
 
         # Recompute authenticity now that the cross-layer verdict exists — the
-        # metadata-only score produced inside extract() can't see content/OCR/
+        # metadata-only score produced inside extract() can't see content/
         # numeric/ELA/PyMuPDF findings. Fold the combined score and verdict in.
         meta_report.authenticity = MetadataExtractor()._compute_authenticity_score(
             meta_report,
@@ -360,7 +313,6 @@ async def analyze_document(file: UploadFile = File(...)):
         layer_scores = {
             "metadata": verdict_obj.metadata_score,
             "content":  verdict_obj.content_score,
-            "ocr":      verdict_obj.ocr_score,
             "numeric":  verdict_obj.numeric_score,
             "ela":      verdict_obj.ela_score,
             "pymupdf":  verdict_obj.pymupdf_score,
@@ -376,7 +328,6 @@ async def analyze_document(file: UploadFile = File(...)):
         suspicious_lines = content_report.suspicious_lines if content_report else []
         numeric_anomalies = numeric_report.anomalies if numeric_report else []
         ela_regions = ela_report.regions if ela_report else []
-        ocr_word_anomalies = ocr_report.word_anomalies if ocr_report else []
         overlay_regions = pymupdf_report.overlay_regions if pymupdf_report else []
 
         # Metadata is a document-level signal with no bbox, so on its own it can
@@ -404,28 +355,9 @@ async def analyze_document(file: UploadFile = File(...)):
                 "text": "; ".join(timeline_signals[:3]),
             })
 
-        # OCR pixel-profiling anomalies (Upgrade 1) are raw OCR-layer findings
-        # with page+bbox, but they were never handed to fusion — only word-level
-        # anomalies were, so e.g. a content-layer font mismatch and a pixel-level
-        # size/color anomaly on the SAME line could never corroborate each other.
-        # They enter as layer "ocr" (they ARE the OCR layer's findings) through
-        # fuse()'s pre-normalized extra_findings input.
-        def _pf(a, key, default=None):
-            return a.get(key, default) if isinstance(a, dict) else getattr(a, key, default)
-        ocr_pixel_findings = [
-            {
-                "layer": "ocr",
-                "page": _pf(a, "page", 0),
-                "bbox": tuple(_pf(a, "bbox")) if _pf(a, "bbox") else None,
-                "text": _pf(a, "word"),
-                "score": (_pf(a, "confidence", 0) or 0) / 100,
-            }
-            for a in ((ocr_report.pixel_anomalies if ocr_report else None) or [])
-        ]
-
         # Coordinate-collision text-stacking findings enter fusion as their
-        # OWN layer ("text_stacking"), pre-normalized, exactly like the OCR
-        # pixel and image-pipeline findings — so a genuine stacked edit can
+        # OWN layer ("text_stacking"), pre-normalized, exactly like the
+        # image-pipeline findings — so a genuine stacked edit can
         # cross-validate with the pymupdf/content/numeric layers that flag the
         # same spot, rather than being an automatic override. Pages are
         # already 0-indexed (see TextStackingFinding).
@@ -474,10 +406,9 @@ async def analyze_document(file: UploadFile = File(...)):
             suspicious_lines=suspicious_lines,
             numeric_anomalies=numeric_anomalies,
             ela_regions=ela_fusion_regions,
-            ocr_regions=ocr_word_anomalies,
             overlay_regions=overlay_regions,
             metadata_findings=metadata_findings,
-            extra_findings=(ocr_pixel_findings + text_stacking_extra
+            extra_findings=(text_stacking_extra
                             + flat_zone_extra + embedded_image_findings),
         )
 
@@ -494,7 +425,6 @@ async def analyze_document(file: UploadFile = File(...)):
             suspicious_lines=suspicious_lines,
             numeric_anomalies=numeric_anomalies,
             ela_regions=ela_regions,
-            ocr_regions=ocr_word_anomalies,
             overlay_regions=overlay_regions,
         )
         if contradicted_findings:
@@ -504,7 +434,7 @@ async def analyze_document(file: UploadFile = File(...)):
 
             layer_score_attr = {
                 "content": "content_score", "numeric": "numeric_score",
-                "ela": "ela_score", "ocr": "ocr_score", "pymupdf": "pymupdf_score",
+                "ela": "ela_score", "pymupdf": "pymupdf_score",
             }
             weights = WEIGHTS.get(verdict_obj.pdf_type, WEIGHTS["native_text"])
             score_delta = 0.0
@@ -533,7 +463,6 @@ async def analyze_document(file: UploadFile = File(...)):
                 layer_scores["content"]  = verdict_obj.content_score
                 layer_scores["numeric"]  = verdict_obj.numeric_score
                 layer_scores["ela"]      = verdict_obj.ela_score
-                layer_scores["ocr"]      = verdict_obj.ocr_score
                 layer_scores["pymupdf"]  = verdict_obj.pymupdf_score
 
         # Fusion escalation — runs LAST among the verdict adjustments, after
@@ -566,18 +495,17 @@ async def analyze_document(file: UploadFile = File(...)):
         # Gatekeeper — a document whose FINAL verdict (after fusion had its
         # chance to cross-validate and escalate) is still ORIGINAL means no
         # accumulation of evidence called it modified. Surfacing per-region
-        # location arrays anyway (a borderline ELA block, a lone OCR word
-        # anomaly that didn't move the score) draws false highlight boxes on
-        # a document the engine itself just called clean. Every coordinate-
-        # bearing list below is zeroed so it can't reach the JSON response or
-        # the annotation cache that /annotated-image reads from.
+        # location arrays anyway (a borderline ELA block that didn't move the
+        # score) draws false highlight boxes on a document the engine itself
+        # just called clean. Every coordinate-bearing list below is zeroed so
+        # it can't reach the JSON response or the annotation cache that
+        # /annotated-image reads from.
         # fusion_stats stays truthful (counts of what fusion actually saw).
         is_clean = verdict_obj.verdict == "ORIGINAL"
         if is_clean:
             suspicious_lines = []
             numeric_anomalies = []
             ela_regions = []
-            ocr_word_anomalies = []
             overlay_regions = []
             fused_findings = []
             contradicted_findings = []
@@ -704,7 +632,6 @@ async def analyze_document(file: UploadFile = File(...)):
             "suspicious_lines": suspicious_lines,
             "numeric_anomalies": numeric_anomalies,
             "ela_regions": ela_regions,
-            "ocr_word_anomalies": ocr_word_anomalies,
             "overlay_regions": overlay_regions,
             "fused_findings": fused_findings,   # raw FusedFinding objects (0-indexed pages)
             "text_stacking_findings": text_stacking_findings,  # raw TextStackingFinding (0-indexed pages)
@@ -734,24 +661,6 @@ async def analyze_document(file: UploadFile = File(...)):
         result_dict = result.dict()
         result_dict["analysis_id"] = analysis_id
         result_dict["total_pages"] = total_pages
-        result_dict["ocr_word_anomalies"] = [
-            {
-                "page": a.page + 1,
-                "word": a.word,
-                "bbox": list(a.bbox),
-                "anomaly_types": a.anomaly_types,
-                "size_z": round(a.size_z, 2),
-                "color_z": round(a.color_z, 2),
-                "reason": a.reason,
-            }
-            for a in ocr_word_anomalies
-        ]
-        result_dict["ocr_stats"] = {
-            "word_count": ocr_report.word_count if ocr_report else 0,
-            "avg_font_size": ocr_report.avg_font_size if ocr_report else 0,
-            "avg_color_brightness": ocr_report.avg_color_brightness if ocr_report else 0,
-            "avg_confidence": ocr_report.avg_confidence if ocr_report else 0,
-        }
         result_dict["incremental_updates"] = ela_report.incremental_updates if ela_report else {}
         return result_dict
 
@@ -786,10 +695,11 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
     Always draws every individual per-layer marking. Cross-validated fusion is
     surfaced separately in the UI Overview tab and never replaces these boxes.
 
-    Returns PNG image with red boxes (font anomalies), orange boxes (OCR
-    confidence drops), yellow boxes (numeric outliers), purple boxes (ELA
-    outliers), cyan boxes (white-rect overlays), and magenta boxes (image
-    overlays) drawn on suspicious regions.
+    Returns PNG image with red boxes (content font/spacing anomalies),
+    yellow boxes (numeric outliers), purple boxes (ELA flat/pasted patches),
+    cyan/gold boxes (overlay layers), green boxes (embedded-image findings),
+    and dashed magenta boxes (hidden/stacked text) drawn on suspicious
+    regions. Each box's label states the specific finding.
     """
     if analysis_id not in _analysis_cache:
         raise HTTPException(
@@ -829,7 +739,6 @@ async def get_annotated_image(analysis_id: str, page: int = 1):
             highlighter = LocationHighlighter(pdf_path)
             highlighted = highlighter.highlight_pages(
                 suspicious_lines=cached["suspicious_lines"],
-                ocr_word_anomalies=cached["ocr_word_anomalies"],
                 numeric_anomalies=cached["numeric_anomalies"],
                 ela_regions=cached["ela_regions"],
                 overlay_regions=cached.get("overlay_regions", []),

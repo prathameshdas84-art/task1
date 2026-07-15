@@ -22,10 +22,10 @@ def get_qr_zones(page: "fitz.Page", doc: "fitz.Document") -> list:
     Returns a list of fitz.Rect bounding boxes for likely QR-code image
     regions on a page.
 
-    High-frequency QR pixel data reads as a tamper signal to OCR color/size
-    checks, ELA, and white-rect detection alike, regardless of document
-    type — so callers in each layer use this to exclude QR regions before
-    flagging an anomaly there.
+    High-frequency QR pixel data reads as a tamper signal to ELA and
+    white-rect detection alike, regardless of document type — so callers
+    in each layer use this to exclude QR regions before flagging an
+    anomaly there.
     """
     qr_zones = []
     page_area = page.rect.width * page.rect.height

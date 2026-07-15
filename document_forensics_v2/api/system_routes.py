@@ -34,7 +34,7 @@ async def health():
     return HealthResponse(
         status="ok",
         version="1.0.0",
-        layers=["metadata", "content", "ocr", "numeric", "ela", "pymupdf"],
+        layers=["metadata", "content", "numeric", "ela", "pymupdf"],
     )
 
 
