@@ -31,9 +31,12 @@ and used to trip the born-digital gate, suppressing all detection):
                                 NOT be classified born-digital — blocking-
                                 grid residuals prove compression erased the
                                 noise; stamp still detected; no false hits
-  S5 born-digital as JPEG     → a true vector render exported AS JPEG must
-                                STILL gate (container format alone is not
-                                evidence of a capture pipeline)
+  S5 born-digital as JPEG     → a render exported AS JPEG is no longer
+                                CLASSIFIED born-digital (any JPEG history —
+                                container included — vetoes the gate, so
+                                weak-grain genuine scans stay detectable);
+                                the invariant is behavioral instead: the
+                                checks run and must stay silent (0 anomalies)
   S6 scanned form w/ stamp    → police-verification-style scanned form,
                                 re-compressed: not gated, stamp detected
 
@@ -430,10 +433,21 @@ def run():
          f"grid_z={r.metrics.get('blockiness', {}).get('grid_phase_z')}, "
          f"anomalies={[(a.evidence_check, a.bbox) for a in r.anomalies]}")
 
-    # ── S5: born-digital exported AS JPEG → must STILL gate ──────────────
+    # ── S5: born-digital exported AS JPEG → checks run, but stay silent ──
+    # Spec change (weak-grain-scan fix): ANY JPEG history — including the
+    # container — now vetoes the born-digital classification, because a
+    # genuine scan saved as a high-quality JPEG (noise floor < 1.2, no
+    # blocking residuals) was indistinguishable from a render under the
+    # old grid-z-only rule and got every texture check gated off. The
+    # honesty requirement moves to behavior: a pristine render exported
+    # AS JPEG runs the checks and must produce ZERO anomalies (Check 1's
+    # threshold is relative to the zero floor; Check 5 gates itself on a
+    # uniformly-crisp baseline), so its score stays 0.
     r = reports["s5_bd_jpeg"]
-    case("S5 born-digital as JPEG",
-         r.is_born_digital and len(r.anomalies) == 0,
+    case("S5 render-as-JPEG stays clean",
+         not r.is_born_digital                 # JPEG container = history
+         and r.jpeg_history_detected
+         and len(r.anomalies) == 0,            # checks ran, nothing fired
          f"is_born_digital={r.is_born_digital}, "
          f"baseline={r.metrics.get('noise_baseline_std')}, "
          f"grid_z={r.metrics.get('blockiness', {}).get('grid_phase_z')}, "

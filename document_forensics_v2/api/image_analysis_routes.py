@@ -61,6 +61,13 @@ _CHECK_COLORS = {
     "check6_copy_move":      (255, 0, 255),   # magenta — clone consensus
     "check8_stamp_texture":  (255, 0, 0),     # blue — flat ink fill
     "check9_stamp_boundary": (0, 255, 255),   # yellow — cutout boundary
+    "check11_background_color": (0, 200, 0),  # green — background color mismatch
+}
+
+# Human-readable overlay labels; checks without an entry keep the compact
+# "C<n>_<name>" form derived from evidence_check below.
+_CHECK_LABELS = {
+    "check11_background_color": "Background Color Mismatch",
 }
 
 
@@ -139,17 +146,25 @@ async def analyze_image(file: UploadFile = File(...)):
             bgr = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_COLOR)
             if bgr is not None:
                 for a in visible_anomalies:
-                    x, y, w, h = a.bbox
+                    x, y, w, h = [int(round(float(v))) for v in a.bbox]
                     color = _CHECK_COLORS.get(a.evidence_check, (0, 0, 255))
+                    # Ensure color values are integer tuples for OpenCV
+                    color = tuple(int(c) for c in color)
                     cv2.rectangle(bgr, (x, y), (x + w, y + h), color, 2)
-                    cv2.putText(bgr, a.evidence_check.replace("check", "C")[:20],
+                    label = _CHECK_LABELS.get(
+                        a.evidence_check,
+                        a.evidence_check.replace("check", "C")[:20],
+                    )
+                    cv2.putText(bgr, label,
                                 (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.4, color, 1, cv2.LINE_AA)
                 ok, buf = cv2.imencode(".png", bgr)
                 if ok:
                     annotated_png = buf.tobytes()
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Image annotation drawing failed: {e}")
             annotated_png = None
+
 
         analysis_id = str(uuid.uuid4())
         _image_analysis_cache[analysis_id] = {

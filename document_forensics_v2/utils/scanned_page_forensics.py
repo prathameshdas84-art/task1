@@ -32,8 +32,10 @@ Gates:
     ela_analyzer._is_image_based_document uses: <20 chars of extractable
     text AND at least one image). native_text/image_document never route
     (byte-identical scores).
-  * Born-digital gate — a render with no scan-noise baseline gates the
-    texture checks out per page (inside analyze_page_render).
+  * Born-digital gate — two-signal: a render with no scan-noise baseline
+    gates the texture checks out per page (inside analyze_page_render)
+    only when the page's embedded source images ALSO show no raster-
+    pipeline evidence (utils/pdf_utils.page_raster_source_evidence).
   * QR zones — high-frequency QR pixels read as crisp overlay edges to
     Check 5; findings overlapping a QR zone are dropped BEFORE scoring
     (utils/pdf_utils.get_qr_zones, same exclusion every raster layer uses).
@@ -53,7 +55,9 @@ from PIL import Image
 from analyzers.image_document_analyzer import (
     ImageDocumentAnalyzer, score_anomalies,
 )
-from utils.pdf_utils import get_qr_zones, bbox_overlaps_qr_zone
+from utils.pdf_utils import (
+    get_qr_zones, bbox_overlaps_qr_zone, page_raster_source_evidence,
+)
 
 # pdf_types whose pages carry scan-noise raster content worth routing.
 ROUTED_PDF_TYPES = ("scanned", "scanned_native", "mixed")
@@ -127,7 +131,15 @@ def analyze_scanned_pages(pdf_path: str, pdf_type: str) -> dict:
                 img = Image.frombytes("RGB", [pix.w, pix.h], pix.samples)
                 rgb = np.asarray(img)
                 gray = np.asarray(img.convert("L"), dtype=np.float64)
-                result = analyzer.analyze_page_render(rgb, gray)
+                # Corroborate the born-digital gate against the page's
+                # embedded SOURCE images (original bytes), not just the
+                # freshly-resampled render — see analyze_page_render.
+                evidence, basis = page_raster_source_evidence(page, doc)
+                result = analyzer.analyze_page_render(
+                    rgb, gray,
+                    raster_source_evidence=evidence,
+                    evidence_basis=basis,
+                )
             except Exception:
                 pages_skipped += 1
                 continue

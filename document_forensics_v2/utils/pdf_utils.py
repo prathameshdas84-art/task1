@@ -2,9 +2,15 @@
 Shared PDF utility helpers usable by any analyzer without circular imports.
 """
 
+import io
+
 import cv2
 import fitz
 import numpy as np
+
+from PIL import Image
+
+from utils.flat_zone_detection import local_std_map, BORN_DIGITAL_STD_FLOOR
 
 # QR codes are near-square, small relative to the page, and almost pure
 # black/white — these heuristics are deliberately generic (not Aadhaar-
@@ -78,6 +84,102 @@ def get_qr_zones(page: "fitz.Page", doc: "fitz.Document") -> list:
             pix = None
 
     return qr_zones
+
+
+# ── Born-digital gate corroboration (PDF-render paths) ─────────────────────
+# A page RENDER is a fresh rasterization: its measured noise floor can
+# collapse for reasons that say nothing about the CONTENT being born-digital
+# (get_pixmap resampling averages real scan noise away; scanner-app
+# background cleanup zeroes it at the source). So the render floor alone
+# must not classify a page born-digital — the same one-signal
+# misclassification already fixed on the standalone image path, where the
+# corroborating signal is grid_phase_z measured on the uploaded pixels.
+# On the PDF path the render pixels can't carry that corroboration (a
+# fresh rasterization has no compression history), but the page's embedded
+# SOURCE image objects — the original bytes — can:
+#   1. a DCTDecode/JPX stream: content stored as a lossy-compressed raster
+#      necessarily passed through a rasterize+save pipeline (scan / photo /
+#      screenshot / paste). Unlike a standalone JPEG *upload* — where JPEG
+#      is everyone's default export format and proves nothing (the image
+#      pipeline's S5 case) — born-digital PDF page content is vector
+#      text/drawings; arriving as a JPEG image object is itself the trace.
+#   2. real texture in the source pixels at NATIVE resolution (the render
+#      may have resampled it away).
+#   3. 8px blocking-grid residuals in a non-JPEG-container source (a
+#      recompressed capture re-wrapped as PNG/Flate) — the same
+#      grid-phase statistic the standalone gate's second signal uses.
+RASTER_EVIDENCE_MAX_PX = 2048   # analyze a center CROP above this (never
+                                # resample — resampling erases the noise
+                                # this is testing for)
+_LOSSY_EXTS = ("jpeg", "jpg", "jpx", "jp2")
+
+
+def page_raster_source_evidence(page: "fitz.Page", doc: "fitz.Document"):
+    """
+    Returns (evidence: bool, basis: str) — whether this page's embedded
+    source images show the content passed through a raster/photo/scan/
+    paste pipeline at any point. Used to corroborate (or veto) the
+    born-digital gate when a page render's noise floor is low.
+    """
+    try:
+        images = page.get_images(full=True)
+    except Exception:
+        images = []
+    if not images:
+        return False, "page has no embedded raster images"
+
+    for im in images:
+        xref = im[0]
+        try:
+            info = doc.extract_image(xref)
+            ext = (info.get("ext") or "").lower()
+            if ext in _LOSSY_EXTS:
+                return True, (
+                    f"embedded image xref {xref} is a lossy-compressed "
+                    f"({ext}) stream — content passed through a "
+                    f"rasterize+save pipeline before entering the PDF"
+                )
+
+            pil = Image.open(io.BytesIO(info["image"])).convert("L")
+            w, h = pil.size
+            if w * h < 64 * 64:
+                continue
+            if w > RASTER_EVIDENCE_MAX_PX or h > RASTER_EVIDENCE_MAX_PX:
+                cw, ch = min(w, RASTER_EVIDENCE_MAX_PX), min(h, RASTER_EVIDENCE_MAX_PX)
+                left, top = (w - cw) // 2, (h - ch) // 2
+                pil = pil.crop((left, top, left + cw, top + ch))
+            gray = np.asarray(pil, dtype=np.float64)
+
+            _, src_baseline = local_std_map(gray)
+            if src_baseline >= BORN_DIGITAL_STD_FLOOR:
+                return True, (
+                    f"embedded image xref {xref} has real scan/photo "
+                    f"texture at native resolution (noise baseline "
+                    f"{src_baseline:.2f} >= {BORN_DIGITAL_STD_FLOOR})"
+                )
+
+            # Lazy import: pdf_utils must stay importable by any analyzer,
+            # and this reuses the standalone gate's exact statistic rather
+            # than re-deriving a second implementation of it.
+            from analyzers.image_document_analyzer.checks_compression import (
+                CompressionChecksMixin,
+            )
+            from analyzers.image_document_analyzer.constants import (
+                BLOCKINESS_Z_THRESHOLD,
+            )
+            _, m = CompressionChecksMixin._detect_jpeg_history(gray, ext.upper())
+            grid_z = m.get("grid_phase_z") or [0.0, 0.0]
+            if min(grid_z) > BLOCKINESS_Z_THRESHOLD:
+                return True, (
+                    f"embedded image xref {xref} carries 8px blocking-grid "
+                    f"residuals (grid_phase_z={grid_z}) — a re-compressed "
+                    f"capture re-wrapped in a lossless container"
+                )
+        except Exception:
+            continue
+
+    return False, ("embedded raster content shows no scan/photo texture "
+                   "and no lossy-compression traces at native resolution")
 
 
 def bbox_overlaps_qr_zone(bbox, qr_zones: list) -> bool:

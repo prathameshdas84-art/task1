@@ -330,6 +330,44 @@ class MetadataExtractor(BasicExtractionMixin, DeepExtractionMixin,
             report.anomaly_score = 0
             return  # nothing to flag — this is our own converter output
 
+        # ── Define ANONYMOUS / cleared author patterns ─────────────────────
+        ANONYMOUS_PATTERNS = [
+            "(anonymous)", "(unspecified)", "anonymous",
+            "unknown", "(unknown)", "user", "owner", ""
+        ]
+        author_lower = (report.author or "").lower().strip()
+        creator_lower = (report.creator or "").lower().strip()
+        author_cleared = (not author_lower) or any(
+            p and p in author_lower for p in ANONYMOUS_PATTERNS)
+        creator_cleared = (not creator_lower) or any(
+            p and p in creator_lower for p in ANONYMOUS_PATTERNS)
+
+        # Calculate if document was actually modified
+        was_modified = (report.creation_date and report.modification_date and
+                        report.creation_date != report.modification_date)
+
+        # ── Benign server-generated PDF pattern collapse ──────────────────
+        is_absent = (not report.producer or not report.producer.strip()) and \
+                    (not report.creator or not report.creator.strip())
+        is_instant_or_missing_dates = (report.time_delta_seconds is None) or \
+                                      (report.time_delta_seconds < 1.0)
+        has_other_metadata_anomalies = (
+            report.xmp_docinfo_mismatch or
+            report.multiple_producers or
+            (report.xmp_producer and report.producer and report.xmp_producer.lower() != report.producer.lower()) or
+            (report.page_rotation and report.page_rotation.get("anomaly")) or
+            (report.xmp_fields and report.xmp_fields.get("_metadata_date_mismatch")) or
+            (report.time_delta_seconds is not None and report.time_delta_seconds >= XMP_MISMATCH_TOLERANCE_SECONDS)
+        )
+
+        if is_absent and is_instant_or_missing_dates and not has_other_metadata_anomalies:
+            report.anomalies = [
+                "Metadata is absent or suggests a programmatic server-generated PDF. "
+                "This is normal for this document class."
+            ]
+            report.anomaly_score = 0
+            return
+
         score = 0
         anomalies = []
 
@@ -393,7 +431,7 @@ class MetadataExtractor(BasicExtractionMixin, DeepExtractionMixin,
             score += SCORE_XMP_MISMATCH
 
         # XMP MetadataDate vs ModifyDate mismatch (full XMP extraction)
-        if report.xmp_fields.get("_metadata_date_mismatch"):
+        if report.xmp_fields and report.xmp_fields.get("_metadata_date_mismatch"):
             anomalies.append(
                 "XMP MetadataDate differs from XMP ModifyDate — "
                 "document metadata was updated separately from content, "
@@ -402,7 +440,7 @@ class MetadataExtractor(BasicExtractionMixin, DeepExtractionMixin,
             score += SCORE_XMP_METADATA_DATE_MISMATCH
 
         # Page rotation inconsistency — signs of document recombination
-        if report.page_rotation.get("anomaly"):
+        if report.page_rotation and report.page_rotation.get("anomaly"):
             anomalies.append(report.page_rotation["anomaly_reason"])
             score += SCORE_ROTATION_INCONSISTENCY
 
@@ -458,28 +496,6 @@ class MetadataExtractor(BasicExtractionMixin, DeepExtractionMixin,
         # 10. Anonymous / cleared author+creator on a document that was
         # actually modified — a deliberately sanitized identity combined with
         # a real edit history is a classic "hide who edited this" pattern.
-        ANONYMOUS_PATTERNS = [
-            "(anonymous)", "(unspecified)", "anonymous",
-            "unknown", "(unknown)", "user", "owner", ""
-        ]
-
-        author_lower = (report.author or "").lower().strip()
-        creator_lower = (report.creator or "").lower().strip()
-
-        # The "" entry in ANONYMOUS_PATTERNS would make `p in field` vacuously
-        # true for ANY value (every string contains ""), which would fire the
-        # check on documents carrying a real author name. The truly-empty case
-        # is handled by the explicit `not field` clause, so the empty pattern
-        # is skipped in the membership test (`p and ...`).
-        author_cleared = (not author_lower) or any(
-            p and p in author_lower for p in ANONYMOUS_PATTERNS)
-        creator_cleared = (not creator_lower) or any(
-            p and p in creator_lower for p in ANONYMOUS_PATTERNS)
-
-        # Calculate if document was actually modified
-        was_modified = (report.creation_date and report.modification_date and
-                        report.creation_date != report.modification_date)
-
         if author_cleared and creator_cleared and was_modified:
             anomalies.append(
                 "Author and creator metadata deliberately cleared while "
@@ -495,5 +511,16 @@ class MetadataExtractor(BasicExtractionMixin, DeepExtractionMixin,
             )
             score += 15
 
+        # 11. Specific unrecognized desktop-editor tool tampering fingerprint (Problem B)
+        unrecognized_tool_present = (report.source.suspicion_level == "UNKNOWN" and (report.producer or report.creator))
+        if unrecognized_tool_present and was_modified and (author_cleared or creator_cleared):
+            anomalies.append(
+                "Unrecognized or desktop-editor producer present combined with post-creation "
+                "modification and cleared author/creator metadata — pattern strongly indicative "
+                "of intentional editing and metadata sanitization"
+            )
+            score += 30
+
         report.anomalies = anomalies
         report.anomaly_score = min(100, score)
+

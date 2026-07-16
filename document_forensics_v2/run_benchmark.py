@@ -222,14 +222,15 @@ def main():
         for fn_name in false_positives:
             print(f"    - {fn_name}")
     else:
-        print("\n[✓] Zero False Positives detected.")
+        print("\n[OK] Zero False Positives detected.")
 
     if false_negatives:
         print("\n[!] False Negatives (Tampered documents flagged as Original):")
         for fn_name in false_negatives:
             print(f"    - {fn_name}")
     else:
-        print("[✓] Zero False Negatives detected.")
+        print("[OK] Zero False Negatives detected.")
+
     print("=" * 60)
 
 if __name__ == "__main__":

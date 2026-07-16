@@ -25,11 +25,11 @@ try:
     for ptype, w in WEIGHTS.items():
         assert "ocr" not in w, f"WEIGHTS[{ptype!r}] still has an 'ocr' entry"
         assert abs(sum(w.values()) - 1.0) < 1e-9, f"WEIGHTS[{ptype!r}] doesn't sum to 1.0"
-    print("  ✓ ocr_analyzer module removed")
-    print("  ✓ no 'ocr' weight remains; every pdf_type's weights sum to 1.0")
-    print("  ✓ OCR removal test PASSED")
+    print("  [OK] ocr_analyzer module removed")
+    print("  [OK] no 'ocr' weight remains; every pdf_type's weights sum to 1.0")
+    print("  [OK] OCR removal test PASSED")
 except Exception as e:
-    print(f"  ✗ OCR removal test FAILED: {e}")
+    print(f"  [FAILED] OCR removal test FAILED: {e}")
     sys.exit(1)
 
 # Test 2: Import Upgrade 2 (NumericAnalyzer with trimmed mean)
@@ -38,22 +38,22 @@ try:
     # Verify by importing (catches syntax AND import-time errors)
     import importlib
     importlib.import_module("analyzers.numeric_analyzer")
-    print("  ✓ NumericAnalyzer syntax verified")
-    print("  ✓ Trimmed mean implementation confirmed")
-    print("  ✓ Upgrade 2 test PASSED")
+    print("  [OK] NumericAnalyzer syntax verified")
+    print("  [OK] Trimmed mean implementation confirmed")
+    print("  [OK] Upgrade 2 test PASSED")
 except Exception as e:
-    print(f"  ✗ Upgrade 2 test FAILED: {e}")
+    print(f"  [FAILED] Upgrade 2 test FAILED: {e}")
     sys.exit(1)
 
 # Test 3: Import Upgrade 3 (NumericAnalyzer with rolling window)
 print("\n[TEST 3] Upgrade 3 — Column-aware Z-score with Rolling Window")
 try:
     # Check syntax by compiling (reusing the same file from Test 2)
-    print("  ✓ Rolling window method syntax verified")
-    print("  ✓ Cross-column anomaly boost syntax verified")
-    print("  ✓ Upgrade 3 test PASSED")
+    print("  [OK] Rolling window method syntax verified")
+    print("  [OK] Cross-column anomaly boost syntax verified")
+    print("  [OK] Upgrade 3 test PASSED")
 except Exception as e:
-    print(f"  ✗ Upgrade 3 test FAILED: {e}")
+    print(f"  [FAILED] Upgrade 3 test FAILED: {e}")
     sys.exit(1)
 
 # Test 4: Import Upgrade 4 (XrefAnalyzer for Canva detection)
@@ -61,11 +61,11 @@ print("\n[TEST 4] Upgrade 4 — XREF Sequence Check for Canva Edits")
 try:
     import importlib
     importlib.import_module("analyzers.xref_analyzer")
-    print("  ✓ XrefAnalyzer syntax verified")
-    print("  ✓ XREF analysis methods confirmed")
-    print("  ✓ Upgrade 4 test PASSED")
+    print("  [OK] XrefAnalyzer syntax verified")
+    print("  [OK] XREF analysis methods confirmed")
+    print("  [OK] Upgrade 4 test PASSED")
 except Exception as e:
-    print(f"  ✗ Upgrade 4 test FAILED: {e}")
+    print(f"  [FAILED] Upgrade 4 test FAILED: {e}")
     sys.exit(1)
 
 # Test 5: Verify integration in verdict_engine and models
@@ -73,25 +73,26 @@ print("\n[TEST 5] Integration — Verdict engine and models with xref_score")
 try:
     import importlib
     importlib.import_module("fusion.verdict_engine")
-    print("  ✓ Verdict engine syntax verified")
+    print("  [OK] Verdict engine syntax verified")
 
     importlib.import_module("models")
-    print("  ✓ Models syntax verified")
+    print("  [OK] Models syntax verified")
 
     importlib.import_module("main")
-    print("  ✓ Main.py syntax verified (XrefAnalyzer integrated)")
+    print("  [OK] Main.py syntax verified (XrefAnalyzer integrated)")
     
-    print("  ✓ Integration test PASSED")
+    print("  [OK] Integration test PASSED")
 except Exception as e:
-    print(f"  ✗ Integration test FAILED: {e}")
+    print(f"  [FAILED] Integration test FAILED: {e}")
     sys.exit(1)
 
 print("\n" + "=" * 70)
-print("ALL UPGRADE TESTS PASSED ✓")
+print("ALL UPGRADE TESTS PASSED [OK]")
 print("=" * 70)
 print("\nSummary:")
-print("  Upgrade 1 (Pixel Profiling): ✓ READY")
-print("  Upgrade 2 (Trimmed Mean): ✓ READY")
-print("  Upgrade 3 (Rolling Window): ✓ READY")
-print("  Upgrade 4 (XREF Check): ✓ READY")
+print("  Upgrade 1 (Pixel Profiling): [OK] READY")
+print("  Upgrade 2 (Trimmed Mean): [OK] READY")
+print("  Upgrade 3 (Rolling Window): [OK] READY")
+print("  Upgrade 4 (XREF Check): [OK] READY")
 print("\nThe Document Forensics Engine v2.0 is ready for deployment.")
+

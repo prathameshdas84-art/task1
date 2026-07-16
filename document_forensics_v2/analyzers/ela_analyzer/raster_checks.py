@@ -13,6 +13,7 @@ from utils.flat_zone_detection import (
     local_std_map, detect_flat_zones, isolate_ink_regions,
     BORN_DIGITAL_STD_FLOOR,
 )
+from utils.pdf_utils import page_raster_source_evidence
 
 from .constants import *
 from .models import ELARegion
@@ -203,10 +204,20 @@ class RasterChecksMixin:
         """
         gray = np.asarray(img.convert("L"), dtype=np.float64)
         std_map, baseline = local_std_map(gray)
-        # Born-digital gate (same as the image pipeline's): no sensor/scan
-        # noise baseline means flat regions are normal, not evidence.
+        # Born-digital gate — two-signal, like the image pipeline's: a low
+        # RENDER noise floor alone is not proof of born-digital (the 150 DPI
+        # resampling can average real scan noise away, and scanner-app
+        # background cleanup collapses it at the source), so a low floor
+        # only gates when the page's embedded SOURCE images also carry no
+        # raster-pipeline evidence (utils/pdf_utils.page_raster_source_
+        # evidence). When evidence exists the detector runs with the
+        # measured baseline as-is: every threshold inside is RELATIVE to
+        # it, so a truly-zero floor still cannot manufacture findings —
+        # the bypass only revives detection on low-but-nonzero floors.
         if baseline < BORN_DIGITAL_STD_FLOOR:
-            return []
+            evidence, _basis = page_raster_source_evidence(page, page.parent)
+            if not evidence:
+                return []
 
         zones, _glare = detect_flat_zones(gray, std_map, baseline)
         if not zones:

@@ -48,6 +48,26 @@ STAMP_BOUNDARY_ABS      = 0.55
 HEATMAP_BAND_LOW        = 240
 HEATMAP_BAND_HIGH       = 255
 
+# ── Check 11: background color consistency ──────────────────────────────────
+BG_BLOCK                = 16     # analysis block (px) — same grid as Check 1
+BG_PAPER_DELTA          = 26     # background = gray within this of the paper tone
+BG_INK_ERODE            = 2     # erosion iterations — keeps text/line halos out
+BG_MIN_BG_FRAC          = 0.55   # block needs this fraction of bg pixels for a color
+BG_BASELINE_KERNEL      = 21     # blocks (336px) — local-surround sliding median
+BG_BASELINE_MIN_VALID   = 60     # min valid neighbor blocks for a usable baseline
+BG_DEV_RATIO            = 4.0    # candidate if dev > median + ratio × MAD-sigma…
+BG_DEV_ABS_FLOOR        = 1.25   # …and above uint8-quantization dust, whichever larger
+BG_MIN_NATURAL_VARIATION = 0.01  # med+MAD below this = no measurable background
+                                 # variation (vector-render content) → abstain
+BG_MIN_BLOCKS           = 4      # min connected candidate blocks (64px extent)
+BG_MIN_FILL             = 0.45   # component fill vs bbox — digital fills are boxy
+BG_PLATEAU_SPREAD       = 0.5    # per-block delta std ≤ max(0.75, this × |median|)
+BG_STEP_NEAR_MAX        = 0.45   # ring-near residual ≤ this × step = sharp boundary
+BG_RING_MIN_BLOCKS      = 6      # min valid blocks per ring for the step test
+BG_MAX_SUBTLE_STEP      = 12.0   # beyond this the color difference is EYE-VISIBLE
+                                 # (glare, shadow, sticker, design band) — not the
+                                 # "reads as the same background" paste signature
+
 # ── Scoring weights (Part 4) ─────────────────────────────────────────────────
 # Per Part 0's honesty requirement, the two signals most durable against
 # social-media recompression — glyph/edge sharpness (Checks 5/9) and
@@ -65,6 +85,15 @@ HEATMAP_BAND_HIGH       = 255
 CHECK_POINTS = {
     "check5_edge_sharpness":   {"per_hit": 40, "cap": 55},   # PRIMARY
     "check1_local_variance":   {"per_hit": 35, "cap": 45},   # PRIMARY
+    # Background color mismatch sits just under the primaries: its signal
+    # (a sharp localized color plateau against the local surround) is
+    # heavily self-verified (plateau coherence + boundary ring test,
+    # validated on the 4-clean acceptance suite incl. gradient lighting),
+    # so one confident hit (30 × ~0.9 = 27) clears MODIFIED (20) plus the
+    # uncertain band (±5) on its own — but it stays below Checks 1/5,
+    # whose physics (noise texture / edge rendering) survive recompression
+    # better than small color offsets do.
+    "check11_background_color": {"per_hit": 30, "cap": 40},
     "check9_stamp_boundary":   {"per_hit": 20, "cap": 35},   # same mechanism as 5
     "check6_copy_move":        {"per_hit": 15, "cap": 30},
     "check8_stamp_texture":    {"per_hit": 12, "cap": 20},
